@@ -1,0 +1,109 @@
+--- /dev/null
++++ b/com/coderyo/compat/Governor.java
+@@ -1,0 +_,106 @@
++/*
++ * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
++ * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
++ * ADR-0001 (the LOCKED tier model).
++ */
++package com.coderyo.compat;
++
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * The adaptive governor (design-spec §5.3 / ADR-0001 §"the governor"): the three cheap gates
++ * that, in later phases, decide whether a plugin handler may run on the speculative fast-lane
++ * (Tier 1.5) or must stay serialized (Tier 2).
++ *
++ * <ol>
++ *   <li><b>Static pre-classification (load-time):</b> a handler known to call side-effect APIs
++ *       or touch cross-region state is marked <em>never speculate</em>.</li>
++ *   <li><b>Runtime side-effect tripwire</b> (see {@link SideEffectTripwire}): abort → re-run
++ *       synchronously the instant a speculating handler does something irreversible.</li>
++ *   <li><b>Adaptive confidence counter (per handler):</b> 2-bit-saturating success/abort
++ *       tracking; a chronic aborter is permanently demoted to synchronous (Tier 2).</li>
++ * </ol>
++ *
++ * <p><b>P3.1 status: SCAFFOLD.</b> P3.1 builds only Tier 0 (inline) + Tier 2 (serialized legacy
++ * region), so speculation never runs and these gates never gate anything yet. The static
++ * pre-classifier here is a conservative stub (everything is "never speculate" — i.e. defaults
++ * to the always-correct Tier 2 baseline), and the confidence counters are wired but unused. The
++ * bytecode-scan pre-classifier and the live speculative demotion path are <b>deferred to phase
++ * 3+</b> (the speculative fast-lane is itself phase 3+ per ADR-0001). This scaffold lets the
++ * later tier slot in without reshaping the router.
++ *
++ * <p>The "confidence" is a 2-bit saturating counter à la branch predictors: 0–1 = demoted
++ * (run serialized), 2–3 = trusted (eligible to speculate). It starts demoted so the safe
++ * fallback is the default until evidence accumulates — which, in P3.1, it never does.
++ */
++public final class Governor {
++
++    private static final Governor INSTANCE = new Governor();
++
++    /** 2-bit saturating counter bounds. */
++    private static final int MIN_CONFIDENCE = 0;
++    private static final int MAX_CONFIDENCE = 3;
++    /** A handler is eligible to speculate only at or above this confidence. */
++    private static final int SPECULATE_THRESHOLD = 2;
++
++    /** Per-handler confidence counters (identity = "plugin#handler"). */
++    private final ConcurrentHashMap<String, AtomicInteger> confidence = new ConcurrentHashMap<>();
++
++    /** Handlers statically pre-classified as never-speculate (load-time gate 1). */
++    private final Set<String> neverSpeculate = ConcurrentHashMap.newKeySet();
++
++    private Governor() {
++    }
++
++    /** The process-wide governor. */
++    public static Governor get() {
++        return INSTANCE;
++    }
++
++    /**
++     * Static pre-classification (gate 1): the tier a handler should run at <em>before</em> any
++     * speculation evidence. P3.1 conservatively returns the always-correct
++     * {@link CompatTier#LEGACY_SERIALIZED} for every cross-region / context-free handler — the
++     * speculative tier that would promote it is phase 3+. (Same-region calls are decided inline
++     * by the router as {@link CompatTier#INLINE}; this classifier governs only the non-inline
++     * remainder.)
++     */
++    public CompatTier classify(final String handlerKey) {
++        // P3.1: no bytecode scan yet; default to the safe serialized tier. Marking a handler
++        // never-speculate is honored for when Tier 1.5 lands.
++        return CompatTier.LEGACY_SERIALIZED;
++    }
++
++    /** Mark a handler as never-speculate (gate 1 — e.g. detected unsafe pattern at load time). */
++    public void markNeverSpeculate(final String handlerKey) {
++        this.neverSpeculate.add(handlerKey);
++    }
++
++    /** Whether a handler is eligible to speculate (gates 1 + 3). Always false in P3.1. */
++    public boolean maySpeculate(final String handlerKey) {
++        if (this.neverSpeculate.contains(handlerKey)) {
++            return false;
++        }
++        return confidenceOf(handlerKey) >= SPECULATE_THRESHOLD;
++    }
++
++    /** Gate 3: a speculative run that committed without aborting — raise confidence (saturating). */
++    public void recordSuccess(final String handlerKey) {
++        this.confidence.computeIfAbsent(handlerKey, k -> new AtomicInteger(MIN_CONFIDENCE))
++            .updateAndGet(v -> Math.min(MAX_CONFIDENCE, v + 1));
++    }
++
++    /** Gate 3: a speculative run that aborted (tripwire) — lower confidence (saturating). */
++    public void recordAbort(final String handlerKey) {
++        this.confidence.computeIfAbsent(handlerKey, k -> new AtomicInteger(MIN_CONFIDENCE))
++            .updateAndGet(v -> Math.max(MIN_CONFIDENCE, v - 1));
++    }
++
++    /** Current 2-bit confidence for a handler (0 = chronic aborter, 3 = trusted). */
++    public int confidenceOf(final String handlerKey) {
++        final AtomicInteger c = this.confidence.get(handlerKey);
++        return c == null ? MIN_CONFIDENCE : c.get();
++    }
++}

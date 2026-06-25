@@ -1,0 +1,39 @@
+--- /dev/null
++++ b/com/coderyo/compat/CompatTier.java
+@@ -1,0 +_,36 @@
++/*
++ * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
++ * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
++ * ADR-0001 (the LOCKED tier model).
++ */
++package com.coderyo.compat;
++
++/**
++ * The tiered-execution model from ADR-0001 / design-spec §5.2 (the LOCKED model).
++ *
++ * <ul>
++ *   <li>{@link #INLINE} — Tier 0: the call's subject is owned by the current thread's
++ *       region; run inline, zero marshaling cost. Implemented in P3.1.</li>
++ *   <li>{@link #MARSHAL} — Tier 1: auto-marshal a cross-region call to the owning
++ *       region (future-based, never blocks a tick thread). <b>Deferred</b> past P3.1.</li>
++ *   <li>{@link #SPECULATIVE} — Tier 1.5: MVCC speculative fast-lane for the read-heavy,
++ *       side-effect-free slice. <b>Phase 3+ only</b>; not built yet.</li>
++ *   <li>{@link #LEGACY_SERIALIZED} — Tier 2: the always-correct serialized
++ *       {@link com.coderyo.compat.legacy.LegacyRegion legacy region}; classic
++ *       single-main-thread semantics. The P3.1 baseline.</li>
++ *   <li>{@link #NATIVE_OPTIN} — Tier 3: author-cooperating plugins run fully parallel.
++ *       <b>Deferred</b> past P3.1.</li>
++ * </ul>
++ */
++public enum CompatTier {
++    /** Tier 0 — same-region inline fast path (zero cost, parallel). */
++    INLINE,
++    /** Tier 1 — auto-marshal to the owning region (future-based). Deferred. */
++    MARSHAL,
++    /** Tier 1.5 — speculative fast-lane (MVCC). Phase 3+ only. */
++    SPECULATIVE,
++    /** Tier 2 — serialized legacy region. Always-correct safe fallback (P3.1 baseline). */
++    LEGACY_SERIALIZED,
++    /** Tier 3 — opt-in native / annotated, fully parallel. Deferred. */
++    NATIVE_OPTIN
++}

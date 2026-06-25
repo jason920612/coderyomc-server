@@ -1,0 +1,6 @@
+name: CompatProbe
+version: 1.0.0
+main: com.coderyo.test.CompatProbePlugin
+api-version: '1.21'
+description: Minimal P3.1 plugin-compat e2e probe (lifecycle + listener + scheduled task).
+author: coderyoMC

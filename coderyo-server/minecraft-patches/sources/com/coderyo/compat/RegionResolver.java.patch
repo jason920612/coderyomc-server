@@ -1,0 +1,103 @@
+--- /dev/null
++++ b/com/coderyo/compat/RegionResolver.java
+@@ -1,0 +_,100 @@
++/*
++ * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
++ * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
++ * ADR-0001 (the LOCKED tier model).
++ */
++package com.coderyo.compat;
++
++import com.coderyo.region.RegionId;
++import com.coderyo.region.RegionLifecycle;
++import java.util.Optional;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++import org.bukkit.Chunk;
++import org.bukkit.Location;
++import org.bukkit.World;
++import org.bukkit.block.Block;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.craftbukkit.entity.CraftEntity;
++
++/**
++ * Resolves the owning {@link RegionId} (or "global" / no region) for an intercepted
++ * plugin API call's target — a {@link Location}, {@link org.bukkit.entity.Entity Entity},
++ * {@link Block}, or {@link Chunk} (design-spec §5.5 sketch). The {@link CompatRouter} uses
++ * this to decide the {@link CompatTier} for each plugin callback.
++ *
++ * <p><b>Mapping.</b> Every concrete subject lives in a dimension at a chunk position; we
++ * map (dimension, packed-chunk-key) → owning region via the live
++ * {@link RegionLifecycle#index() region index}. A subject in an unowned chunk (no region
++ * formed yet, or off-world) or a context-free / server-global call resolves to
++ * {@link Optional#empty() empty} — meaning "orchestrator / legacy region" (Tier 2).
++ *
++ * <p>All methods are read-only and lock-light (the index is copy-on-merge), safe to call
++ * from any thread.
++ */
++public final class RegionResolver {
++
++    private RegionResolver() {
++    }
++
++    /** Owning region of a Bukkit {@link Location}, or empty (global/unowned). */
++    public static Optional<RegionId> resolve(final Location loc) {
++        final World world = loc == null ? null : loc.getWorld();
++        if (world == null) {
++            return Optional.empty();
++        }
++        return resolve(world, loc.getBlockX() >> 4, loc.getBlockZ() >> 4);
++    }
++
++    /** Owning region of a Bukkit {@link org.bukkit.entity.Entity}, or empty. */
++    public static Optional<RegionId> resolve(final org.bukkit.entity.Entity entity) {
++        if (!(entity instanceof final CraftEntity craft)) {
++            return Optional.empty();
++        }
++        final net.minecraft.world.entity.Entity handle = craft.getHandleRaw();
++        if (handle == null || !(handle.level() instanceof final ServerLevel level)) {
++            return Optional.empty();
++        }
++        final ChunkPos cp = handle.chunkPosition();
++        return resolve(level.dimension(), cp.longKey());
++    }
++
++    /** Owning region of a Bukkit {@link Block}, or empty. */
++    public static Optional<RegionId> resolve(final Block block) {
++        if (block == null) {
++            return Optional.empty();
++        }
++        return resolve(block.getWorld(), block.getX() >> 4, block.getZ() >> 4);
++    }
++
++    /** Owning region of a Bukkit {@link Chunk}, or empty. */
++    public static Optional<RegionId> resolve(final Chunk chunk) {
++        if (chunk == null) {
++            return Optional.empty();
++        }
++        return resolve(chunk.getWorld(), chunk.getX(), chunk.getZ());
++    }
++
++    /**
++     * "Global" resolution: a context-free / server-wide call has no owning region and is
++     * funneled to the orchestrator / legacy region (Tier 2). Always empty by definition;
++     * present to mirror the design-spec §5.5 {@code resolveGlobal()} sketch.
++     */
++    public static Optional<RegionId> resolveGlobal() {
++        return Optional.empty();
++    }
++
++    private static Optional<RegionId> resolve(final World world, final int chunkX, final int chunkZ) {
++        if (!(world instanceof final CraftWorld craftWorld)) {
++            return Optional.empty();
++        }
++        return resolve(craftWorld.getHandle().dimension(), ChunkPos.pack(chunkX, chunkZ));
++    }
++
++    private static Optional<RegionId> resolve(final ResourceKey<Level> dimension, final long packedChunkKey) {
++        final RegionId id = RegionLifecycle.index().regionOf(dimension, packedChunkKey);
++        return Optional.ofNullable(id);
++    }
++}

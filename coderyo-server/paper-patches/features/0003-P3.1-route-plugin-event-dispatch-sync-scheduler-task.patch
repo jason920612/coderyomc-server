@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyoMC <dev@coderyo.local>
+Date: Thu, 25 Jun 2026 14:57:13 +0800
+Subject: [PATCH] P3.1: route plugin event dispatch + sync scheduler tasks
+ through compat router
+
+
+diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
+index 7ce9ebba8ce304d1f3f21d4f15ee5f3560d7700b..921119d3be3ffb94a3b9e77231d99b47c2eb8e5e 100644
+--- a/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
++++ b/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
+@@ -45,6 +45,20 @@ class PaperEventManager {
+         HandlerList handlers = event.getHandlers();
+         RegisteredListener[] listeners = handlers.getRegisteredListeners();
+ 
++        // coderyoMC start - P3.1: route synchronous event dispatch through the compat router so,
++        // under region.enabled=true, plugin event handlers run on the correct thread (Tier 0 inline
++        // when the current thread owns the event subject's region; Tier 2 serialized legacy region
++        // otherwise / for global events). Async events keep their existing path (already off-tick).
++        // region.enabled=false / compat disabled => the router runs the dispatch inline = vanilla.
++        if (!event.isAsynchronous() && com.coderyo.compat.CompatConfig.isEnabled()) {
++            com.coderyo.compat.CompatRouter.runEventDispatch(event, () -> this.dispatchToListeners(event, listeners));
++            return;
++        }
++        this.dispatchToListeners(event, listeners);
++    }
++
++    private void dispatchToListeners(@NotNull Event event, RegisteredListener[] listeners) {
++        // coderyoMC end - P3.1
+         for (RegisteredListener registration : listeners) {
+             if (!registration.getPlugin().isEnabled()) {
+                 continue;
+diff --git a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+index 7ffb7a210bf840009158d5e4364dad78221ded6c..7cfd68beb27f7bdb12c151404415f784a5a27102 100644
+--- a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
++++ b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+@@ -471,7 +471,12 @@ public class CraftScheduler implements BukkitScheduler {
+             if (task.isSync()) {
+                 this.currentTask = task;
+                 try {
+-                    task.run();
++                    // coderyoMC start - P3.1: route plugin sync scheduler tasks through the compat
++                    // router so, under region.enabled=true, they run on the correct thread (Tier 0
++                    // inline on the orchestrator while regions are quiescent, or Tier 2 serialized
++                    // legacy region). region.enabled=false / compat disabled => runs inline = vanilla.
++                    com.coderyo.compat.CompatRouter.runSchedulerTask(task);
++                    // coderyoMC end - P3.1
+                 } catch (final Throwable throwable) {
+                     // Paper start
+                     final String logMessage = String.format(

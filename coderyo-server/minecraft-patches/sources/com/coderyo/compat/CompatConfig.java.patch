@@ -1,0 +1,74 @@
+--- /dev/null
++++ b/com/coderyo/compat/CompatConfig.java
+@@ -1,0 +_,71 @@
++/*
++ * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
++ * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
++ * ADR-0001 (the LOCKED tier model).
++ */
++package com.coderyo.compat;
++
++import com.coderyo.region.RegionConfig;
++
++/**
++ * Dormancy switch for the plugin compatibility layer (design-spec §5 / §7.2:
++ * {@code compat.enabled}).
++ *
++ * <p><b>Default follows {@link RegionConfig#isEnabled() region.enabled}.</b> The compat
++ * layer only has work to do when regionized parallel ticking is active: with
++ * {@code region.enabled=false} the server is byte-for-byte vanilla single-threaded, so the
++ * compat router must be inert (every plugin callback already runs on the one main thread).
++ * An explicit {@code -Dcoderyo.compat.enabled=...} overrides the default (e.g. to disable
++ * compat routing even with regions on, for A/B testing).
++ *
++ * <pre>
++ *   -Dcoderyo.compat.enabled=true|false   (system property, takes precedence)
++ *   CODERYO_COMPAT_ENABLED=true|false      (environment variable, fallback)
++ *   -Dcoderyo.compat.debug=true            (compat routing logging; default false)
++ *   CODERYO_COMPAT_DEBUG=true              (environment variable, fallback)
++ * </pre>
++ */
++public final class CompatConfig {
++
++    /** System property key. */
++    public static final String PROPERTY = "coderyo.compat.enabled";
++    /** Environment variable key. */
++    public static final String ENV = "CODERYO_COMPAT_ENABLED";
++
++    /** System property key for compat routing debug logging. */
++    public static final String DEBUG_PROPERTY = "coderyo.compat.debug";
++    /** Environment variable key for compat routing debug logging. */
++    public static final String DEBUG_ENV = "CODERYO_COMPAT_DEBUG";
++
++    private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, RegionConfig.isEnabled());
++    private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, false);
++
++    private CompatConfig() {
++    }
++
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
++        }
++        return fallback;
++    }
++
++    /**
++     * Whether the compat layer is enabled. Resolved once at class-load. Defaults to
++     * {@link RegionConfig#isEnabled()} so it is inert exactly when the server is vanilla
++     * single-threaded.
++     */
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++
++    /** Whether compat routing logging is enabled. Only consulted when {@link #isEnabled()}. */
++    public static boolean isDebug() {
++        return DEBUG;
++    }
++}

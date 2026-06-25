@@ -1,0 +1,226 @@
+--- /dev/null
++++ b/com/coderyo/compat/CompatRouter.java
+@@ -1,0 +_,223 @@
++/*
++ * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
++ * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
++ * ADR-0001 (the LOCKED tier model).
++ */
++package com.coderyo.compat;
++
++import com.coderyo.compat.legacy.LegacyRegion;
++import com.coderyo.region.RegionConfig;
++import com.coderyo.region.RegionId;
++import com.coderyo.region.RegionLifecycle;
++import java.util.Optional;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.craftbukkit.entity.CraftEntity;
++import org.bukkit.event.Event;
++import org.bukkit.event.block.BlockEvent;
++import org.bukkit.event.entity.EntityEvent;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * The central interception point at the Craft* API surface (design-spec §5.2 / §5.5). Given a
++ * plugin callback (an event dispatch or a scheduler sync task) and its subject, it decides the
++ * {@link CompatTier} and routes the callback so it runs on the <b>correct thread</b> under
++ * regionized parallel ticking:
++ *
++ * <ul>
++ *   <li><b>Tier 0 (INLINE):</b> the subject's owning region is owned by the <em>current</em>
++ *       thread (the callback fired from that region's worker tick) → run inline, zero cost.</li>
++ *   <li><b>Tier 2 (LEGACY_SERIALIZED):</b> otherwise — a cross-region subject, a context-free
++ *       subject, or a call from a thread that does not own the subject's region → funnel to the
++ *       serialized {@link LegacyRegion legacy region} so the plugin never touches game state from
++ *       the wrong region thread and never trips {@code AsyncCatcher} /
++ *       {@code "may only be triggered synchronously"}.</li>
++ * </ul>
++ *
++ * <p><b>Deferred (documented, ADR-0001 phasing):</b> Tier 1 auto-marshal (future-based
++ * cross-region), Tier 1.5 speculative fast-lane (phase 3+), and Tier 3 opt-in are NOT in P3.1.
++ * P3.1 ships the always-correct baseline: Tier 0 inline + Tier 2 serialized legacy.
++ *
++ * <p><b>Dormancy.</b> When {@link CompatConfig#isEnabled()} is false (the default whenever
++ * {@code region.enabled=false}), every method runs the callback inline with zero routing — the
++ * server is vanilla single-threaded, so the one main thread is already the correct thread.
++ *
++ * <p><b>Never fail silent (design-spec §5.4 hard rule).</b> The router never disables a thread
++ * check; if a callback ends up on the wrong thread despite routing, the underlying
++ * {@code AsyncCatcher} / sync-event assertion still fires loud — routing only ensures it does
++ * not, by funneling to a valid serialized {@code TickThread}.
++ */
++public final class CompatRouter {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/compat");
++
++    private CompatRouter() {
++    }
++
++    /**
++     * Run a plugin <b>scheduler sync task</b> ({@code BukkitScheduler} sync) on the correct
++     * thread. Sync scheduler tasks are <b>context-free</b> (the scheduler has no per-region
++     * subject), so under the LOCKED model they route to the legacy region (Tier 2) — except the
++     * common case where they are ALREADY running on the orchestrator/legacy/region thread with
++     * no parallel region phase in flight, in which case running inline is identical and avoids a
++     * hand-off. Called from {@code CraftScheduler.mainThreadHeartbeat}'s task dispatch.
++     */
++    public static void runSchedulerTask(final Runnable task) {
++        if (!CompatConfig.isEnabled()) {
++            task.run();
++            return;
++        }
++        // The scheduler heartbeat runs on the orchestrator main thread OUTSIDE the parallel
++        // region barrier (regions are quiescent), or on the legacy thread itself. In both cases
++        // there is no concurrent region worker, so the classic single-main-thread semantics a
++        // sync task expects already hold — run inline (this IS the Tier 2 contract: serialized,
++        // no region racing). Routing to a separate legacy thread is reserved for tasks dispatched
++        // from a context where a region worker IS active (none today).
++        if (LegacyRegion.isLegacyThread() || isOrchestratorContext()) {
++            if (CompatConfig.isDebug()) {
++                LOGGER.info("compat: scheduler task inline (orchestrator/legacy, no region phase active)");
++            }
++            task.run();
++            return;
++        }
++        // Defensive: a sync task somehow dispatched while off the orchestrator/legacy thread ->
++        // funnel to the legacy region (Tier 2) so it is serialized and on a valid TickThread.
++        if (CompatConfig.isDebug()) {
++            LOGGER.info("compat: scheduler task -> legacy region (Tier 2)");
++        }
++        LegacyRegion.get().execute(task);
++    }
++
++    /**
++     * Run a plugin <b>event dispatch</b> on the correct thread for the event's {@code subject}.
++     * Tier 0 inline when the current thread owns the subject's region (the event fired during
++     * that region's worker tick — the common fast path); otherwise Tier 2 legacy region.
++     *
++     * @param subjectDimension the subject's dimension, or {@code null} for a global/context-free
++     *                         event (always Tier 2 / inline-on-orchestrator).
++     * @param subjectChunkKey  the subject's packed chunk key (ignored if dimension is null).
++     * @param dispatch         the event-dispatch body (iterate listeners, invoke handlers).
++     */
++    public static void runEventDispatch(final ResourceKey<Level> subjectDimension,
++                                        final long subjectChunkKey,
++                                        final Runnable dispatch) {
++        if (!CompatConfig.isEnabled()) {
++            dispatch.run();
++            return;
++        }
++        final CompatTier tier = classifyEvent(subjectDimension, subjectChunkKey);
++        switch (tier) {
++            case INLINE -> {
++                if (CompatConfig.isDebug()) {
++                    LOGGER.info("compat: event dispatch INLINE (Tier 0, owning region thread)");
++                }
++                dispatch.run();
++            }
++            default -> {
++                if (CompatConfig.isDebug()) {
++                    LOGGER.info("compat: event dispatch -> legacy region (Tier 2)");
++                }
++                // Already on a valid main/legacy thread with no region phase active -> inline is
++                // the serialized Tier 2 contract; only hand off if a region worker is active.
++                if (LegacyRegion.isLegacyThread() || isOrchestratorContext()) {
++                    dispatch.run();
++                } else {
++                    LegacyRegion.get().execute(dispatch);
++                }
++            }
++        }
++    }
++
++    /**
++     * Run a plugin event dispatch, resolving the subject's region from the Bukkit {@link Event}
++     * itself. The convenience entry point for the {@code callEvent} hook: extracts a
++     * (dimension, chunk) subject from common subject-bearing events
++     * ({@link BlockEvent#getBlock()} / {@link EntityEvent#getEntity()}), defaulting to
++     * global/context-free (Tier 2) for events without a single owning location.
++     */
++    public static void runEventDispatch(final Event event, final Runnable dispatch) {
++        if (!CompatConfig.isEnabled()) {
++            dispatch.run();
++            return;
++        }
++        ResourceKey<Level> dim = null;
++        long chunkKey = 0L;
++        // Best-effort subject extraction. A null subject -> global (Tier 2). Never throws into
++        // the event path: any resolution problem falls through to the safe global classification.
++        try {
++            if (event instanceof final BlockEvent be && be.getBlock() != null) {
++                final org.bukkit.block.Block b = be.getBlock();
++                if (b.getWorld() instanceof final CraftWorld cw) {
++                    dim = cw.getHandle().dimension();
++                    chunkKey = ChunkPos.pack(b.getX() >> 4, b.getZ() >> 4);
++                }
++            } else if (event instanceof final EntityEvent ee && ee.getEntity() instanceof final CraftEntity ce) {
++                final net.minecraft.world.entity.Entity handle = ce.getHandleRaw();
++                if (handle != null && handle.level() instanceof final ServerLevel level) {
++                    dim = level.dimension();
++                    chunkKey = handle.chunkPosition().longKey();
++                }
++            }
++        } catch (final Throwable ignored) {
++            dim = null; // fall back to global/Tier 2 — never disrupt event dispatch
++        }
++        runEventDispatch(dim, chunkKey, dispatch);
++    }
++
++    /**
++     * Classify an event by its subject (the static + inline gate). Tier 0 if the subject's
++     * region is owned by the current thread; else the governor's static classification (Tier 2
++     * in P3.1).
++     */
++    public static CompatTier classifyEvent(final ResourceKey<Level> subjectDimension, final long subjectChunkKey) {
++        if (subjectDimension == null) {
++            return Governor.get().classify("event#global");
++        }
++        final RegionId owner = RegionLifecycle.index().regionOf(subjectDimension, subjectChunkKey);
++        if (owner != null && ownsCurrentThread(subjectDimension, owner)) {
++            return CompatTier.INLINE;
++        }
++        return Governor.get().classify("event#" + (owner == null ? "unowned" : owner.value()));
++    }
++
++    /**
++     * Tier 0 check: does the current thread own the live region {@code id} in {@code dimension}?
++     * Resolves the live {@link com.coderyo.region.Region} and asks its single-writer owner
++     * (the region's {@code tickOwner} set during {@link com.coderyo.region.Region#tick}). This
++     * reuses the region's existing thread-check without touching region source.
++     */
++    private static boolean ownsCurrentThread(final ResourceKey<Level> dimension, final RegionId id) {
++        final com.coderyo.region.Region region = RegionLifecycle.regionById(dimension, id);
++        return region != null && region.isOwnedByCurrentThread();
++    }
++
++    /**
++     * Whether the current thread is the orchestrator main thread (or otherwise a tick thread
++     * with no parallel region phase active). We approximate "no region worker active" by: the
++     * thread is a tick thread but NOT currently the mid-tick owner of any live region. The cheap
++     * proxy used here is the thread name of the region worker pool ({@code coderyo-region-worker-});
++     * a thread NOT named that, while still a tick thread, is the orchestrator or legacy thread.
++     */
++    private static boolean isOrchestratorContext() {
++        final Thread t = Thread.currentThread();
++        // Region workers are named "coderyo-region-worker-N". The orchestrator (server main),
++        // the legacy region, and the init thread are not — and the scheduler heartbeat / event
++        // dispatch that reach here run on the orchestrator outside the region barrier.
++        return !t.getName().startsWith("coderyo-region-worker-");
++    }
++
++    /** Convenience: resolve a subject's region tier from a {@link RegionResolver} optional. */
++    public static CompatTier tierFor(final Optional<RegionId> resolved, final ResourceKey<Level> dimension) {
++        if (resolved.isEmpty()) {
++            return Governor.get().classify("call#global");
++        }
++        if (ownsCurrentThread(dimension, resolved.get())) {
++            return CompatTier.INLINE;
++        }
++        return Governor.get().classify("call#" + resolved.get().value());
++    }
++}

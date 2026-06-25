@@ -1,0 +1,184 @@
+--- /dev/null
++++ b/com/coderyo/compat/legacy/LegacyRegion.java
+@@ -1,0 +_,181 @@
++/*
++ * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
++ * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
++ * ADR-0001 (the LOCKED tier model).
++ */
++package com.coderyo.compat.legacy;
++
++import ca.spottedleaf.moonrise.common.util.TickThread;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.function.Supplier;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Tier 2 — the always-correct <b>serialized legacy region</b> (design-spec §5.2 /
++ * §5「Tier 2」). A single dedicated thread that provides classic single-main-thread
++ * semantics: any plugin API call / event handler / scheduler task that cannot run inline on
++ * an owning region thread (cross-region, context-free, or routed for safety) is funneled
++ * here and executes <b>serialized</b>, one at a time, in submission order.
++ *
++ * <p><b>Why a dedicated thread that {@code extends TickThread}.</b> Game-state mutation in
++ * Paper 26.2 is gated by {@code TickThread.isTickThread()} (Moonrise) — it is the basis of
++ * both {@code org.spigotmc.AsyncCatcher.catchOp} and {@code CraftServer.isPrimaryThread()}.
++ * A plugin running on the legacy region therefore must be on a {@code TickThread} or it would
++ * trip {@code "Asynchronous ... !"} / {@code "may only be triggered synchronously"}. So this
++ * thread IS a {@code TickThread} (the same public, non-Folia identity check the region workers
++ * satisfy). It is NOT one of the parallel region tick workers, so — unlike a region tick
++ * thread — it <b>may block</b> (design-spec §5「Tier 2」: "legacy region 可同步阻塞於 cross-region
++ * future"), preserving legacy plugins' blocking-API expectations at the cost of throughput.
++ *
++ * <p><b>Serialization = correctness.</b> Because exactly one legacy thread drains the queue
++ * one task at a time, two plugin callbacks routed here never run concurrently — the classic
++ * single-main-thread invariant a legacy plugin assumes. The legacy region runs only when the
++ * parallel region phase is NOT touching the same chunks: scheduler heartbeat + event dispatch
++ * from the orchestrator happen outside the region barrier, and an event fired during a region
++ * worker tick that resolves to its own region runs inline (Tier 0) — it never reaches here.
++ *
++ * <p><b>Re-entrancy / deadlock-freedom.</b> Work already running ON the legacy thread that
++ * routes back to the legacy region runs <b>inline</b> ({@link #isLegacyThread()} true), never
++ * re-enqueuing behind itself — so a plugin task that fires an event (which routes to legacy)
++ * does not deadlock. The router only ever <em>blocks waiting</em> on the legacy region from
++ * the orchestrator main thread (allowed) or a region worker (a worker awaiting the legacy
++ * thread is one-directional and the legacy thread never waits back on a worker, so no cycle).
++ */
++public final class LegacyRegion {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/compat");
++
++    private static final LegacyRegion INSTANCE = new LegacyRegion();
++
++    /** The current thread's identity, set on the single legacy worker. */
++    private static volatile Thread LEGACY_THREAD;
++
++    private final BlockingQueue<Runnable> queue = new LinkedBlockingQueue<>();
++    private final AtomicLong executed = new AtomicLong();
++    private volatile boolean started;
++    private volatile boolean stopping;
++
++    private LegacyRegion() {
++    }
++
++    /** The process-wide legacy region. */
++    public static LegacyRegion get() {
++        return INSTANCE;
++    }
++
++    /** Whether the calling thread IS the legacy region serial thread (Tier 0 re-entrancy check). */
++    public static boolean isLegacyThread() {
++        return Thread.currentThread() == LEGACY_THREAD;
++    }
++
++    /** Lazily start the single serial drainer thread (idempotent). */
++    public synchronized void start() {
++        if (this.started) {
++            return;
++        }
++        this.started = true;
++        final Thread t = new LegacyRegionThread(this::drainLoop);
++        t.setDaemon(true);
++        LEGACY_THREAD = t;
++        t.start();
++        LOGGER.info("LegacyRegion (Tier 2 serialized) started on thread '{}'", t.getName());
++    }
++
++    private void drainLoop() {
++        while (!this.stopping) {
++            final Runnable task;
++            try {
++                task = this.queue.take();
++            } catch (final InterruptedException ie) {
++                if (this.stopping) {
++                    return;
++                }
++                continue;
++            }
++            try {
++                task.run();
++            } catch (final Throwable t) {
++                // Fail loud: never silently swallow a legacy-region task failure.
++                LOGGER.error("LegacyRegion task threw", t);
++            } finally {
++                this.executed.incrementAndGet();
++            }
++        }
++    }
++
++    /**
++     * Run {@code task} on the legacy region, <b>blocking</b> the caller until it completes
++     * (and re-throwing its failure). If the caller is ALREADY the legacy thread, runs inline
++     * (re-entrancy fast path — no enqueue, no deadlock). The caller must NOT be a parallel
++     * region tick thread that is mid-tick over a region whose chunks the task touches; the
++     * router enforces routing so this never happens (Tier 0 handles same-region inline).
++     */
++    public void execute(final Runnable task) {
++        if (isLegacyThread()) {
++            task.run();
++            return;
++        }
++        submit(() -> {
++            task.run();
++            return null;
++        }).join();
++    }
++
++    /**
++     * Submit {@code supplier} to the legacy region, returning a future resolved on the legacy
++     * thread. Runs inline if already on the legacy thread.
++     */
++    public <T> CompletableFuture<T> submit(final Supplier<T> supplier) {
++        if (isLegacyThread()) {
++            final CompletableFuture<T> done = new CompletableFuture<>();
++            try {
++                done.complete(supplier.get());
++            } catch (final Throwable t) {
++                done.completeExceptionally(t);
++            }
++            return done;
++        }
++        if (!this.started) {
++            this.start();
++        }
++        final CompletableFuture<T> future = new CompletableFuture<>();
++        this.queue.add(() -> {
++            try {
++                future.complete(supplier.get());
++            } catch (final Throwable t) {
++                future.completeExceptionally(t);
++            }
++        });
++        return future;
++    }
++
++    /** Total tasks executed on the legacy region (diagnostics). */
++    public long executedCount() {
++        return this.executed.get();
++    }
++
++    /** Stop the legacy region drainer (server shutdown). */
++    public void shutdown() {
++        this.stopping = true;
++        final Thread t = LEGACY_THREAD;
++        if (t != null) {
++            t.interrupt();
++        }
++    }
++
++    /**
++     * The single legacy-region serial thread. {@code extends TickThread} so that game-state
++     * mutation, {@code isPrimaryThread()}, and {@code AsyncCatcher} all treat plugin work
++     * here as on-the-main-thread (the same public Moonrise check the region workers satisfy);
++     * reuses NONE of Folia's region threading.
++     */
++    private static final class LegacyRegionThread extends TickThread {
++        LegacyRegionThread(final Runnable run) {
++            super(run, "coderyo-legacy-region");
++        }
++    }
++}

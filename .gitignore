@@ -41,5 +41,10 @@ replay_pid*
 # e2e harness generated worlds / scratch (never commit generated server runs)
 test-harness/**/run-*/
 test-harness/**/.detcmp/
+test-harness/**/*.log
 __pycache__/
 *.pyc
+
+# test-plugin build artifacts (source is tracked; built jar + javac out dir are not)
+test-plugins/**/out/
+test-plugins/**/*.jar
