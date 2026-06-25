@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 25 Jun 2026 16:05:24 +0800
+Subject: [PATCH] issue #11: clean region worker-pool shutdown before Moonrise
+ halt
+
+
+diff --git a/com/coderyo/region/RegionTickOrchestrator.java b/com/coderyo/region/RegionTickOrchestrator.java
+index fea752c0f69993160495332dcf7dbab1b727ba25..d406a1c16e0f7c47c8f85b60023c9231b9396fca 100644
+--- a/com/coderyo/region/RegionTickOrchestrator.java
++++ b/com/coderyo/region/RegionTickOrchestrator.java
+@@ -319,9 +319,18 @@ public final class RegionTickOrchestrator {
+         }
+     }
+ 
+-    public static void shutdown() {
++    /**
++     * Shut the region worker pool down as part of the server stop sequence (issue #11).
++     * Called from {@code MinecraftServer.stopServer()} BEFORE Moonrise halts its chunk-system
++     * pool, so no region worker is mid-tick (holding chunk-system locks / with Moonrise work
++     * posted) when Moonrise joins — which previously left the stop wedged at "Awaiting
++     * termination of worker pool". Idempotent and safe to call when no scheduler was ever
++     * created (region.enabled=false ⇒ no-op ⇒ byte-for-byte vanilla stop).
++     */
++    public static synchronized void shutdown() {
+         final RegionScheduler s = scheduler;
+         if (s != null) {
++            scheduler = null; // prevent any post-stop tick from resurrecting a dead pool
+             s.shutdown();
+         }
+     }
+diff --git a/com/coderyo/region/WorkStealingRegionScheduler.java b/com/coderyo/region/WorkStealingRegionScheduler.java
+index a7029c40bdb2a5ff17c8cc7db7d29f0f1f6d78ed..07ba921e8394a4930a41abd42b564aae5a02f40f 100644
+--- a/com/coderyo/region/WorkStealingRegionScheduler.java
++++ b/com/coderyo/region/WorkStealingRegionScheduler.java
+@@ -51,6 +51,10 @@ public final class WorkStealingRegionScheduler implements RegionScheduler {
+ 
+     private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/region");
+ 
++    /** Bounded grace for in-flight region ticks to drain on stop, then a short forced wait. */
++    private static final long SHUTDOWN_DRAIN_MILLIS = 5_000L;
++    private static final long SHUTDOWN_FORCE_MILLIS = 5_000L;
++
+     private final ThreadPoolExecutor pool;
+     private final int parallelism;
+ 
+@@ -146,9 +150,39 @@ public final class WorkStealingRegionScheduler implements RegionScheduler {
+         return future;
+     }
+ 
++    /**
++     * Graceful shutdown for the server stop sequence (issue #11). Stops accepting new
++     * region-tick submissions, lets in-flight region ticks finish (bounded), then forces
++     * termination. This MUST complete before Moonrise's {@code MoonriseCommon.haltExecutors()}
++     * joins its chunk-system worker pool: a region worker that is mid-tick can hold
++     * chunk-system locks / have posted work to the Moonrise pool, so draining ours first
++     * removes the lock-inversion that otherwise stalls Moonrise's bounded 60s
++     * {@code WORKER_POOL.join(...)} ("Awaiting termination of worker pool"). The workers are
++     * also daemon threads, so even a pathological wedge cannot keep the JVM alive.
++     */
+     @Override
+     public void shutdown() {
+-        this.pool.shutdownNow();
++        // 1) Stop accepting new tick passes; let in-flight region ticks drain.
++        this.pool.shutdown();
++        boolean clean;
++        try {
++            clean = this.pool.awaitTermination(SHUTDOWN_DRAIN_MILLIS, TimeUnit.MILLISECONDS);
++        } catch (final InterruptedException ie) {
++            Thread.currentThread().interrupt();
++            clean = false;
++        }
++        // 2) Forced fallback: cancel anything still pending / interrupt stragglers.
++        if (!clean) {
++            LOGGER.warn("region worker pool did not drain in {}ms; forcing shutdown",
++                SHUTDOWN_DRAIN_MILLIS);
++            this.pool.shutdownNow();
++            try {
++                this.pool.awaitTermination(SHUTDOWN_FORCE_MILLIS, TimeUnit.MILLISECONDS);
++            } catch (final InterruptedException ie) {
++                Thread.currentThread().interrupt();
++            }
++        }
++        LOGGER.info("WorkStealingRegionScheduler shut down (clean={})", clean);
+     }
+ 
+     /**
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index d9ba08a978c8777abe16d688ee11a5cbf8b6378e..687ea967bdaf557bb53c2b24c8e0f89169febec6 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1084,6 +1084,16 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             this.services().nameToIdCache().save(false); // Paper - Perf: Async GameProfileCache saving
+         }
+         // Spigot end
++        // coderyoMC start - issue #11: shut the region worker pool down cleanly BEFORE Moonrise
++        // halts its chunk-system pool. A region worker that is still mid-tick can hold
++        // chunk-system locks / have posted work onto Moonrise's WORKER_POOL; if we let Moonrise
++        // join first, that lock inversion can stall its bounded 60s join ("Awaiting termination
++        // of worker pool") = the intermittent shutdown hang. Draining ours first removes it.
++        // No-op (and untouched-behaviour) when region.enabled=false: the scheduler was never created.
++        if (com.coderyo.region.RegionConfig.isEnabled()) {
++            com.coderyo.region.RegionTickOrchestrator.shutdown();
++        }
++        // coderyoMC end - issue #11
+         // Paper start - rewrite chunk system
+         LOGGER.info("Waiting for all RegionFile I/O tasks to complete...");
+         ca.spottedleaf.moonrise.patches.chunk_system.io.MoonriseRegionFileIO.flush((MinecraftServer)(Object)this);
