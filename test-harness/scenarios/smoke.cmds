@@ -1,0 +1,6 @@
+# Example scenario file for e2e-harness.sh (--cmds-file).
+# One console command per line. Blank lines and lines starting with # are ignored.
+# Trivial smoke scenario: force-load spawn chunks, report tps, save the world.
+forceload add 0 0
+tps
+save-all
