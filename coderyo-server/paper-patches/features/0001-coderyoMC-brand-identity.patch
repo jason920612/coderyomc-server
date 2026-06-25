@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyo <actions@coderyo>
+Date: Thu, 25 Jun 2026 09:45:42 +0800
+Subject: [PATCH] coderyoMC brand identity
+
+
+diff --git a/src/main/java/io/papermc/paper/ServerBuildInfoImpl.java b/src/main/java/io/papermc/paper/ServerBuildInfoImpl.java
+index 74ffdc823e66fc5ec027c4b7c462382bcbfe2be2..87805eb74a5f554af6d0c6746f41fe48703d4af9 100644
+--- a/src/main/java/io/papermc/paper/ServerBuildInfoImpl.java
++++ b/src/main/java/io/papermc/paper/ServerBuildInfoImpl.java
+@@ -32,6 +32,9 @@ public record ServerBuildInfoImpl(
+ 
+     private static final String BRAND_PAPER_NAME = "Paper";
+ 
++    // coderyoMC - identity brand: regionized multithreaded Paper 26.2 hard-fork
++    private static final String BRAND_CODERYO_NAME = "coderyoMC";
++
+     private static final String BUILD_DEV = "DEV";
+ 
+     public ServerBuildInfoImpl() {
+@@ -44,7 +47,7 @@ public record ServerBuildInfoImpl(
+                 .map(Key::key)
+                 .orElse(BRAND_PAPER_ID),
+             getManifestAttribute(manifest, ATTRIBUTE_BRAND_NAME)
+-                .orElse(BRAND_PAPER_NAME),
++                .orElse(BRAND_CODERYO_NAME), // coderyoMC - brand identity
+             SharedConstants.getCurrentVersion().id(),
+             SharedConstants.getCurrentVersion().name(),
+             getManifestAttribute(manifest, ATTRIBUTE_BUILD_NUMBER)
