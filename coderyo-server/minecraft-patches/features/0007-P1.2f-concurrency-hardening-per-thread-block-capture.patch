@@ -1,0 +1,548 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyoMC <dev@coderyo.local>
+Date: Thu, 25 Jun 2026 14:01:47 +0800
+Subject: [PATCH] P1.2f: concurrency hardening - per-thread block-capture state
+ + atomic EAR counters (issue #8)
+
+
+diff --git a/io/papermc/paper/entity/activation/ActivationRange.java b/io/papermc/paper/entity/activation/ActivationRange.java
+index 829f7685904fd741e00403647ae76d32275c34a3..46d1f7f1b67953f5920df56dd6843a87c256a708 100644
+--- a/io/papermc/paper/entity/activation/ActivationRange.java
++++ b/io/papermc/paper/entity/activation/ActivationRange.java
+@@ -57,24 +57,22 @@ public final class ActivationRange {
+         final Level world = entity.level();
+         final SpigotWorldConfig config = world.spigotConfig;
+         final long inactiveFor = MinecraftServer.currentTick - entity.activatedTick;
++        // coderyoMC - P1.2f: atomic bounded "consume" of the wakeup budget (may run on a region
++        // worker via tickNonPassenger -> checkIfActive). Replaces the racy >0 check + plain --.
+         if (entity.activationType == ActivationType.VILLAGER) {
+-            if (inactiveFor > config.wakeUpInactiveVillagersEvery && world.wakeupInactiveRemainingVillagers > 0) {
+-                world.wakeupInactiveRemainingVillagers--;
++            if (inactiveFor > config.wakeUpInactiveVillagersEvery && Level.coderyoTryConsumeWakeup(world.wakeupInactiveRemainingVillagers)) {
+                 return config.wakeUpInactiveVillagersFor;
+             }
+         } else if (entity.activationType == ActivationType.ANIMAL) {
+-            if (inactiveFor > config.wakeUpInactiveAnimalsEvery && world.wakeupInactiveRemainingAnimals > 0) {
+-                world.wakeupInactiveRemainingAnimals--;
++            if (inactiveFor > config.wakeUpInactiveAnimalsEvery && Level.coderyoTryConsumeWakeup(world.wakeupInactiveRemainingAnimals)) {
+                 return config.wakeUpInactiveAnimalsFor;
+             }
+         } else if (entity.activationType == ActivationType.FLYING_MONSTER) {
+-            if (inactiveFor > config.wakeUpInactiveFlyingEvery && world.wakeupInactiveRemainingFlying > 0) {
+-                world.wakeupInactiveRemainingFlying--;
++            if (inactiveFor > config.wakeUpInactiveFlyingEvery && Level.coderyoTryConsumeWakeup(world.wakeupInactiveRemainingFlying)) {
+                 return config.wakeUpInactiveFlyingFor;
+             }
+         } else if (entity.activationType == ActivationType.MONSTER || entity.activationType == ActivationType.RAIDER) {
+-            if (inactiveFor > config.wakeUpInactiveMonstersEvery && world.wakeupInactiveRemainingMonsters > 0) {
+-                world.wakeupInactiveRemainingMonsters--;
++            if (inactiveFor > config.wakeUpInactiveMonstersEvery && Level.coderyoTryConsumeWakeup(world.wakeupInactiveRemainingMonsters)) {
+                 return config.wakeUpInactiveMonstersFor;
+             }
+         }
+@@ -129,10 +127,11 @@ public final class ActivationRange {
+         final int waterActivationRange = world.spigotConfig.waterActivationRange;
+         final int flyingActivationRange = world.spigotConfig.flyingMonsterActivationRange;
+         final int villagerActivationRange = world.spigotConfig.villagerActivationRange;
+-        world.wakeupInactiveRemainingAnimals = Math.min(world.wakeupInactiveRemainingAnimals + 1, world.spigotConfig.wakeUpInactiveAnimals);
+-        world.wakeupInactiveRemainingVillagers = Math.min(world.wakeupInactiveRemainingVillagers + 1, world.spigotConfig.wakeUpInactiveVillagers);
+-        world.wakeupInactiveRemainingMonsters = Math.min(world.wakeupInactiveRemainingMonsters + 1, world.spigotConfig.wakeUpInactiveMonsters);
+-        world.wakeupInactiveRemainingFlying = Math.min(world.wakeupInactiveRemainingFlying + 1, world.spigotConfig.wakeUpInactiveFlying);
++        // coderyoMC - P1.2f: atomic refill of the per-tick wakeup budget (orchestrator, before fan-out)
++        Level.coderyoRefillWakeup(world.wakeupInactiveRemainingAnimals, world.spigotConfig.wakeUpInactiveAnimals);
++        Level.coderyoRefillWakeup(world.wakeupInactiveRemainingVillagers, world.spigotConfig.wakeUpInactiveVillagers);
++        Level.coderyoRefillWakeup(world.wakeupInactiveRemainingMonsters, world.spigotConfig.wakeUpInactiveMonsters);
++        Level.coderyoRefillWakeup(world.wakeupInactiveRemainingFlying, world.spigotConfig.wakeUpInactiveFlying);
+ 
+         int maxRange = Math.max(monsterActivationRange, animalActivationRange);
+         maxRange = Math.max(maxRange, raiderActivationRange);
+diff --git a/net/minecraft/core/dispenser/DispenseItemBehavior.java b/net/minecraft/core/dispenser/DispenseItemBehavior.java
+index 162d7890f204315b0476467e757de5c9dd84aeca..b1e34d4b6431af46fadef45c8a4711e77693471b 100644
+--- a/net/minecraft/core/dispenser/DispenseItemBehavior.java
++++ b/net/minecraft/core/dispenser/DispenseItemBehavior.java
+@@ -293,7 +293,8 @@ public interface DispenseItemBehavior {
+                 // Paper end - Call BlockDispenseEvent
+                 List<org.bukkit.craftbukkit.block.CraftBlockState> capturedBlockStates; // Paper
+                 org.bukkit.TreeType treeType; // Paper
+-                level.captureTreeGeneration = true; // CraftBukkit
++                final net.minecraft.world.level.Level.CaptureState coderyoCap = level.coderyoCapture(); // coderyoMC - P1.2f: per-thread capture frame (issue #8)
++                coderyoCap.captureTreeGeneration = true; // CraftBukkit
+                 try { // Paper
+                 if (!BoneMealItem.growCrop(dispensed, level, target) && !BoneMealItem.growWaterPlant(dispensed, level, target, null)) {
+                     this.setSuccess(false);
+@@ -302,13 +303,12 @@ public interface DispenseItemBehavior {
+                 }
+                 // Paper start
+                 } finally {
+-                    level.captureTreeGeneration = false;
++                    coderyoCap.captureTreeGeneration = false;
+ 
+-                    capturedBlockStates = new java.util.ArrayList<>(level.capturedBlockStates.values());
+-                    level.capturedBlockStates.clear();
++                    capturedBlockStates = new java.util.ArrayList<>(coderyoCap.capturedBlockStates.values());
++                    coderyoCap.capturedBlockStates.clear();
+ 
+-                    treeType = net.minecraft.world.level.block.SaplingBlock.treeType;
+-                    net.minecraft.world.level.block.SaplingBlock.treeType = null;
++                    treeType = net.minecraft.world.level.block.SaplingBlock.coderyoTakeTreeType(); // coderyoMC - P1.2f
+                 }
+                 // Paper end
+                 // CraftBukkit start
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 3f271bf3f94b636e7782458b6cfd41927c453115..490ee896154d5a5a7e0518715035806241dcfff1 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -2230,13 +2230,13 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             return;
+         }
+         // CraftBukkit end
+-        if (captureBlockStates) { return; } // Paper - Cancel all physics during placement
++        if (this.coderyoCapture().captureBlockStates) { return; } // Paper - Cancel all physics during placement // coderyoMC - P1.2f: per-thread capture frame
+         this.updateNeighborsAt(pos, sourceBlock, ExperimentalRedstoneUtils.initialOrientation(this, null, null));
+     }
+ 
+     @Override
+     public void updateNeighborsAt(final BlockPos pos, final Block sourceBlock, final @Nullable Orientation orientation) {
+-        if (captureBlockStates) { return; } // Paper - Cancel all physics during placement
++        if (this.coderyoCapture().captureBlockStates) { return; } // Paper - Cancel all physics during placement // coderyoMC - P1.2f: per-thread capture frame
+         this.neighborUpdater.updateNeighborsAtExceptFromFacing(pos, sourceBlock, null, orientation);
+     }
+ 
+diff --git a/net/minecraft/world/item/ItemStack.java b/net/minecraft/world/item/ItemStack.java
+index f1e6e876460e62cee24c4ca4adcf047fb96b1909..d38cff8ec3833cc50b3b2dd966c25270e75b4a84 100644
+--- a/net/minecraft/world/item/ItemStack.java
++++ b/net/minecraft/world/item/ItemStack.java
+@@ -382,9 +382,10 @@ public final class ItemStack implements DataComponentHolder, ItemInstance {
+         ServerLevel level = (ServerLevel) context.getLevel();
+         boolean isBonemeal = usedItem == Items.BONE_MEAL;
+ 
++        final net.minecraft.world.level.Level.CaptureState coderyoCap = level.coderyoCapture(); // coderyoMC - P1.2f: per-thread capture frame (issue #8)
+         if (!(usedItem instanceof BucketItem)) {
+-            level.captureBlockStates = true;
+-            level.captureTreeGeneration = isBonemeal;
++            coderyoCap.captureBlockStates = true;
++            coderyoCap.captureTreeGeneration = isBonemeal;
+         }
+ 
+         List<org.bukkit.craftbukkit.block.CraftBlockState> capturedBlockStates;
+@@ -394,17 +395,16 @@ public final class ItemStack implements DataComponentHolder, ItemInstance {
+         try {
+             result = usedItem.useOn(context);
+         } finally {
+-            level.captureBlockStates = false;
+-            level.captureTreeGeneration = false;
++            coderyoCap.captureBlockStates = false;
++            coderyoCap.captureTreeGeneration = false;
+ 
+-            capturedBlockStates = new java.util.ArrayList<>(level.capturedBlockStates.values());
+-            level.capturedBlockStates.clear();
++            capturedBlockStates = new java.util.ArrayList<>(coderyoCap.capturedBlockStates.values());
++            coderyoCap.capturedBlockStates.clear();
+ 
+-            capturedBlockEntities = new java.util.ArrayList<>(level.capturedBlockEntities.values());
+-            level.capturedBlockEntities.clear();
++            capturedBlockEntities = new java.util.ArrayList<>(coderyoCap.capturedBlockEntities.values());
++            coderyoCap.capturedBlockEntities.clear();
+ 
+-            treeType = net.minecraft.world.level.block.SaplingBlock.treeType;
+-            net.minecraft.world.level.block.SaplingBlock.treeType = null;
++            treeType = net.minecraft.world.level.block.SaplingBlock.coderyoTakeTreeType(); // coderyoMC - P1.2f
+         }
+ 
+         DataComponentPatch newPatch = this.components.asPatch();
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index fb626858132622eb292c9d5b29ec0eefb686dcfb..64ce9bb9536c57c9ff8c21f6bba74e42e47d8808 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -160,18 +160,70 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     private final CraftWorld world;
+     public org.bukkit.generator.@Nullable ChunkGenerator generator;
+ 
+-    public boolean captureBlockStates = false;
+-    public boolean captureTreeGeneration = false;
+-    public Map<BlockPos, org.bukkit.craftbukkit.block.CraftBlockState> capturedBlockStates = new java.util.LinkedHashMap<>(); // Paper
+-    public Map<BlockPos, BlockEntity> capturedBlockEntities = new java.util.LinkedHashMap<>(); // Paper - Retain block place order when capturing blockstates
++    // coderyoMC start - P1.2f: per-thread block-capture state (concurrency hazard, issue #8).
++    // Paper's block-state / tree-generation capture (captureBlockStates / captureTreeGeneration
++    // + the capturedBlockStates / capturedBlockEntities maps) is a SHARED per-level work area
++    // that setBlock / getBlockState / setBlockEntity read & write. Under parallel region ticking
++    // (region.enabled=true) two region workers can run setBlock-capturing work CONCURRENTLY on the
++    // SAME level -- e.g. SaplingBlock.randomTick growing two trees in two different regions, or a
++    // dispenser (block-entity tick) dispensing a sapling -- racing these maps (lost/cross-region
++    // tree blocks, ConcurrentModificationException). This is the SAME class of hazard as the
++    // CollectingNeighborUpdater work-stack fixed in P1.2e. Captures are strictly nested + drained
++    // before the worker returns (set true -> grow -> set false -> drain map), and the affected
++    // chunks are owned by the ticking region, so giving each ticking thread its OWN capture frame
++    // is correct -- and IDENTICAL to vanilla when single-threaded (region.enabled=false => only the
++    // orchestrator thread ever touches it => one CaptureState => byte-for-byte vanilla).
++    public static final class CaptureState {
++        public boolean captureBlockStates = false;
++        public boolean captureTreeGeneration = false;
++        public final Map<BlockPos, org.bukkit.craftbukkit.block.CraftBlockState> capturedBlockStates = new java.util.LinkedHashMap<>(); // Paper
++        public final Map<BlockPos, BlockEntity> capturedBlockEntities = new java.util.LinkedHashMap<>(); // Paper - Retain block place order when capturing blockstates
++    }
++
++    private final ThreadLocal<CaptureState> coderyoCapture = ThreadLocal.withInitial(CaptureState::new);
++
++    /** The calling thread's block-capture frame (per-region under parallel ticking; the single
++     *  orchestrator frame when region.enabled=false). */
++    public CaptureState coderyoCapture() {
++        return this.coderyoCapture.get();
++    }
++    // coderyoMC end - P1.2f
+     @Nullable
+     public List<net.minecraft.world.entity.item.ItemEntity> captureDrops;
+     public final it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap<SpawnCategory> ticksPerSpawnCategory = new it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap<>();
+     // Paper start - EAR 2
+-    public int wakeupInactiveRemainingAnimals;
+-    public int wakeupInactiveRemainingFlying;
+-    public int wakeupInactiveRemainingMonsters;
+-    public int wakeupInactiveRemainingVillagers;
++    // coderyoMC start - P1.2f: atomic EAR wakeup budgets (concurrency hazard, issue #8).
++    // These per-level counters are REFILLED once per tick on the orchestrator (ActivationRange
++    // .activateEntities, before region fan-out) and then DECREMENTED from ActivationRange
++    // .checkInactiveWakeup, which is reached via tickNonPassenger -> checkIfActive on a REGION
++    // WORKER thread. Under parallel region ticking many workers decrement the SAME counter
++    // concurrently -> a lost-update race on a non-atomic int (design-spec §4.5 "non-atomic
++    // counters"). Promoted to AtomicInteger with a bounded compare-and-set "consume" so the
++    // budget is never driven below 0 and no decrement is lost. region.enabled=false => only the
++    // orchestrator thread touches them => semantically identical to the old plain int.
++    public final java.util.concurrent.atomic.AtomicInteger wakeupInactiveRemainingAnimals = new java.util.concurrent.atomic.AtomicInteger();
++    public final java.util.concurrent.atomic.AtomicInteger wakeupInactiveRemainingFlying = new java.util.concurrent.atomic.AtomicInteger();
++    public final java.util.concurrent.atomic.AtomicInteger wakeupInactiveRemainingMonsters = new java.util.concurrent.atomic.AtomicInteger();
++    public final java.util.concurrent.atomic.AtomicInteger wakeupInactiveRemainingVillagers = new java.util.concurrent.atomic.AtomicInteger();
++
++    /** Refill a wakeup budget once per tick (orchestrator): {@code min(cur+1, cap)}. */
++    public static void coderyoRefillWakeup(final java.util.concurrent.atomic.AtomicInteger budget, final int cap) {
++        budget.updateAndGet(cur -> Math.min(cur + 1, cap));
++    }
++
++    /** Atomically consume one unit of a wakeup budget iff > 0 (region worker). Returns true if
++     *  a unit was consumed. Never drives the budget below 0, never loses a concurrent decrement. */
++    public static boolean coderyoTryConsumeWakeup(final java.util.concurrent.atomic.AtomicInteger budget) {
++        int cur;
++        do {
++            cur = budget.get();
++            if (cur <= 0) {
++                return false;
++            }
++        } while (!budget.compareAndSet(cur, cur - 1));
++        return true;
++    }
++    // coderyoMC end - P1.2f
+     // Paper end - EAR 2
+     public boolean populating;
+     public final org.spigotmc.SpigotWorldConfig spigotConfig; // Spigot
+@@ -1001,8 +1053,9 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     @Nullable
+     public final BlockState getBlockStateIfLoaded(BlockPos pos) {
+         // CraftBukkit start - tree generation
+-        if (this.captureTreeGeneration) {
+-            CraftBlockState previous = this.capturedBlockStates.get(pos);
++        final CaptureState coderyoCap = this.coderyoCapture(); // coderyoMC - P1.2f
++        if (coderyoCap.captureTreeGeneration) {
++            CraftBlockState previous = coderyoCap.capturedBlockStates.get(pos);
+             if (previous != null) {
+                 return previous.getHandle();
+             }
+@@ -1065,15 +1118,16 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     @Override
+     public boolean setBlock(final BlockPos pos, final BlockState blockState, final @Block.UpdateFlags int updateFlags, final int updateLimit) {
+         // CraftBukkit start - tree generation
+-        if (this.captureTreeGeneration) {
++        final CaptureState coderyoCap = this.coderyoCapture(); // coderyoMC - P1.2f
++        if (coderyoCap.captureTreeGeneration) {
+             // Paper start - Protect Bedrock and End Portal/Frames from being destroyed
+             BlockState type = getBlockState(pos);
+             if (!type.isDestroyable()) return false;
+             // Paper end - Protect Bedrock and End Portal/Frames from being destroyed
+-            CraftBlockState blockstate = this.capturedBlockStates.get(pos);
++            CraftBlockState blockstate = coderyoCap.capturedBlockStates.get(pos);
+             if (blockstate == null) {
+                 blockstate = org.bukkit.craftbukkit.block.CapturedBlockState.getTreeBlockState(this, pos, updateFlags);
+-                this.capturedBlockStates.put(pos.immutable(), blockstate);
++                coderyoCap.capturedBlockStates.put(pos.immutable(), blockstate);
+             }
+             blockstate.setBlock(blockState);
+             blockstate.setFlags(updateFlags);
+@@ -1092,14 +1146,14 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         Block block = blockState.getBlock();
+         // CraftBukkit start - capture blockstates
+         boolean captured = false;
+-        if (this.captureBlockStates) {
++        if (coderyoCap.captureBlockStates) {
+             final CraftBlockState snapshot;
+-            if (!this.capturedBlockStates.containsKey(pos)) {
++            if (!coderyoCap.capturedBlockStates.containsKey(pos)) {
+                 snapshot = (CraftBlockState) org.bukkit.craftbukkit.block.CraftBlock.at(this, pos).getState(); // Paper - use CB getState to get a suitable snapshot
+-                this.capturedBlockStates.put(pos.immutable(), snapshot);
++                coderyoCap.capturedBlockStates.put(pos.immutable(), snapshot);
+                 captured = true;
+             } else {
+-                snapshot = this.capturedBlockStates.get(pos);
++                snapshot = coderyoCap.capturedBlockStates.get(pos);
+             }
+             snapshot.setFlags(updateFlags); // Paper - always set the flag of the most recent call to mitigate issues with multiple update at the same pos with different flags
+         }
+@@ -1108,8 +1162,8 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         this.chunkPacketBlockController.onBlockChange(this, pos, blockState, oldState, updateFlags, updateLimit); // Paper - Anti-Xray
+         if (oldState == null) {
+             // CraftBukkit start - remove blockstate if failed (or the same)
+-            if (this.captureBlockStates && captured) {
+-                this.capturedBlockStates.remove(pos);
++            if (coderyoCap.captureBlockStates && captured) {
++                coderyoCap.capturedBlockStates.remove(pos);
+             }
+             // CraftBukkit end
+             return false;
+@@ -1147,7 +1201,7 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         */ // CraftBukkit
+ 
+         // CraftBukkit start
+-        if (!this.captureBlockStates) { // Don't notify clients or update physics while capturing blockstates
++        if (!coderyoCap.captureBlockStates) { // Don't notify clients or update physics while capturing blockstates // coderyoMC - P1.2f: per-thread capture frame
+             // Modularize client and physic updates
+             // Spigot start
+             try {
+@@ -1319,8 +1373,9 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     @Override
+     public BlockState getBlockState(final BlockPos pos) {
+         // CraftBukkit start - tree generation
+-        if (this.captureTreeGeneration) {
+-            CraftBlockState previous = this.capturedBlockStates.get(pos); // Paper
++        final CaptureState coderyoCap = this.coderyoCapture(); // coderyoMC - P1.2f
++        if (coderyoCap.captureTreeGeneration) {
++            CraftBlockState previous = coderyoCap.capturedBlockStates.get(pos); // Paper
+             if (previous != null) {
+                 return previous.getHandle();
+             }
+@@ -1691,7 +1746,8 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     public @Nullable BlockEntity getBlockEntity(final BlockPos pos) {
+         // Paper start - Perf: Optimize capturedTileEntities lookup
+         net.minecraft.world.level.block.entity.BlockEntity blockEntity;
+-        if (!this.capturedBlockEntities.isEmpty() && (blockEntity = this.capturedBlockEntities.get(pos)) != null) {
++        final CaptureState coderyoCap = this.coderyoCapture(); // coderyoMC - P1.2f
++        if (!coderyoCap.capturedBlockEntities.isEmpty() && (blockEntity = coderyoCap.capturedBlockEntities.get(pos)) != null) {
+             return blockEntity;
+         }
+         // Paper end - Perf: Optimize capturedTileEntities lookup
+@@ -1708,8 +1764,9 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         BlockPos pos = blockEntity.getBlockPos();
+         if (this.isInValidBounds(pos)) {
+             // CraftBukkit start
+-            if (this.captureBlockStates) {
+-                this.capturedBlockEntities.put(pos.immutable(), blockEntity);
++            final CaptureState coderyoCap = this.coderyoCapture(); // coderyoMC - P1.2f
++            if (coderyoCap.captureBlockStates) {
++                coderyoCap.capturedBlockEntities.put(pos.immutable(), blockEntity);
+                 return;
+             }
+             // CraftBukkit end
+diff --git a/net/minecraft/world/level/block/MushroomBlock.java b/net/minecraft/world/level/block/MushroomBlock.java
+index 8d466e5a3e187cb151a7513de3e78d3350b32277..d6136fdebd6a9222e869d0f216e3d85c3827cc92 100644
+--- a/net/minecraft/world/level/block/MushroomBlock.java
++++ b/net/minecraft/world/level/block/MushroomBlock.java
+@@ -94,7 +94,7 @@ public class MushroomBlock extends VegetationBlock implements BonemealableBlock
+         }
+ 
+         level.removeBlock(pos, false);
+-        SaplingBlock.treeType = (this == Blocks.BROWN_MUSHROOM) ? org.bukkit.TreeType.BROWN_MUSHROOM : org.bukkit.TreeType.RED_MUSHROOM; // CraftBukkit
++        SaplingBlock.coderyoSetTreeType((this == Blocks.BROWN_MUSHROOM) ? org.bukkit.TreeType.BROWN_MUSHROOM : org.bukkit.TreeType.RED_MUSHROOM); // CraftBukkit // coderyoMC - P1.2f
+         if (feature.get().value().place(level, level.getChunkSource().getGenerator(), random, pos)) {
+             return true;
+         }
+diff --git a/net/minecraft/world/level/block/NetherFungusBlock.java b/net/minecraft/world/level/block/NetherFungusBlock.java
+index 82ab930bf438e988d637786bdde88e34ea073a2f..2bf9b656b4f23b3b383aa7e611f3d500fbb40bde 100644
+--- a/net/minecraft/world/level/block/NetherFungusBlock.java
++++ b/net/minecraft/world/level/block/NetherFungusBlock.java
+@@ -84,9 +84,9 @@ public class NetherFungusBlock extends VegetationBlock implements BonemealableBl
+             // CraftBukkit start
+             .map((value) -> {
+                 if (this == Blocks.WARPED_FUNGUS) {
+-                    SaplingBlock.treeType = org.bukkit.TreeType.WARPED_FUNGUS;
++                    SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.WARPED_FUNGUS); // coderyoMC - P1.2f
+                 } else if (this == Blocks.CRIMSON_FUNGUS) {
+-                    SaplingBlock.treeType = org.bukkit.TreeType.CRIMSON_FUNGUS;
++                    SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.CRIMSON_FUNGUS); // coderyoMC - P1.2f
+                 }
+                 return value;
+             })
+diff --git a/net/minecraft/world/level/block/SaplingBlock.java b/net/minecraft/world/level/block/SaplingBlock.java
+index cbf7845ca64f1b716af3e50ac8716373d2ae3755..d19e5f33cfc0fb5acacd5663e3749406847c1231 100644
+--- a/net/minecraft/world/level/block/SaplingBlock.java
++++ b/net/minecraft/world/level/block/SaplingBlock.java
+@@ -24,7 +24,29 @@ public class SaplingBlock extends VegetationBlock implements BonemealableBlock {
+     public static final IntegerProperty STAGE = BlockStateProperties.STAGE;
+     private static final VoxelShape SHAPE = Block.column(12.0, 0.0, 12.0);
+     protected final TreeGrower treeGrower;
+-    public static org.bukkit.@org.jspecify.annotations.Nullable TreeType treeType; // CraftBukkit
++    // coderyoMC start - P1.2f: per-thread tree type (concurrency hazard, issue #8). This static
++    // is written by TreeGrower.setTreeType inside growTree (on the ticking thread) and read back
++    // after growTree. Under parallel region ticking two region workers growing trees concurrently
++    // would race this single static slot (wrong TreeType in a StructureGrowEvent). A ThreadLocal
++    // gives each ticking thread its own slot; single-threaded (region.enabled=false) it behaves
++    // exactly like the old static (one thread => one value). Access via the helpers below.
++    private static final ThreadLocal<org.bukkit.TreeType> TREE_TYPE = new ThreadLocal<>();
++
++    public static void coderyoSetTreeType(final org.bukkit.@org.jspecify.annotations.Nullable TreeType type) {
++        if (type == null) {
++            TREE_TYPE.remove();
++        } else {
++            TREE_TYPE.set(type);
++        }
++    }
++
++    /** Read-and-clear the calling thread's captured tree type (used after growTree). */
++    public static org.bukkit.@org.jspecify.annotations.Nullable TreeType coderyoTakeTreeType() {
++        final org.bukkit.TreeType t = TREE_TYPE.get();
++        TREE_TYPE.remove();
++        return t;
++    }
++    // coderyoMC end - P1.2f
+ 
+     @Override
+     public MapCodec<? extends SaplingBlock> codec() {
+@@ -54,22 +76,22 @@ public class SaplingBlock extends VegetationBlock implements BonemealableBlock {
+             level.setBlock(pos, state.cycle(STAGE), Block.UPDATE_NONE);
+         } else {
+             // CraftBukkit start
+-            if (level.captureTreeGeneration) {
++            final net.minecraft.world.level.Level.CaptureState coderyoCap = level.coderyoCapture(); // coderyoMC - P1.2f: per-thread tree-gen capture frame (issue #8)
++            if (coderyoCap.captureTreeGeneration) {
+                 this.treeGrower.growTree(level, level.getChunkSource().getGenerator(), pos, state, random);
+             } else {
+-                level.captureTreeGeneration = true;
++                coderyoCap.captureTreeGeneration = true;
+                 java.util.List<org.bukkit.craftbukkit.block.CraftBlockState> capturedBlockStates;
+                 org.bukkit.TreeType treeType;
+                 try {
+                     this.treeGrower.growTree(level, level.getChunkSource().getGenerator(), pos, state, random);
+                 } finally {
+-                    level.captureTreeGeneration = false;
++                    coderyoCap.captureTreeGeneration = false;
+ 
+-                    capturedBlockStates = new java.util.ArrayList<>(level.capturedBlockStates.values());
+-                    level.capturedBlockStates.clear();
++                    capturedBlockStates = new java.util.ArrayList<>(coderyoCap.capturedBlockStates.values());
++                    coderyoCap.capturedBlockStates.clear();
+ 
+-                    treeType = SaplingBlock.treeType;
+-                    SaplingBlock.treeType = null;
++                    treeType = SaplingBlock.coderyoTakeTreeType(); // coderyoMC - P1.2f: per-thread tree type
+                 }
+                 if (!capturedBlockStates.isEmpty()) {
+                     org.bukkit.Location location = org.bukkit.craftbukkit.util.CraftLocation.toBukkit(pos, level);
+diff --git a/net/minecraft/world/level/block/WitherSkullBlock.java b/net/minecraft/world/level/block/WitherSkullBlock.java
+index 65da2aae8bbddebe829e9b44b36152fdb76d507d..4246be069c010c0442254310e0388c4719e15670 100644
+--- a/net/minecraft/world/level/block/WitherSkullBlock.java
++++ b/net/minecraft/world/level/block/WitherSkullBlock.java
+@@ -43,7 +43,7 @@ public class WitherSkullBlock extends SkullBlock {
+     }
+ 
+     public static void checkSpawn(final Level level, final BlockPos pos) {
+-        if (!level.captureBlockStates && level.getBlockEntity(pos) instanceof SkullBlockEntity placedSkull) { // CraftBukkit
++        if (!level.coderyoCapture().captureBlockStates && level.getBlockEntity(pos) instanceof SkullBlockEntity placedSkull) { // CraftBukkit // coderyoMC - P1.2f: per-thread capture frame
+             checkSpawn(level, pos, placedSkull);
+         }
+     }
+diff --git a/net/minecraft/world/level/block/grower/TreeGrower.java b/net/minecraft/world/level/block/grower/TreeGrower.java
+index 2a537a329b635d48865e59c03589b89594ef012e..d1b112517332bec4e365d018ebc831f78b9dff8b 100644
+--- a/net/minecraft/world/level/block/grower/TreeGrower.java
++++ b/net/minecraft/world/level/block/grower/TreeGrower.java
+@@ -216,51 +216,51 @@ public final class TreeGrower {
+     // CraftBukkit start
+     private void setTreeType(Holder<ConfiguredFeature<?, ?>> feature) {
+         if (feature.is(TreeFeatures.OAK) || feature.is(TreeFeatures.OAK_BEES_005)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.TREE;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.TREE); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.HUGE_RED_MUSHROOM)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.RED_MUSHROOM;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.RED_MUSHROOM); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.HUGE_BROWN_MUSHROOM)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.BROWN_MUSHROOM;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.BROWN_MUSHROOM); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.JUNGLE_TREE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.COCOA_TREE;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.COCOA_TREE); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.JUNGLE_TREE_NO_VINE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.SMALL_JUNGLE;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.SMALL_JUNGLE); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.PINE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.TALL_REDWOOD;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.TALL_REDWOOD); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.SPRUCE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.REDWOOD;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.REDWOOD); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.ACACIA)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.ACACIA;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.ACACIA); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.BIRCH) || feature.is(TreeFeatures.BIRCH_BEES_005)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.BIRCH;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.BIRCH); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.SUPER_BIRCH_BEES_0002)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.TALL_BIRCH;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.TALL_BIRCH); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.SWAMP_OAK)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.SWAMP;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.SWAMP); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.FANCY_OAK) || feature.is(TreeFeatures.FANCY_OAK_BEES_005)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.BIG_TREE;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.BIG_TREE); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.JUNGLE_BUSH)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.JUNGLE_BUSH;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.JUNGLE_BUSH); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.DARK_OAK)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.DARK_OAK;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.DARK_OAK); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.MEGA_SPRUCE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.MEGA_REDWOOD;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.MEGA_REDWOOD); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.MEGA_PINE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.MEGA_PINE;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.MEGA_PINE); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.MEGA_JUNGLE_TREE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.JUNGLE;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.JUNGLE); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.AZALEA_TREE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.AZALEA;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.AZALEA); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.MANGROVE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.MANGROVE;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.MANGROVE); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.TALL_MANGROVE)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.TALL_MANGROVE;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.TALL_MANGROVE); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.CHERRY) || feature.is(TreeFeatures.CHERRY_BEES_005)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.CHERRY;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.CHERRY); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.PALE_OAK) || feature.is(TreeFeatures.PALE_OAK_BONEMEAL)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.PALE_OAK;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.PALE_OAK); // coderyoMC - P1.2f
+         } else if (feature.is(TreeFeatures.PALE_OAK_CREAKING)) {
+-            net.minecraft.world.level.block.SaplingBlock.treeType = org.bukkit.TreeType.PALE_OAK_CREAKING;
++            net.minecraft.world.level.block.SaplingBlock.coderyoSetTreeType(org.bukkit.TreeType.PALE_OAK_CREAKING); // coderyoMC - P1.2f
+         } else {
+             throw new IllegalArgumentException("Unknown tree generator " + feature);
+         }
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 681563230061212afa7994c8eb16c068754db5dd..f945aeaab035a10a47ddcd6e91eb1f1707f31492 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -424,7 +424,7 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+             return null;
+         }
+ 
+-        if (!this.level.isClientSide() && (flags & Block.UPDATE_SKIP_ON_PLACE) == 0 && (!this.level.captureBlockStates || newBlock instanceof net.minecraft.world.level.block.BaseEntityBlock)) { // CraftBukkit - Don't place while processing the BlockPlaceEvent, unless it's a BlockContainer. Prevents blocks such as TNT from activating when cancelled.
++        if (!this.level.isClientSide() && (flags & Block.UPDATE_SKIP_ON_PLACE) == 0 && (!this.level.coderyoCapture().captureBlockStates || newBlock instanceof net.minecraft.world.level.block.BaseEntityBlock)) { // CraftBukkit - Don't place while processing the BlockPlaceEvent, unless it's a BlockContainer. Prevents blocks such as TNT from activating when cancelled. // coderyoMC - P1.2f: per-thread capture frame
+             state.onPlace(this.level, pos, oldState, movedByPiston);
+         }
+ 
+@@ -468,7 +468,7 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+ 
+     public @Nullable BlockEntity getBlockEntity(final BlockPos pos, final LevelChunk.EntityCreationType creationType) {
+         // CraftBukkit start
+-        BlockEntity blockEntity = this.level.capturedBlockEntities.get(pos);
++        BlockEntity blockEntity = this.level.coderyoCapture().capturedBlockEntities.get(pos); // coderyoMC - P1.2f: per-thread capture frame
+         if (blockEntity == null) {
+             blockEntity = this.blockEntities.get(pos);
+         }

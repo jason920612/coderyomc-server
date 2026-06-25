@@ -37,3 +37,9 @@ replay_pid*
 /DESIGN.md
 /docs/
 /research/
+
+# e2e harness generated worlds / scratch (never commit generated server runs)
+test-harness/**/run-*/
+test-harness/**/.detcmp/
+__pycache__/
+*.pyc

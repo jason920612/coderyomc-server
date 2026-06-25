@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyoMC <dev@coderyo.local>
+Date: Thu, 25 Jun 2026 14:02:10 +0800
+Subject: [PATCH] P1.2f: route CraftBukkit tree-gen capture through per-thread
+ frame (issue #8)
+
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+index faa57d7a4dc75a4c8d5c3feba7ae0b1b1fc72547..5b944a76ca1057fff5666f458f497f850420a695 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+@@ -738,18 +738,21 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+ 
+     @Override
+     public boolean generateTree(Location loc, TreeType type, BlockChangeDelegate delegate) {
+-        this.world.captureTreeGeneration = true;
+-        this.world.captureBlockStates = true;
++        // coderyoMC start - P1.2f: per-thread capture frame (issue #8)
++        final net.minecraft.world.level.Level.CaptureState coderyoCap = this.world.coderyoCapture();
++        coderyoCap.captureTreeGeneration = true;
++        coderyoCap.captureBlockStates = true;
++        // coderyoMC end - P1.2f
+         List<org.bukkit.craftbukkit.block.CraftBlockState> capturedBlockStates;
+         boolean grownTree;
+         try {
+             grownTree = this.generateTree(loc, type);
+         } finally {
+-            this.world.captureTreeGeneration = false;
+-            this.world.captureBlockStates = false;
++            coderyoCap.captureTreeGeneration = false; // coderyoMC - P1.2f
++            coderyoCap.captureBlockStates = false; // coderyoMC - P1.2f
+ 
+-            capturedBlockStates = new ArrayList<>(this.world.capturedBlockStates.values());
+-            this.world.capturedBlockStates.clear();
++            capturedBlockStates = new ArrayList<>(coderyoCap.capturedBlockStates.values()); // coderyoMC - P1.2f
++            coderyoCap.capturedBlockStates.clear(); // coderyoMC - P1.2f
+         }
+         if (grownTree) { // Copy block data to delegate
+             for (CraftBlockState snapshot : capturedBlockStates) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java b/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+index bf98fc87b0a2146455f7c56dca6584bb6ae6fb76..f85f32cd4e892c2b3c59d7202385c36fa0dabf78 100644
+--- a/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
++++ b/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+@@ -507,19 +507,19 @@ public class CraftBlock implements Block {
+ 
+         // SPIGOT-6895: Call StructureGrowEvent and BlockFertilizeEvent
+         List<org.bukkit.craftbukkit.block.CraftBlockState> capturedBlockStates;
+-        world.captureTreeGeneration = true;
++        final net.minecraft.world.level.Level.CaptureState coderyoCap = world.coderyoCapture(); // coderyoMC - P1.2f: per-thread capture frame (issue #8)
++        coderyoCap.captureTreeGeneration = true;
+         TreeType treeType;
+         InteractionResult result;
+         try {
+             result = BoneMealItem.applyBonemeal(context);
+         } finally {
+-            world.captureTreeGeneration = false;
++            coderyoCap.captureTreeGeneration = false; // coderyoMC - P1.2f
+ 
+-            capturedBlockStates = new ArrayList<>(world.capturedBlockStates.values());
+-            world.capturedBlockStates.clear();
++            capturedBlockStates = new ArrayList<>(coderyoCap.capturedBlockStates.values()); // coderyoMC - P1.2f
++            coderyoCap.capturedBlockStates.clear(); // coderyoMC - P1.2f
+ 
+-            treeType = SaplingBlock.treeType;
+-            SaplingBlock.treeType = null;
++            treeType = SaplingBlock.coderyoTakeTreeType(); // coderyoMC - P1.2f
+         }
+ 
+         if (!capturedBlockStates.isEmpty()) {
