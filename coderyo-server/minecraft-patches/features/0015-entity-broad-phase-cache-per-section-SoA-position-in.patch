@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Fri, 26 Jun 2026 05:50:58 +0800
+Subject: [PATCH] entity broad-phase cache: per-section SoA position index for
+ getEntities(AABB) (flag-gated)
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+index 8d9ce3d301d5f7e4106587ae00adb8dd5b8b6f88..4e2e5ab9b8af99f40c9bbcd527ff73732fd30fda 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+@@ -480,12 +480,29 @@ public final class ChunkEntitySlices {
+         private final BasicEntityList<Entity>[] entitiesBySection;
+         private int count;
+ 
++        // coderyoMC — entity broad-phase position cache (flag-gated, default OFF).
++        // One thread-confined SoA AABB mirror per stored section, lazily allocated so
++        // that with the flag off (or a never-queried section) zero extra memory is used
++        // and the vanilla scan runs byte-for-byte. See com.coderyo.entitycache.
++        private final com.coderyo.entitycache.SectionAabbCache[] coderyoAabbCache;
++
+         public EntityCollectionBySection(final ChunkEntitySlices slices) {
+             this.slices = slices;
+ 
+             final int sectionCount = slices.maxSection - slices.minSection + 1;
+ 
+             this.entitiesBySection = new BasicEntityList[sectionCount];
++            this.coderyoAabbCache = com.coderyo.entitycache.EntityCacheConfig.isEnabled()
++                ? new com.coderyo.entitycache.SectionAabbCache[sectionCount]
++                : null;
++        }
++
++        private com.coderyo.entitycache.SectionAabbCache coderyoCacheFor(final int sectionSlot) {
++            com.coderyo.entitycache.SectionAabbCache cache = this.coderyoAabbCache[sectionSlot];
++            if (cache == null) {
++                this.coderyoAabbCache[sectionSlot] = cache = new com.coderyo.entitycache.SectionAabbCache();
++            }
++            return cache;
+         }
+ 
+         public void addEntity(final Entity entity, final int sectionIndex) {
+@@ -530,8 +547,11 @@ public final class ChunkEntitySlices {
+ 
+             final BasicEntityList<Entity>[] entitiesBySection = this.entitiesBySection;
+ 
++            final com.coderyo.entitycache.SectionAabbCache[] coderyoAabbCache = this.coderyoAabbCache;
++
+             for (int section = min; section <= max; ++section) {
+-                final BasicEntityList<Entity> list = entitiesBySection[section - minSection];
++                final int sectionSlot = section - minSection;
++                final BasicEntityList<Entity> list = entitiesBySection[sectionSlot];
+ 
+                 if (list == null) {
+                     continue;
+@@ -539,6 +559,13 @@ public final class ChunkEntitySlices {
+ 
+                 final Entity[] storage = list.storage;
+ 
++                // coderyoMC — route the hot broad-phase scan through the SoA AABB cache
++                // when enabled; identical results, cache-friendly memory layout.
++                if (coderyoAabbCache != null) {
++                    this.coderyoCacheFor(sectionSlot).scan(storage, list.size(), except, box, into, predicate);
++                    continue;
++                }
++
+                 for (int i = 0, len = Math.min(storage.length, list.size()); i < len; ++i) {
+                     final Entity entity = storage[i];
+ 
+@@ -568,9 +595,11 @@ public final class ChunkEntitySlices {
+             final int max = Mth.clamp(Mth.floor(box.maxY + 2.0) >> 4, minSection, maxSection);
+ 
+             final BasicEntityList<Entity>[] entitiesBySection = this.entitiesBySection;
++            final com.coderyo.entitycache.SectionAabbCache[] coderyoAabbCache = this.coderyoAabbCache;
+ 
+             for (int section = min; section <= max; ++section) {
+-                final BasicEntityList<Entity> list = entitiesBySection[section - minSection];
++                final int sectionSlot = section - minSection;
++                final BasicEntityList<Entity> list = entitiesBySection[sectionSlot];
+ 
+                 if (list == null) {
+                     continue;
+@@ -578,6 +607,15 @@ public final class ChunkEntitySlices {
+ 
+                 final Entity[] storage = list.storage;
+ 
++                // coderyoMC — cache-backed limited scan; identical results + early stop.
++                if (coderyoAabbCache != null) {
++                    if (this.coderyoCacheFor(sectionSlot)
++                            .scanLimited(storage, list.size(), except, box, into, predicate, maxCount)) {
++                        return true;
++                    }
++                    continue;
++                }
++
+                 for (int i = 0, len = Math.min(storage.length, list.size()); i < len; ++i) {
+                     final Entity entity = storage[i];
+ 
+diff --git a/com/coderyo/entitycache/EntityCacheConfig.java b/com/coderyo/entitycache/EntityCacheConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..75065a0b663b1cc5408e0f3bb0f8908c2304ec54
+--- /dev/null
++++ b/com/coderyo/entitycache/EntityCacheConfig.java
+@@ -0,0 +1,64 @@
++/*
++ * coderyoMC — entity broad-phase position cache. Clean-room independent
++ * implementation; surgical, API-invisible cache of the hot getEntities(AABB)
++ * spatial query. Flag-gated, default OFF.
++ */
++package com.coderyo.entitycache;
++
++/**
++ * Dormancy switch for the entity broad-phase position cache (the surgical SoA
++ * mirror of the per-section AABB extents that backs {@code getEntities(AABB)}).
++ *
++ * <p>Purely additive, same pattern as {@link com.coderyo.region.RegionConfig}:
++ * read from a system property / environment variable, default <strong>false</strong>.
++ * With it false — the default — the broad-phase scan runs the byte-for-byte
++ * vanilla path ({@code entity.getBoundingBox().intersects(box)} over the fat
++ * {@code Entity[]} storage), so the server is vanilla-equivalent.
++ *
++ * <pre>
++ *   -Dcoderyo.entitycache.enabled=true   (system property, takes precedence)
++ *   CODERYO_ENTITYCACHE_ENABLED=true      (environment variable, fallback)
++ * </pre>
++ *
++ * <p>The cache is a contiguous {@code double[]} of the 6 AABB extents kept
++ * parallel to each section's {@code Entity[]} storage. It is refreshed lazily
++ * from the live {@code entity.getBoundingBox()} whenever the box object identity
++ * changes ({@code setBoundingBox} always allocates a fresh {@code AABB}), so the
++ * query returns the <em>identical</em> entity set as vanilla — only the memory
++ * layout of the scan differs (flat primitive array vs per-entity heap AABB).
++ */
++public final class EntityCacheConfig {
++
++    /** System property key. */
++    public static final String PROPERTY = "coderyo.entitycache.enabled";
++    /** Environment variable key. */
++    public static final String ENV = "CODERYO_ENTITYCACHE_ENABLED";
++
++    /** {@code entitycache.enabled} default — OFF (vanilla path). */
++    public static final boolean DEFAULT_ENABLED = false;
++
++    private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
++
++    private EntityCacheConfig() {
++    }
++
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
++        }
++        return fallback;
++    }
++
++    /**
++     * Whether the entity broad-phase position cache is enabled. Resolved once at
++     * class-load. Default {@link #DEFAULT_ENABLED} (false) → the vanilla scan runs.
++     */
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++}
+diff --git a/com/coderyo/entitycache/SectionAabbCache.java b/com/coderyo/entitycache/SectionAabbCache.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..262a3b77fd3098b2ffd0ef49515c8a8b136463a1
+--- /dev/null
++++ b/com/coderyo/entitycache/SectionAabbCache.java
+@@ -0,0 +1,213 @@
++/*
++ * coderyoMC — entity broad-phase position cache.
++ */
++package com.coderyo.entitycache;
++
++import java.util.List;
++import java.util.function.Predicate;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.phys.AABB;
++
++/**
++ * A cache-friendly Structure-of-Arrays mirror of one chunk-section's entity AABB
++ * extents, kept parallel to the section's {@code Entity[]} storage so the hot
++ * broad-phase scan ({@code getEntities(AABB)}) iterates <em>contiguous primitive
++ * doubles</em> instead of pointer-chasing a fat {@code Entity} to reach its heap
++ * {@code AABB} object on every candidate.
++ *
++ * <h3>Correctness — identical results to vanilla</h3>
++ * Each row {@code i} caches {@code (refEntity, refBox, minX..maxZ)}. On scan, the
++ * row is validated against the live entity:
++ * <ul>
++ *   <li>if {@code storage[i] != refEntity[i]} (slot reused after add/remove) or
++ *       {@code entity.getBoundingBox() != refBox[i]} (the box object changed —
++ *       {@code Entity.setBoundingBox} always allocates a <em>new</em> {@code AABB},
++ *       so identity inequality is an exact "moved/resized" signal), the 6 cached
++ *       doubles are refreshed from the live box and the refs updated.</li>
++ * </ul>
++ * The intersection test then runs against the freshly-validated doubles, which are
++ * byte-identical to {@code entity.getBoundingBox()}. The predicate and {@code except}
++ * filters are applied exactly as vanilla, in the same order, so the produced list is
++ * the same set in the same order. The only difference from the vanilla loop is the
++ * memory layout the {@code intersects} math reads from.
++ *
++ * <p>Thread-confined: one instance per {@code EntityCollectionBySection}, mutated and
++ * read only on the owning level/region tick thread (single-writer; respects the #24
++ * race class — no cross-region shared mutable state).
++ */
++public final class SectionAabbCache {
++
++    private static final int GROWTH_SLACK = 4;
++
++    private Entity[] refEntity;
++    private AABB[] refBox;
++    private double[] minX;
++    private double[] minY;
++    private double[] minZ;
++    private double[] maxX;
++    private double[] maxY;
++    private double[] maxZ;
++
++    public SectionAabbCache() {
++        this.refEntity = EMPTY_ENTITY;
++        this.refBox = EMPTY_BOX;
++        this.minX = EMPTY_D;
++        this.minY = EMPTY_D;
++        this.minZ = EMPTY_D;
++        this.maxX = EMPTY_D;
++        this.maxY = EMPTY_D;
++        this.maxZ = EMPTY_D;
++    }
++
++    private static final Entity[] EMPTY_ENTITY = new Entity[0];
++    private static final AABB[] EMPTY_BOX = new AABB[0];
++    private static final double[] EMPTY_D = new double[0];
++
++    private void ensureCapacity(final int len) {
++        if (this.refEntity.length >= len) {
++            return;
++        }
++        final int cap = len + GROWTH_SLACK;
++        this.refEntity = new Entity[cap];
++        this.refBox = new AABB[cap];
++        this.minX = new double[cap];
++        this.minY = new double[cap];
++        this.minZ = new double[cap];
++        this.maxX = new double[cap];
++        this.maxY = new double[cap];
++        this.maxZ = new double[cap];
++        // grown arrays start cleared (refEntity all null) so every row is treated as
++        // stale and re-validated on first touch — correctness preserved.
++    }
++
++    /**
++     * Cache-resident broad-phase scan over one section's contiguous {@code storage}.
++     * Mirror of {@code EntityCollectionBySection.getEntities}'s inner loop but reading
++     * intersection math from the SoA doubles. Returns identical results to vanilla.
++     */
++    public void scan(final Entity[] storage, final int size,
++                     final Entity except, final AABB box,
++                     final List<Entity> into, final Predicate<? super Entity> predicate) {
++        final int len = Math.min(storage.length, size);
++        if (len == 0) {
++            return;
++        }
++        this.ensureCapacity(len);
++
++        final Entity[] refEntity = this.refEntity;
++        final AABB[] refBox = this.refBox;
++        final double[] aMinX = this.minX;
++        final double[] aMinY = this.minY;
++        final double[] aMinZ = this.minZ;
++        final double[] aMaxX = this.maxX;
++        final double[] aMaxY = this.maxY;
++        final double[] aMaxZ = this.maxZ;
++
++        final double bMinX = box.minX;
++        final double bMinY = box.minY;
++        final double bMinZ = box.minZ;
++        final double bMaxX = box.maxX;
++        final double bMaxY = box.maxY;
++        final double bMaxZ = box.maxZ;
++
++        for (int i = 0; i < len; ++i) {
++            final Entity entity = storage[i];
++            if (entity == null || entity == except) {
++                continue;
++            }
++
++            // Validate / refresh the SoA row against the live entity (identical-result guard).
++            final AABB live = entity.getBoundingBox();
++            if (refEntity[i] != entity || refBox[i] != live) {
++                refEntity[i] = entity;
++                refBox[i] = live;
++                aMinX[i] = live.minX;
++                aMinY[i] = live.minY;
++                aMinZ[i] = live.minZ;
++                aMaxX[i] = live.maxX;
++                aMaxY[i] = live.maxY;
++                aMaxZ[i] = live.maxZ;
++            }
++
++            // AABB.intersects, computed from the contiguous primitive arrays.
++            if (bMinX > aMaxX[i] || bMaxX < aMinX[i]
++                || bMinY > aMaxY[i] || bMaxY < aMinY[i]
++                || bMinZ > aMaxZ[i] || bMaxZ < aMinZ[i]) {
++                continue;
++            }
++
++            if (predicate != null && !predicate.test(entity)) {
++                continue;
++            }
++
++            into.add(entity);
++        }
++    }
++
++    /**
++     * Limited variant — mirror of {@code getEntitiesLimited}. Returns true when the
++     * caller's {@code maxCount} is reached (so the outer loop can stop).
++     */
++    public boolean scanLimited(final Entity[] storage, final int size,
++                               final Entity except, final AABB box,
++                               final List<Entity> into, final Predicate<? super Entity> predicate,
++                               final int maxCount) {
++        final int len = Math.min(storage.length, size);
++        if (len == 0) {
++            return false;
++        }
++        this.ensureCapacity(len);
++
++        final Entity[] refEntity = this.refEntity;
++        final AABB[] refBox = this.refBox;
++        final double[] aMinX = this.minX;
++        final double[] aMinY = this.minY;
++        final double[] aMinZ = this.minZ;
++        final double[] aMaxX = this.maxX;
++        final double[] aMaxY = this.maxY;
++        final double[] aMaxZ = this.maxZ;
++
++        final double bMinX = box.minX;
++        final double bMinY = box.minY;
++        final double bMinZ = box.minZ;
++        final double bMaxX = box.maxX;
++        final double bMaxY = box.maxY;
++        final double bMaxZ = box.maxZ;
++
++        for (int i = 0; i < len; ++i) {
++            final Entity entity = storage[i];
++            if (entity == null || entity == except) {
++                continue;
++            }
++
++            final AABB live = entity.getBoundingBox();
++            if (refEntity[i] != entity || refBox[i] != live) {
++                refEntity[i] = entity;
++                refBox[i] = live;
++                aMinX[i] = live.minX;
++                aMinY[i] = live.minY;
++                aMinZ[i] = live.minZ;
++                aMaxX[i] = live.maxX;
++                aMaxY[i] = live.maxY;
++                aMaxZ[i] = live.maxZ;
++            }
++
++            if (bMinX > aMaxX[i] || bMaxX < aMinX[i]
++                || bMinY > aMaxY[i] || bMaxY < aMinY[i]
++                || bMinZ > aMaxZ[i] || bMaxZ < aMinZ[i]) {
++                continue;
++            }
++
++            if (predicate != null && !predicate.test(entity)) {
++                continue;
++            }
++
++            into.add(entity);
++            if (into.size() >= maxCount) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++}
