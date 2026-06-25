@@ -1,0 +1,797 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyo <actions@coderyo>
+Date: Thu, 25 Jun 2026 10:07:24 +0800
+Subject: [PATCH] coderyo region foundation (dormant)
+
+
+diff --git a/com/coderyo/region/Region.java b/com/coderyo/region/Region.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4db7cc1b969aa27bb6502a699498c07db7afecfa
+--- /dev/null
++++ b/com/coderyo/region/Region.java
+@@ -0,0 +1,169 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.longs.LongSet;
++import it.unimi.dsi.fastutil.longs.LongSets;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.AtomicReference;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++
++/**
++ * A region: the single-writer tick unit (design-spec §4.1).
++ *
++ * <p>Owns a connected set of loaded chunks within ONE dimension, plus an inbound
++ * lock-free {@link RegionizedTaskQueue}. While a region is being ticked, exactly
++ * one thread owns it, giving intra-region game-state logic lock-free access
++ * (single-writer-per-region invariant).
++ *
++ * <p>Chunk membership is stored as packed {@link ChunkPos#longKey() long keys}
++ * (matching {@link ChunkPos#pack(int, int)}). Mutations to the chunk set go through
++ * the {@link com.coderyo.region.merge merge/split} subsystem, which guarantees the
++ * region is quiescent (not ticking) during structural changes.
++ *
++ * <p>P1.1: working data structure + hooks. NOT yet wired into the live tick loop;
++ * with {@code region.enabled=false} no Region is ever constructed at runtime.
++ */
++public final class Region {
++
++    private final RegionId id;
++    private final ResourceKey<Level> dimension;
++
++    /** Packed chunk keys owned by this region. Guarded by the merge/split subsystem. */
++    private final LongOpenHashSet chunks = new LongOpenHashSet();
++
++    private final RegionizedTaskQueue inbound = new RegionizedTaskQueue();
++
++    /** Owning thread while this region is mid-tick; null when idle. Enforces single-writer. */
++    private final AtomicReference<Thread> tickOwner = new AtomicReference<>(null);
++
++    private final AtomicLong lastTickNanos = new AtomicLong(0L);
++
++    public Region(final RegionId id, final ResourceKey<Level> dimension) {
++        this.id = id;
++        this.dimension = dimension;
++    }
++
++    public RegionId id() {
++        return this.id;
++    }
++
++    public ResourceKey<Level> dimension() {
++        return this.dimension;
++    }
++
++    /** Lock-free inbound queue: cross-region tasks are posted here, drained at tick start. */
++    public RegionizedTaskQueue inbound() {
++        return this.inbound;
++    }
++
++    /** A region is active (worth scheduling) when it owns at least one chunk. */
++    public boolean isActive() {
++        synchronized (this.chunks) {
++            return !this.chunks.isEmpty();
++        }
++    }
++
++    /** Number of chunks currently owned by this region. */
++    public int chunkCount() {
++        synchronized (this.chunks) {
++            return this.chunks.size();
++        }
++    }
++
++    /** Whether this region owns the given packed chunk key. */
++    public boolean ownsChunk(final long packedChunkKey) {
++        synchronized (this.chunks) {
++            return this.chunks.contains(packedChunkKey);
++        }
++    }
++
++    /** Whether this region owns the given chunk position. */
++    public boolean ownsChunk(final ChunkPos pos) {
++        return this.ownsChunk(pos.longKey());
++    }
++
++    /** Read-only snapshot of owned chunk keys (defensive copy; safe for cross-thread reads). */
++    public LongSet chunkKeysSnapshot() {
++        synchronized (this.chunks) {
++            return LongSets.unmodifiable(new LongOpenHashSet(this.chunks));
++        }
++    }
++
++    // --- structural mutation: only the com.coderyo.region.merge subsystem should call these.
++    //     (public because the merge subsystem lives in a sub-package; treat as internal API.) ---
++
++    /** Internal: add a chunk to this region. Merge-subsystem only. */
++    public void addChunkInternal(final long packedChunkKey) {
++        synchronized (this.chunks) {
++            this.chunks.add(packedChunkKey);
++        }
++    }
++
++    /** Internal: remove a chunk from this region. Merge-subsystem only. */
++    public boolean removeChunkInternal(final long packedChunkKey) {
++        synchronized (this.chunks) {
++            return this.chunks.remove(packedChunkKey);
++        }
++    }
++
++    /** Internal: absorb all chunks of {@code other} into this region (merge). Merge-subsystem only. */
++    public void absorbInternal(final Region other) {
++        synchronized (this.chunks) {
++            synchronized (other.chunks) {
++                this.chunks.addAll(other.chunks);
++                other.chunks.clear();
++            }
++        }
++    }
++
++    /** Last per-region tick wall-time in nanos (per-region TPS accounting, design-spec §4.2). */
++    public long lastTickNanos() {
++        return this.lastTickNanos.get();
++    }
++
++    /**
++     * Executes one region tick: claim single-writer ownership, drain inbound tasks,
++     * run the body, release ownership, and record timing.
++     *
++     * <p>P1.1: {@code body} is a no-op-friendly hook — the real per-region game logic
++     * (entity/block-entity/scheduled-tick decomposition mapped in P1-integration-notes.md
++     * S3-S6) is wired in P1.2. This method is NOT yet called by the server.
++     *
++     * @throws IllegalStateException if another thread already owns this region tick
++     *         (single-writer-per-region invariant violation — fail loud, never silent).
++     */
++    public void tick(final Runnable body) {
++        final Thread self = Thread.currentThread();
++        if (!this.tickOwner.compareAndSet(null, self)) {
++            throw new IllegalStateException(
++                "single-writer-per-region invariant violated: region " + this.id
++                    + " already owned by " + this.tickOwner.get());
++        }
++        final long start = System.nanoTime();
++        try {
++            this.inbound.drain();
++            if (body != null) {
++                body.run();
++            }
++        } finally {
++            this.lastTickNanos.set(System.nanoTime() - start);
++            this.tickOwner.set(null);
++        }
++    }
++
++    /** True if the current thread is mid-tick owner of this region (thread-check helper). */
++    public boolean isOwnedByCurrentThread() {
++        return this.tickOwner.get() == Thread.currentThread();
++    }
++
++    @Override
++    public String toString() {
++        return "Region[" + this.id + " dim=" + this.dimension.identifier() + " chunks=" + this.chunkCount() + "]";
++    }
++}
+diff --git a/com/coderyo/region/RegionConfig.java b/com/coderyo/region/RegionConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d80f5955febe71cbea3cc9af38d4fa9520f178b7
+--- /dev/null
++++ b/com/coderyo/region/RegionConfig.java
+@@ -0,0 +1,58 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++/**
++ * Dormancy switch for the regionization subsystem (design-spec §7.2: {@code region.enabled}).
++ *
++ * <p>P1.1 keeps the foundation <em>purely additive</em>: rather than patch an upstream
++ * config file (which would risk patch drift and is unnecessary while nothing consults the
++ * flag), the switch is read from a system property / environment variable, defaulting to
++ * <strong>false</strong>. With it false — the default — the region core never runs and the
++ * server boots byte-for-byte vanilla-equivalent.
++ *
++ * <p>P1.2 will surface this in {@code config/coderyo.yml} once the tick loop actually
++ * consults it (see P1-integration-notes.md §1).
++ *
++ * <pre>
++ *   -Dcoderyo.region.enabled=true        (system property, takes precedence)
++ *   CODERYO_REGION_ENABLED=true          (environment variable, fallback)
++ * </pre>
++ */
++public final class RegionConfig {
++
++    /** System property key. */
++    public static final String PROPERTY = "coderyo.region.enabled";
++    /** Environment variable key. */
++    public static final String ENV = "CODERYO_REGION_ENABLED";
++
++    /** {@code region.enabled} default — dormant. */
++    public static final boolean DEFAULT_ENABLED = false;
++
++    private static final boolean ENABLED = resolveEnabled();
++
++    private RegionConfig() {
++    }
++
++    private static boolean resolveEnabled() {
++        final String prop = System.getProperty(PROPERTY);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String env = System.getenv(ENV);
++        if (env != null) {
++            return Boolean.parseBoolean(env.trim());
++        }
++        return DEFAULT_ENABLED;
++    }
++
++    /**
++     * Whether the regionization subsystem is enabled. Resolved once at class-load.
++     * Default {@link #DEFAULT_ENABLED} (false) → the region core stays dormant.
++     */
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++}
+diff --git a/com/coderyo/region/RegionId.java b/com/coderyo/region/RegionId.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c58a3b4f9032b8db0d105c68e44176aeb5eff791
+--- /dev/null
++++ b/com/coderyo/region/RegionId.java
+@@ -0,0 +1,37 @@
++/*
++ * coderyoMC — regionized multithreading core.
++ *
++ * Clean-room provenance: this package is an INDEPENDENT implementation of a
++ * regionized-threading model derived from public concepts only. PaperMC/Folia
++ * (GPL-3.0) was studied as a CONCEPT reference; no Folia source is copied.
++ * See design-spec.md §4 and Risk R3.
++ */
++package com.coderyo.region;
++
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Stable, comparable region identity.
++ *
++ * <p>Opaque value type. Comparability gives a global partial order used later by
++ * the plugin-compat layer's ordered-wait rule (design-spec §5, deadlock rule 4):
++ * a thread may only synchronously wait on a <em>higher-ordered</em> region.
++ *
++ * <p>P1.1: a working data structure only. Not yet referenced by the live tick loop
++ * ({@code region.enabled} defaults false), so the running server is unchanged.
++ */
++public record RegionId(long value) implements Comparable<RegionId> {
++
++    /** Monotonic source of fresh region identities; never recycles within a run. */
++    private static final AtomicLong SEQUENCE = new AtomicLong(0L);
++
++    /** Allocates a fresh, globally-unique region id. */
++    public static RegionId next() {
++        return new RegionId(SEQUENCE.incrementAndGet());
++    }
++
++    @Override
++    public int compareTo(final RegionId o) {
++        return Long.compare(this.value, o.value);
++    }
++}
+diff --git a/com/coderyo/region/RegionIndex.java b/com/coderyo/region/RegionIndex.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9efdd5fbaf1945743d9e5cfd97f24fc5be5cc573
+--- /dev/null
++++ b/com/coderyo/region/RegionIndex.java
+@@ -0,0 +1,144 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * Read-mostly, copy-on-merge index from chunk coordinate to owning {@link RegionId},
++ * partitioned per dimension (design-spec §4.1 / §4.3).
++ *
++ * <p>Lookups ({@link #regionOf}) are the hot path (consulted while scheduling /
++ * resolving cross-region API calls) and must stay lock-light. We keep one
++ * immutable-on-read {@code long -> RegionId} map per dimension; structural changes
++ * (merge/split) replace the per-dimension map under a short write lock
++ * (copy-on-merge), so readers never block.
++ *
++ * <p>P1.1: a working concurrent structure. The {@code onChunkLoad/onChunkUnload}
++ * hooks are present but NOT yet subscribed to Moonrise's chunk-status transitions
++ * (P1-integration-notes.md §3) — they are driven only by the merge subsystem / tests
++ * for now, so the running server is unchanged.
++ */
++public final class RegionIndex {
++
++    /** Per-dimension chunk->region maps. Each value map is treated as copy-on-write. */
++    private final Map<ResourceKey<Level>, ConcurrentLongMap> byDimension = new ConcurrentHashMap<>();
++
++    /**
++     * Thin wrapper giving a lock-light read path over a fastutil long map.
++     * Reads are unsynchronized against a volatile snapshot; writes copy-and-replace.
++     */
++    private static final class ConcurrentLongMap {
++        private volatile Long2ObjectMap<RegionId> snapshot = Long2ObjectMaps.empty();
++
++        @Nullable
++        RegionId get(final long key) {
++            return this.snapshot.get(key);
++        }
++
++        synchronized void put(final long key, final RegionId region) {
++            final Long2ObjectOpenHashMap<RegionId> copy = new Long2ObjectOpenHashMap<>(this.snapshot);
++            copy.put(key, region);
++            this.snapshot = copy;
++        }
++
++        synchronized void remove(final long key) {
++            if (!this.snapshot.containsKey(key)) {
++                return;
++            }
++            final Long2ObjectOpenHashMap<RegionId> copy = new Long2ObjectOpenHashMap<>(this.snapshot);
++            copy.remove(key);
++            this.snapshot = copy;
++        }
++
++        synchronized void reassign(final RegionId from, final RegionId to) {
++            final Long2ObjectOpenHashMap<RegionId> copy = new Long2ObjectOpenHashMap<>(this.snapshot);
++            for (final Long2ObjectMap.Entry<RegionId> e : copy.long2ObjectEntrySet()) {
++                if (e.getValue().equals(from)) {
++                    e.setValue(to);
++                }
++            }
++            this.snapshot = copy;
++        }
++
++        int size() {
++            return this.snapshot.size();
++        }
++    }
++
++    /** Minimal empty-map helper to avoid pulling in fastutil's Long2ObjectMaps statics by name. */
++    private static final class Long2ObjectMaps {
++        static <V> Long2ObjectMap<V> empty() {
++            return new Long2ObjectOpenHashMap<>(0);
++        }
++    }
++
++    private ConcurrentLongMap mapFor(final ResourceKey<Level> dimension) {
++        return this.byDimension.computeIfAbsent(dimension, d -> new ConcurrentLongMap());
++    }
++
++    /** Hot path: owning region of a packed chunk key, or {@code null} if unowned. */
++    @Nullable
++    public RegionId regionOf(final ResourceKey<Level> dimension, final long packedChunkKey) {
++        final ConcurrentLongMap map = this.byDimension.get(dimension);
++        return map == null ? null : map.get(packedChunkKey);
++    }
++
++    @Nullable
++    public RegionId regionOf(final ResourceKey<Level> dimension, final ChunkPos pos) {
++        return this.regionOf(dimension, pos.longKey());
++    }
++
++    /** Assign (or reassign) a chunk to a region. Called by the merge/split subsystem. */
++    public void assign(final ResourceKey<Level> dimension, final long packedChunkKey, final RegionId region) {
++        this.mapFor(dimension).put(packedChunkKey, region);
++    }
++
++    /** Drop a chunk from the index. Called by the merge/split subsystem on unload. */
++    public void unassign(final ResourceKey<Level> dimension, final long packedChunkKey) {
++        final ConcurrentLongMap map = this.byDimension.get(dimension);
++        if (map != null) {
++            map.remove(packedChunkKey);
++        }
++    }
++
++    /** Copy-on-merge: re-point every chunk currently owned by {@code from} to {@code to}. */
++    public void reassignAll(final ResourceKey<Level> dimension, final RegionId from, final RegionId to) {
++        final ConcurrentLongMap map = this.byDimension.get(dimension);
++        if (map != null) {
++            map.reassign(from, to);
++        }
++    }
++
++    /** Number of indexed chunks in a dimension (diagnostics). */
++    public int size(final ResourceKey<Level> dimension) {
++        final ConcurrentLongMap map = this.byDimension.get(dimension);
++        return map == null ? 0 : map.size();
++    }
++
++    // --- live chunk-load/unload hooks (P1.2 will subscribe these to Moonrise) ---
++
++    /**
++     * Signal that a chunk became loaded/full. P1.2 wires this to Moonrise's
++     * {@code NewChunkHolder} full-status transition; here it merely delegates to the
++     * merge subsystem to (re)form regions. No-op until merge logic is driven.
++     */
++    public void onChunkLoad(final ResourceKey<Level> dimension, final long packedChunkKey) {
++        // P1.1: structural formation is performed by com.coderyo.region.merge.RegionMerger,
++        // which is exercised by tests on a chunk-adjacency model. Live hook deferred to P1.2.
++    }
++
++    /** Signal that a chunk unloaded; may trigger a region split. No-op until wired (P1.2). */
++    public void onChunkUnload(final ResourceKey<Level> dimension, final long packedChunkKey) {
++        // P1.1: see onChunkLoad.
++    }
++}
+diff --git a/com/coderyo/region/RegionScheduler.java b/com/coderyo/region/RegionScheduler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b454002ddba41d297bd5b292d0aa55917a8e4de
+--- /dev/null
++++ b/com/coderyo/region/RegionScheduler.java
+@@ -0,0 +1,40 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import java.util.concurrent.CompletableFuture;
++import java.util.function.Supplier;
++
++/**
++ * Schedules region ticks and routes cross-region tasks (design-spec §4.2 / §4.3).
++ *
++ * <p>The production implementation (P1.2) is a work-stealing pool that ticks all
++ * active regions in parallel while preserving the single-writer-per-region
++ * invariant. P1.1 ships only the interface plus {@link SequentialRegionScheduler},
++ * a no-op-equivalent sequential implementation, so the wiring point exists but the
++ * server's behaviour is unchanged ({@code region.enabled=false}).
++ *
++ * <p>Deadlock-freedom contract (design-spec §4.5): a region tick thread never blocks
++ * on another region; cross-region results are {@link CompletableFuture}s resolved on
++ * the target region thread, never awaited synchronously from inside a region tick;
++ * posting is single-directional.
++ */
++public interface RegionScheduler {
++
++    /** Run exactly one tick pass over all active regions. The body runs each region's tick. */
++    void submitTick(Iterable<Region> activeRegions, java.util.function.Consumer<Region> regionTickBody);
++
++    /** Post a fire-and-forget task to a region's inbound queue (drained at its next tick). */
++    void post(RegionId target, Region region, Runnable task);
++
++    /**
++     * Post a value-returning task resolved on the target region thread.
++     * MUST NOT be awaited synchronously from inside a region tick (design-spec §4.4).
++     */
++    <T> CompletableFuture<T> postQuery(RegionId target, Region region, Supplier<T> query);
++
++    /** Release scheduler resources. */
++    void shutdown();
++}
+diff --git a/com/coderyo/region/RegionizedTaskQueue.java b/com/coderyo/region/RegionizedTaskQueue.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5bcf088e7add7cdcd207e6101692d51a9a08de2
+--- /dev/null
++++ b/com/coderyo/region/RegionizedTaskQueue.java
+@@ -0,0 +1,62 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Lock-free MPSC inbound queue for a single {@link Region} (many posters, one drainer).
++ *
++ * <p>Many threads may {@link #post(Runnable)} a one-directional task; exactly the
++ * owning region thread {@link #drain()}s it at the start of its next tick. This is
++ * the ONLY channel into a region from the outside — combined with the
++ * single-writer-per-region invariant it makes cross-region operations
++ * deadlock-free by construction (design-spec §4.4 / §4.5).
++ *
++ * <p>Backed by {@link ConcurrentLinkedQueue} (lock-free Michael-Scott MPSC-safe).
++ * P1.1 provides the working structure; it is not yet fed by the live tick loop.
++ */
++public final class RegionizedTaskQueue {
++
++    private final ConcurrentLinkedQueue<Runnable> queue = new ConcurrentLinkedQueue<>();
++    private final AtomicLong posted = new AtomicLong();
++    private final AtomicLong drained = new AtomicLong();
++
++    /** Enqueue a task from any thread. Never blocks. */
++    public void post(final Runnable task) {
++        if (task == null) {
++            throw new NullPointerException("task");
++        }
++        this.queue.add(task);
++        this.posted.incrementAndGet();
++    }
++
++    /**
++     * Drain and run all currently-queued tasks. MUST be called only by the owning
++     * region thread (single-drainer contract). Tasks posted during draining are
++     * left for the next drain (snapshot of the current backlog) to bound the pass.
++     */
++    public void drain() {
++        // Snapshot the backlog size so a flood of concurrent posts cannot starve
++        // the caller within a single tick.
++        long budget = this.posted.get() - this.drained.get();
++        Runnable task;
++        while (budget-- > 0 && (task = this.queue.poll()) != null) {
++            this.drained.incrementAndGet();
++            task.run();
++        }
++    }
++
++    /** Approximate pending-task count (lock-free, may be momentarily stale). */
++    public boolean isEmpty() {
++        return this.queue.isEmpty();
++    }
++
++    /** Total tasks posted over the lifetime of this queue (diagnostics). */
++    public long totalPosted() {
++        return this.posted.get();
++    }
++}
+diff --git a/com/coderyo/region/SequentialRegionScheduler.java b/com/coderyo/region/SequentialRegionScheduler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fe7a8da2a713468d593cd54ab9ce86b2d60f979
+--- /dev/null
++++ b/com/coderyo/region/SequentialRegionScheduler.java
+@@ -0,0 +1,56 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import java.util.concurrent.CompletableFuture;
++import java.util.function.Consumer;
++import java.util.function.Supplier;
++
++/**
++ * Default SEQUENTIAL {@link RegionScheduler}: ticks regions one at a time on the
++ * calling thread, with no work-stealing pool. Behaviourally equivalent to the
++ * legacy single-main-thread model.
++ *
++ * <p>This is the dormant default for P1.1: it lets the wiring point compile and exist
++ * without changing observable server behaviour. P1.2 replaces it with a parallel
++ * work-stealing scheduler, gated on {@code region.enabled}.
++ */
++public final class SequentialRegionScheduler implements RegionScheduler {
++
++    @Override
++    public void submitTick(final Iterable<Region> activeRegions, final Consumer<Region> regionTickBody) {
++        for (final Region region : activeRegions) {
++            if (region.isActive()) {
++                // Region.tick claims single-writer ownership, drains inbound, runs the body.
++                region.tick(() -> regionTickBody.accept(region));
++            }
++        }
++    }
++
++    @Override
++    public void post(final RegionId target, final Region region, final Runnable task) {
++        // Sequential: just enqueue; drained at the region's next tick (or immediately if idle).
++        region.inbound().post(task);
++    }
++
++    @Override
++    public <T> CompletableFuture<T> postQuery(final RegionId target, final Region region, final Supplier<T> query) {
++        // Sequential model: resolve the query on the region thread at next drain.
++        final CompletableFuture<T> future = new CompletableFuture<>();
++        region.inbound().post(() -> {
++            try {
++                future.complete(query.get());
++            } catch (final Throwable t) {
++                future.completeExceptionally(t);
++            }
++        });
++        return future;
++    }
++
++    @Override
++    public void shutdown() {
++        // No pooled resources to release.
++    }
++}
+diff --git a/com/coderyo/region/merge/RegionMerger.java b/com/coderyo/region/merge/RegionMerger.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5017d5fb097f281805219d466b6ba61b88ed26a
+--- /dev/null
++++ b/com/coderyo/region/merge/RegionMerger.java
+@@ -0,0 +1,177 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ * The connected-cluster merge/split model below is derived from the public concept
++ * (regions = connected loaded-chunk clusters per dimension) and implemented from
++ * scratch with a standard union-find / flood-fill; no GPL source consulted.
++ */
++package com.coderyo.region.merge;
++
++import com.coderyo.region.Region;
++import com.coderyo.region.RegionId;
++import com.coderyo.region.RegionIndex;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import java.util.ArrayList;
++import java.util.List;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++
++/**
++ * Forms regions from connected clusters of loaded chunks within one dimension, and
++ * splits/merges them as chunks unload/load (design-spec §4.1).
++ *
++ * <p>Model (P1.1): this operates on an in-memory <em>chunk-adjacency model</em> — a set
++ * of packed {@link ChunkPos#longKey() long chunk keys} that are "loaded" within a single
++ * dimension. Two chunks are connected when they are within {@link #mergeRadius} Chebyshev
++ * distance (design-spec §7.2 default {@code region.mergeRadius = 8}). Each maximal connected
++ * cluster becomes one {@link Region}. The live chunk-load/unload hooks (Moonrise
++ * {@code NewChunkHolder} status transitions, P1-integration-notes.md §3) are wired in P1.2;
++ * this class is the pure data-structure logic the live hooks will drive.
++ *
++ * <p>Per-dimension only: a merger instance owns exactly one {@link ResourceKey}{@code <Level>};
++ * regions never span dimensions (cross-dimension moves are ownership transfers, §4.4).
++ *
++ * <p>Not thread-safe by itself: structural recompute is expected to run while regions are
++ * quiescent (between ticks), consistent with the single-writer invariant.
++ */
++public final class RegionMerger {
++
++    /** Default Chebyshev merge radius in chunks (design-spec §7.2 {@code region.mergeRadius}). */
++    public static final int DEFAULT_MERGE_RADIUS = 8;
++
++    private final ResourceKey<Level> dimension;
++    private final int mergeRadius;
++    private final RegionIndex index;
++
++    /** Currently-loaded chunk keys in this dimension (the adjacency-model input). */
++    private final LongOpenHashSet loadedChunks = new LongOpenHashSet();
++
++    /** Live regions, keyed by id. */
++    private final Long2ObjectOpenHashMap<Region> regions = new Long2ObjectOpenHashMap<>();
++
++    public RegionMerger(final ResourceKey<Level> dimension, final RegionIndex index) {
++        this(dimension, index, DEFAULT_MERGE_RADIUS);
++    }
++
++    public RegionMerger(final ResourceKey<Level> dimension, final RegionIndex index, final int mergeRadius) {
++        if (mergeRadius < 1) {
++            throw new IllegalArgumentException("mergeRadius must be >= 1, got " + mergeRadius);
++        }
++        this.dimension = dimension;
++        this.index = index;
++        this.mergeRadius = mergeRadius;
++    }
++
++    public ResourceKey<Level> dimension() {
++        return this.dimension;
++    }
++
++    public int mergeRadius() {
++        return this.mergeRadius;
++    }
++
++    /** Add a loaded chunk to the model (merge-on-load). Triggers a recompute. */
++    public void addLoadedChunk(final long packedChunkKey) {
++        if (this.loadedChunks.add(packedChunkKey)) {
++            this.recompute();
++        }
++    }
++
++    public void addLoadedChunk(final ChunkPos pos) {
++        this.addLoadedChunk(pos.longKey());
++    }
++
++    /** Remove a loaded chunk from the model (split-on-unload). Triggers a recompute. */
++    public void removeLoadedChunk(final long packedChunkKey) {
++        if (this.loadedChunks.remove(packedChunkKey)) {
++            this.recompute();
++        }
++    }
++
++    public void removeLoadedChunk(final ChunkPos pos) {
++        this.removeLoadedChunk(pos.longKey());
++    }
++
++    /** Live regions in this dimension (snapshot copy). */
++    public List<Region> regions() {
++        return new ArrayList<>(this.regions.values());
++    }
++
++    public int regionCount() {
++        return this.regions.size();
++    }
++
++    public int loadedChunkCount() {
++        return this.loadedChunks.size();
++    }
++
++    /**
++     * Recomputes the region partition from the current loaded-chunk set via flood-fill
++     * over the Chebyshev-{@code mergeRadius} adjacency relation, then rebuilds the
++     * {@link RegionIndex} for this dimension. Each maximal connected cluster → one region.
++     *
++     * <p>O(N · (2r+1)^2) per recompute over N loaded chunks; fine for the data-structure
++     * milestone. P1.2 will switch to incremental union-find driven by load/unload deltas
++     * instead of full recompute.
++     */
++    public void recompute() {
++        // Clear the index entries for this dimension's previously-owned chunks.
++        for (final Region old : this.regions.values()) {
++            final long[] keys = old.chunkKeysSnapshot().toLongArray();
++            for (final long key : keys) {
++                this.index.unassign(this.dimension, key);
++            }
++        }
++        this.regions.clear();
++
++        final LongOpenHashSet unvisited = new LongOpenHashSet(this.loadedChunks);
++        while (!unvisited.isEmpty()) {
++            final long seed = unvisited.iterator().nextLong();
++            final LongOpenHashSet cluster = this.floodFill(seed, unvisited);
++
++            final RegionId id = RegionId.next();
++            final Region region = new Region(id, this.dimension);
++            final long[] members = cluster.toLongArray();
++            for (final long member : members) {
++                region.addChunkInternal(member);
++                this.index.assign(this.dimension, member, id);
++            }
++            this.regions.put(id.value(), region);
++        }
++    }
++
++    /**
++     * Breadth-first flood-fill of one connected cluster starting at {@code seed},
++     * consuming visited chunks from {@code unvisited}. Connectivity = Chebyshev
++     * distance &le; {@code mergeRadius} to any other loaded chunk.
++     */
++    private LongOpenHashSet floodFill(final long seed, final LongOpenHashSet unvisited) {
++        final LongOpenHashSet cluster = new LongOpenHashSet();
++        final LongArrayFIFOQueue frontier = new LongArrayFIFOQueue();
++        unvisited.remove(seed);
++        cluster.add(seed);
++        frontier.enqueue(seed);
++
++        while (!frontier.isEmpty()) {
++            final long current = frontier.dequeueLong();
++            final int cx = ChunkPos.getX(current);
++            final int cz = ChunkPos.getZ(current);
++            for (int dx = -this.mergeRadius; dx <= this.mergeRadius; dx++) {
++                for (int dz = -this.mergeRadius; dz <= this.mergeRadius; dz++) {
++                    if (dx == 0 && dz == 0) {
++                        continue;
++                    }
++                    final long neighbour = ChunkPos.pack(cx + dx, cz + dz);
++                    if (unvisited.remove(neighbour)) {
++                        cluster.add(neighbour);
++                        frontier.enqueue(neighbour);
++                    }
++                }
++            }
++        }
++        return cluster;
++    }
++}
