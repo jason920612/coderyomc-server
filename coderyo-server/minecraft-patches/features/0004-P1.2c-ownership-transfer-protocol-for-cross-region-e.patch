@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyo <dev@coderyo.local>
+Date: Thu, 25 Jun 2026 11:34:16 +0800
+Subject: [PATCH] P1.2c: ownership-transfer protocol for cross-region entity
+ movement
+
+
+diff --git a/com/coderyo/region/RegionLifecycle.java b/com/coderyo/region/RegionLifecycle.java
+index ad86f2d6ef2514bb42806268097c4c9577b7d0e4..2b6cc8348a5f715867ef89152c196191e779726a 100644
+--- a/com/coderyo/region/RegionLifecycle.java
++++ b/com/coderyo/region/RegionLifecycle.java
+@@ -74,6 +74,17 @@ public final class RegionLifecycle {
+         return merger == null ? List.of() : merger.regions();
+     }
+ 
++    /**
++     * Resolve the live {@link Region} for a {@link RegionId} in {@code dimension}, or
++     * {@code null} if no such region currently exists. Used by the ownership-transfer
++     * protocol (P1.2c) to resolve the destination region of a cross-region crossing.
++     * Takes an explicit dimension key (the destination dimension may differ from source).
++     */
++    public static Region regionById(final ResourceKey<Level> dimension, final RegionId id) {
++        final RegionMerger merger = MERGERS.get(dimension);
++        return merger == null ? null : merger.regionById(id);
++    }
++
+     /**
+      * A chunk reached FULL status (border-loaded / ticking): add it to its dimension's
+      * region model and merge with adjacent loaded chunks. No-op unless the subsystem is
+diff --git a/com/coderyo/region/RegionTickOrchestrator.java b/com/coderyo/region/RegionTickOrchestrator.java
+index 1fcf23e5ff5997e29b2c291b7d2bde66485e0c16..c937c4fbac0276068c3926d34431a83ad45aff62 100644
+--- a/com/coderyo/region/RegionTickOrchestrator.java
++++ b/com/coderyo/region/RegionTickOrchestrator.java
+@@ -138,6 +138,13 @@ public final class RegionTickOrchestrator {
+         // Entities: route each to its owning region by chunk; unowned -> orchestrator fallback.
+         final List<Entity> unownedEntities = new ArrayList<>();
+         for (final Entity e : level.coderyoTickingEntitiesSnapshot()) {
++            // P1.2c: an IN_FLIGHT entity (mid ownership-transfer) is owned by NO region this
++            // tick — its destination region re-attaches it via an inbound post. Skip it here so
++            // it is ticked by exactly zero regions during the transient window (single-writer
++            // upheld across the boundary; no double-tick, no loss).
++            if (com.coderyo.region.transfer.CrossRegionDispatch.isInFlight(e.getUUID())) {
++                continue;
++            }
+             final ChunkPos cp = e.chunkPosition();
+             final RegionId owner = index.regionOf(level.dimension(), cp.longKey());
+             final RegionWork w = owner == null ? null : work.get(owner.value());
+@@ -183,6 +190,12 @@ public final class RegionTickOrchestrator {
+             // Ticks only this region's chunks.
+             for (final Entity e : w.entities) {
+                 level.coderyoTickOneEntity(e);
++                // P1.2c: after ticking, detect a region crossing (movement / teleport /
++                // dimension change). If the entity's new chunk is owned by a DIFFERENT region,
++                // post a one-directional ownership transfer (mark IN_FLIGHT here on this
++                // worker; the destination region re-attaches it next tick). Deadlock-free:
++                // no blocking on the destination region.
++                com.coderyo.region.transfer.OwnershipTransfer.detectAndTransfer(level, e, region, serverTick);
+             }
+             for (final TickingBlockEntity be : w.blockEntities) {
+                 if (level.coderyoTickOneBlockEntity(be)) {
+diff --git a/com/coderyo/region/merge/RegionMerger.java b/com/coderyo/region/merge/RegionMerger.java
+index 3b27883a84892dd22d6ae3072782dda2221ecb18..31128ea6a05c5887139832a58796e35d32916705 100644
+--- a/com/coderyo/region/merge/RegionMerger.java
++++ b/com/coderyo/region/merge/RegionMerger.java
+@@ -112,6 +112,15 @@ public final class RegionMerger {
+         return new ArrayList<>(this.regions.values());
+     }
+ 
++    /**
++     * Look up the live {@link Region} for a {@link RegionId} in this dimension, or
++     * {@code null} if no such region currently exists (it may have been merged/split away).
++     * Used by the ownership-transfer protocol (P1.2c) to resolve the destination region.
++     */
++    public Region regionById(final RegionId id) {
++        return this.regions.get(id.value());
++    }
++
+     public int regionCount() {
+         return this.regions.size();
+     }
+diff --git a/com/coderyo/region/transfer/CrossRegionDispatch.java b/com/coderyo/region/transfer/CrossRegionDispatch.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6d4de09b16c4ae000382718582247f656a566c6
+--- /dev/null
++++ b/com/coderyo/region/transfer/CrossRegionDispatch.java
+@@ -0,0 +1,75 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region.transfer;
++
++import java.util.Set;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Central registry for cross-region entity hand-offs (design-spec §4.4): tracks the
++ * {@code IN_FLIGHT} set and the lifetime accounting that the e2e asserts on.
++ *
++ * <p><b>IN_FLIGHT semantics.</b> An entity is marked {@code IN_FLIGHT} the instant the
++ * source region detaches it (on the source region's worker thread, after that region
++ * finished ticking it) and stays {@code IN_FLIGHT} until the destination region
++ * re-attaches it at the start of its next tick. While {@code IN_FLIGHT} the entity is
++ * owned by NO region; the {@code RegionTickOrchestrator} partition step skips any
++ * {@code IN_FLIGHT} entity, so it is ticked by exactly zero regions for the transient
++ * window — never double-ticked, never lost. This upholds single-writer-per-region
++ * across the boundary crossing.
++ *
++ * <p><b>Concurrency.</b> The IN_FLIGHT set is a {@link ConcurrentHashMap}-backed set:
++ * {@code markInFlight} is called from a region worker thread; {@code clearInFlight}
++ * from the destination region worker thread (its inbound drain); {@code isInFlight}
++ * is read on the orchestrator thread during partition. All three are lock-free and
++ * safe to race because the marker is a presence flag keyed by a stable entity UUID,
++ * and at most one transfer for a given entity is outstanding at a time (a region only
++ * transfers an entity it currently owns, and ownership is single-writer).
++ */
++public final class CrossRegionDispatch {
++
++    /** Entities currently mid-transfer (owned by no region). */
++    private static final Set<UUID> IN_FLIGHT = ConcurrentHashMap.newKeySet();
++
++    /** Lifetime counters for diagnostics / e2e assertions. */
++    private static final AtomicLong transfersInitiated = new AtomicLong();
++    private static final AtomicLong transfersCompleted = new AtomicLong();
++
++    private CrossRegionDispatch() {
++    }
++
++    /** Mark an entity as in-flight (detached, owned by no region). */
++    public static void markInFlight(final UUID entityId) {
++        IN_FLIGHT.add(entityId);
++        transfersInitiated.incrementAndGet();
++    }
++
++    /** Clear the in-flight marker once the destination region has re-attached the entity. */
++    public static void clearInFlight(final UUID entityId) {
++        if (IN_FLIGHT.remove(entityId)) {
++            transfersCompleted.incrementAndGet();
++        }
++    }
++
++    /** Whether the entity is currently mid-transfer (must be ticked by NO region). */
++    public static boolean isInFlight(final UUID entityId) {
++        return IN_FLIGHT.contains(entityId);
++    }
++
++    /** Count of in-flight entities right now (should be ~0 between ticks; transient during). */
++    public static int inFlightCount() {
++        return IN_FLIGHT.size();
++    }
++
++    public static long totalInitiated() {
++        return transfersInitiated.get();
++    }
++
++    public static long totalCompleted() {
++        return transfersCompleted.get();
++    }
++}
+diff --git a/com/coderyo/region/transfer/OwnershipTransfer.java b/com/coderyo/region/transfer/OwnershipTransfer.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..58b26162808e9ce722b1d2f8e2896eeaa75b5505
+--- /dev/null
++++ b/com/coderyo/region/transfer/OwnershipTransfer.java
+@@ -0,0 +1,160 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region.transfer;
++
++import com.coderyo.region.Region;
++import com.coderyo.region.RegionConfig;
++import com.coderyo.region.RegionId;
++import com.coderyo.region.RegionIndex;
++import com.coderyo.region.RegionLifecycle;
++import java.util.UUID;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * The ownership-transfer protocol (design-spec §3.4 / §4.4): the SINGLE mechanism by
++ * which an entity changes owning region — boundary crossing (walking/moving), explicit
++ * teleport, and dimension change all funnel through {@link #detectAndTransfer}.
++ *
++ * <p><b>Deadlock-free by construction.</b> A transfer is implemented purely as
++ * one-directional posts: the source region (already on its own worker thread, having
++ * just ticked the entity) marks the entity {@code IN_FLIGHT} and posts a re-attach task
++ * onto the destination region's lock-free inbound queue. It NEVER blocks waiting on the
++ * destination region, and never synchronously calls back into another region's state.
++ * The destination region drains its inbound queue at the start of its next tick
++ * (via {@link Region#tick}), runs the re-attach task, and clears {@code IN_FLIGHT}.
++ *
++ * <p><b>Conservative correctness.</b> The live {@link Entity} object stays in the level's
++ * Moonrise-managed entity storage throughout — we do not serialize/despawn/respawn it.
++ * Transfer changes only <i>which region is permitted to tick it</i>. During the transient
++ * {@code IN_FLIGHT} window the entity is owned by no region and ticked by none
++ * (the orchestrator partition skips it), so single-writer-per-region holds across the
++ * boundary: no double-tick, no loss.
++ *
++ * <p><b>Where detection runs.</b> {@link #detectAndTransfer} is called by the region
++ * worker immediately after it ticks one entity (so the entity's position is fully
++ * updated, including teleports and dimension changes applied during the tick). It
++ * resolves the entity's current chunk to an owning region via {@link RegionIndex}; if
++ * that differs from the region that just ticked it, a transfer is posted.
++ *
++ * <p><b>Dimension change.</b> A cross-dimension teleport in vanilla REMOVES the old
++ * entity and CREATES a new one in the destination level (see
++ * {@code Entity.teleportCrossDimension}). The removed source entity satisfies
++ * {@code isRemoved()} here (no transfer needed — nothing left to own), and the new entity
++ * is picked up by the destination level's orchestrator partition on its next tick. So a
++ * dimension change is handled naturally by the new-entity-in-new-level path; this method
++ * only posts an explicit transfer for SAME-entity, SAME-level boundary crossings.
++ */
++public final class OwnershipTransfer {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/transfer");
++
++    private OwnershipTransfer() {
++    }
++
++    /**
++     * Detect whether {@code entity} (just ticked by {@code owningRegion} on this worker
++     * thread) has crossed into a chunk owned by a DIFFERENT region and, if so, post an
++     * ownership transfer.
++     *
++     * <p>Runs on the source region's worker thread. Returns {@code true} if a transfer was
++     * posted (the caller should treat the entity as detached for the rest of this tick).
++     *
++     * @param level        the level the entity was ticked in
++     * @param entity       the entity just ticked
++     * @param owningRegion the region that owns the chunk the entity started this tick in
++     * @param serverTick   current server tick (diagnostics)
++     */
++    public static boolean detectAndTransfer(final ServerLevel level, final Entity entity,
++                                            final Region owningRegion, final long serverTick) {
++        if (entity.isRemoved()) {
++            // Removed entities (incl. the source half of a cross-dimension teleport) own
++            // nothing. Nothing to transfer.
++            return false;
++        }
++        // The entity's dimension may have changed during its tick. Use its CURRENT level +
++        // chunk to resolve its now-owning region.
++        final ServerLevel currentLevel = (entity.level() instanceof ServerLevel sl) ? sl : level;
++        final ResourceKey<Level> destDim = currentLevel.dimension();
++        final ChunkPos destChunk = entity.chunkPosition();
++        final long destChunkKey = destChunk.longKey();
++
++        final RegionIndex index = RegionLifecycle.index();
++        final RegionId destOwner = index.regionOf(destDim, destChunkKey);
++
++        // No owning region at the destination (unowned chunk, or no region formed there yet):
++        // leave the entity to the orchestrator's unowned-fallback next tick. Not a transfer.
++        if (destOwner == null) {
++            return false;
++        }
++        // Same region (and same dimension) -> no crossing.
++        if (destDim.equals(owningRegion.dimension()) && destOwner.equals(owningRegion.id())) {
++            return false;
++        }
++
++        final Region destRegion = RegionLifecycle.regionById(destDim, destOwner);
++        if (destRegion == null) {
++            // Destination region id is indexed but the live Region is gone (raced with a
++            // split/merge). Conservatively do NOT transfer; the orchestrator re-resolves
++            // next tick. Fail-loud visibility under debug.
++            if (RegionConfig.isDebug()) {
++                LOGGER.warn("transfer skipped: dest region R{} not live for entity {} (tick#{})",
++                    destOwner.value(), entity.getUUID(), serverTick);
++            }
++            return false;
++        }
++
++        transfer(entity, owningRegion, destRegion, destDim, destChunkKey, serverTick);
++        return true;
++    }
++
++    /**
++     * Execute the transfer: mark IN_FLIGHT on the source thread, capture a payload, and
++     * post a one-directional re-attach task onto the destination region's inbound queue.
++     */
++    private static void transfer(final Entity entity, final Region fromRegion, final Region toRegion,
++                                 final ResourceKey<Level> destDim, final long destChunkKey,
++                                 final long serverTick) {
++        final UUID id = entity.getUUID();
++        final TransferPayload payload = new TransferPayload(
++            entity, id, fromRegion.id(), toRegion.id(), destDim, destChunkKey, serverTick);
++
++        // (1) Detach on the source region thread: the entity is now owned by NO region.
++        //     The orchestrator partition skips IN_FLIGHT entities, so it is not ticked by any
++        //     region until the destination re-attaches it below.
++        CrossRegionDispatch.markInFlight(id);
++
++        if (RegionConfig.isDebug()) {
++            LOGGER.info("tick#{} TRANSFER detach: entity {} ({}) R{} -> R{} dim={} chunk={} [IN_FLIGHT]",
++                serverTick, entity.getName().getString(), id,
++                fromRegion.id().value(), toRegion.id().value(),
++                destDim.identifier(), payload.destChunkPos());
++        }
++
++        // (2) Post a one-directional re-attach task onto the destination region's inbound
++        //     queue. NO blocking, NO synchronous call into the destination region's state.
++        toRegion.inbound().post(() -> reattach(payload, serverTick));
++    }
++
++    /**
++     * Runs on the DESTINATION region's worker thread at the start of its next tick (inbound
++     * drain). Clears IN_FLIGHT so the orchestrator partition routes the entity to this region
++     * from now on. The entity object itself is already in the destination chunk (Moonrise
++     * entity storage moved it during the crossing tick); we only resume ticking ownership.
++     */
++    private static void reattach(final TransferPayload payload, final long postedTick) {
++        CrossRegionDispatch.clearInFlight(payload.entityId());
++        if (RegionConfig.isDebug()) {
++            LOGGER.info("TRANSFER reattach: entity {} re-attached to R{} dim={} chunk={} (posted tick#{}) [IN_FLIGHT cleared]",
++                payload.entityId(), payload.to().value(),
++                payload.destDimension().identifier(), payload.destChunkPos(), postedTick);
++        }
++    }
++}
+diff --git a/com/coderyo/region/transfer/TransferPayload.java b/com/coderyo/region/transfer/TransferPayload.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..54a905f41f79adbd3e0733ebc090498896b3909a
+--- /dev/null
++++ b/com/coderyo/region/transfer/TransferPayload.java
+@@ -0,0 +1,53 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region.transfer;
++
++import com.coderyo.region.RegionId;
++import java.util.UUID;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++
++/**
++ * Minimal hand-off descriptor for an entity crossing a region boundary
++ * (design-spec §4.4).
++ *
++ * <p>Unlike the design-spec sketch (which serialized NBT for a fully detached
++ * teleport), this conservative P1.2c implementation keeps the live {@link Entity}
++ * object — Moonrise's per-level entity storage already owns the object's lifecycle
++ * and its placement in the destination chunk. What "ownership transfer" changes here
++ * is purely <b>which region is allowed to tick the entity</b>: the source region
++ * detaches it (stops ticking it, marks it {@code IN_FLIGHT}) and the destination
++ * region re-attaches it (resumes ticking it on its next tick). No NBT round-trip is
++ * needed because the entity never leaves the world; it only changes owning region.
++ *
++ * <p>The payload records the source/destination {@link RegionId}, the destination
++ * dimension + chunk (so re-attach can re-validate ownership at drain time, in case
++ * regions merged/split in between), and the server-tick the transfer was posted on
++ * (diagnostics / fail-loud accounting).
++ */
++public record TransferPayload(
++    Entity entity,
++    UUID entityId,
++    RegionId from,
++    RegionId to,
++    ResourceKey<Level> destDimension,
++    long destChunkKey,
++    long postedAtTick) {
++
++    public ChunkPos destChunkPos() {
++        return ChunkPos.unpack(this.destChunkKey);
++    }
++
++    @Override
++    public String toString() {
++        return "TransferPayload[entity=" + this.entityId
++            + " R" + this.from.value() + "->R" + this.to.value()
++            + " dim=" + this.destDimension.identifier()
++            + " chunk=" + this.destChunkPos()
++            + " tick=" + this.postedAtTick + "]";
++    }
++}
