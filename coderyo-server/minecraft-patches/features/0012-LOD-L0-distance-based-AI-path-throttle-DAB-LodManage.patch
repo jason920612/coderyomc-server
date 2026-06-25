@@ -1,0 +1,597 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 25 Jun 2026 23:53:05 +0800
+Subject: [PATCH] LOD L0: distance-based AI/path throttle (DAB) + LodManager
+ foundation
+
+
+diff --git a/com/coderyo/lod/LodBand.java b/com/coderyo/lod/LodBand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..25a6e3b3d6e5461d520da4cab5058a8ab8d9fa04
+--- /dev/null
++++ b/com/coderyo/lod/LodBand.java
+@@ -0,0 +1,46 @@
++/*
++ * coderyoMC — player-relative simulation LOD band.
++ */
++package com.coderyo.lod;
++
++/**
++ * A distance band in the player-relative simulation LOD framework. Each band names a distance
++ * shell around the nearest player and carries the ERROR-STANDARD fidelity floor that subsystems
++ * must honor inside it. The mapping distance -&gt; band is computed by {@link LodManager#bandFor}.
++ *
++ * <p>The bands are ordered from highest fidelity (NEAR, closest to a player) to lowest (FAR).
++ * {@link #ordinal()} therefore increases with distance, which subsystems can use to scale
++ * aggressiveness monotonically.
++ */
++public enum LodBand {
++    /** [0, 16) blocks — full vanilla fidelity, never throttled (Tier-1 near radius). */
++    NEAR(0.90),
++    /** [16, 32) blocks — fidelity floor >= 80%. */
++    BAND1(0.80),
++    /** [32, 48) blocks — fidelity floor >= 70%. */
++    BAND2(0.70),
++    /** [48, 64) blocks — fidelity floor >= 60%. */
++    BAND3(0.60),
++    /** [64, +inf) blocks — fidelity floor >= 50%. */
++    FAR(0.50);
++
++    private final double fidelityFloor;
++
++    LodBand(final double fidelityFloor) {
++        this.fidelityFloor = fidelityFloor;
++    }
++
++    /**
++     * The minimum behavioral fidelity (vs vanilla) any LOD subsystem must preserve inside this band,
++     * per the error standard (>=90/80/70/60/50 at 0/16/32/48/64+ blocks). This is the contract a
++     * subsystem's tuning must not violate.
++     */
++    public double fidelityFloor() {
++        return this.fidelityFloor;
++    }
++
++    /** True for the NEAR band — full vanilla, never throttled. */
++    public boolean isNear() {
++        return this == NEAR;
++    }
++}
+diff --git a/com/coderyo/lod/LodConfig.java b/com/coderyo/lod/LodConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4344d3f67199edc48f29ad3bfd9c0b916422b921
+--- /dev/null
++++ b/com/coderyo/lod/LodConfig.java
+@@ -0,0 +1,196 @@
++/*
++ * coderyoMC — player-relative simulation LOD (Level Of Detail) configuration.
++ *
++ * NORTH STAR: the farther an entity is from any player, the cheaper / lower-frequency its
++ * simulation, bounded by a distance-banded ERROR STANDARD (near players >=90% fidelity, then
++ * >=80/70/60/50 at 16/32/48/64+ blocks; Tier-1 invariants hold at ALL distances). This config
++ * holds the flags + tunable band thresholds for the LOD framework. L0 (distance-based AI / path
++ * frequency throttling, "DAB") is the first subsystem to plug into {@link LodManager}; redstone /
++ * fluid LOD will follow on the same seam.
++ *
++ * Resolved once at class-load from system properties / environment variables, mirroring
++ * {@link com.coderyo.region.RegionConfig} and {@link com.coderyo.pathfinding.LosElisionConfig}.
++ * Purely additive: touches NO upstream config file, so default-off boots byte-for-byte vanilla.
++ */
++package com.coderyo.lod;
++
++/**
++ * Flags + tunable parameters for the player-relative simulation LOD framework.
++ *
++ * <p><strong>Default OFF.</strong> When {@code coderyo.lod.dab.enabled} is off — the default —
++ * mob AI runs at full vanilla cadence at every distance. Turn it on to throttle distant mobs' AI
++ * goal-selection + pathfinding frequency by LOD band:
++ * <pre>
++ *   -Dcoderyo.lod.dab.enabled=true        (system property, takes precedence)
++ *   CODERYO_LOD_DAB_ENABLED=true           (environment variable, fallback)
++ *   -Dcoderyo.lod.debug=true               (per-band throttle counters; default false)
++ *   CODERYO_LOD_DEBUG=true                  (environment variable, fallback)
++ * </pre>
++ *
++ * <p><b>Band model (TUNABLE).</b> Five distance bands keyed on the mob's distance to the nearest
++ * player. Each band has an AI-throttle <em>divisor</em>: the mob re-decides goals + repaths every
++ * {@code divisor} ticks (1 = full vanilla). Defaults are calibrated so the banded fidelity still
++ * meets the error standard's >=90/80/70/60/50 floor:
++ * <pre>
++ *   band     range (blocks)   AI divisor   target fidelity
++ *   NEAR     [0, 16)          1   (every tick)   >= 0.90
++ *   BAND1    [16, 32)         2   (every 2)      >= 0.80
++ *   BAND2    [32, 48)         4   (every 4)      >= 0.70
++ *   BAND3    [48, 64)         8   (every 8)      >= 0.60
++ *   FAR      [64, +inf)       16  (every 16)     >= 0.50
++ * </pre>
++ * Every threshold and divisor is overridable via system property / env var so the calibration can
++ * be tuned without a rebuild.
++ *
++ * <p><b>Tier-1 safety.</b> The NEAR band is ALWAYS divisor 1 (full vanilla inside the player's near
++ * radius), and {@link LodManager} only ever throttles goal <em>re-decision</em> + repath frequency,
++ * never aggro/target selection — so the aggro target is 100% identical and reachable targets are
++ * always reached (just reacted-to slightly later when far).
++ *
++ * <p><b>Concurrency.</b> All fields here are immutable, resolved once at class-load. No shared
++ * mutable state, so multiple region worker threads read them race-free (issue #24 class avoided).
++ */
++public final class LodConfig {
++
++    /** System property key for the L0 DAB AI-throttle master flag. */
++    public static final String PROPERTY = "coderyo.lod.dab.enabled";
++    /** Environment variable key for the L0 DAB AI-throttle master flag. */
++    public static final String ENV = "CODERYO_LOD_DAB_ENABLED";
++
++    /** System property key for the LOD debug counters flag. */
++    public static final String DEBUG_PROPERTY = "coderyo.lod.debug";
++    /** Environment variable key for the LOD debug counters flag. */
++    public static final String DEBUG_ENV = "CODERYO_LOD_DEBUG";
++
++    /** {@code lod.dab.enabled} default — OFF (full vanilla AI cadence at all distances). */
++    public static final boolean DEFAULT_ENABLED = false;
++    /** {@code lod.debug} default — quiet. */
++    public static final boolean DEFAULT_DEBUG = false;
++
++    // --- Band edge radii (blocks). Distances are compared squared internally for cheapness. ---
++    /** Outer edge of the NEAR band (default 16). Inside this, AI is always full vanilla cadence. */
++    public static final double DEFAULT_NEAR = 16.0;
++    /** Outer edge of BAND1 (default 32). */
++    public static final double DEFAULT_BAND1 = 32.0;
++    /** Outer edge of BAND2 (default 48). */
++    public static final double DEFAULT_BAND2 = 48.0;
++    /** Outer edge of BAND3 (default 64). Beyond this is the FAR band. */
++    public static final double DEFAULT_BAND3 = 64.0;
++
++    // --- AI throttle divisors per band (1 = every tick = full vanilla). ---
++    public static final int DEFAULT_DIV_NEAR = 1;
++    public static final int DEFAULT_DIV_BAND1 = 2;
++    public static final int DEFAULT_DIV_BAND2 = 4;
++    public static final int DEFAULT_DIV_BAND3 = 8;
++    public static final int DEFAULT_DIV_FAR = 16;
++
++    private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
++    private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, DEFAULT_DEBUG);
++
++    private static final double NEAR = resolveDouble("coderyo.lod.band.near", "CODERYO_LOD_BAND_NEAR", DEFAULT_NEAR);
++    private static final double BAND1 = resolveDouble("coderyo.lod.band.b1", "CODERYO_LOD_BAND_B1", DEFAULT_BAND1);
++    private static final double BAND2 = resolveDouble("coderyo.lod.band.b2", "CODERYO_LOD_BAND_B2", DEFAULT_BAND2);
++    private static final double BAND3 = resolveDouble("coderyo.lod.band.b3", "CODERYO_LOD_BAND_B3", DEFAULT_BAND3);
++
++    private static final double NEAR_SQ = NEAR * NEAR;
++    private static final double BAND1_SQ = BAND1 * BAND1;
++    private static final double BAND2_SQ = BAND2 * BAND2;
++    private static final double BAND3_SQ = BAND3 * BAND3;
++
++    private static final int DIV_NEAR = Math.max(1, resolveInt("coderyo.lod.div.near", "CODERYO_LOD_DIV_NEAR", DEFAULT_DIV_NEAR));
++    private static final int DIV_BAND1 = Math.max(1, resolveInt("coderyo.lod.div.b1", "CODERYO_LOD_DIV_B1", DEFAULT_DIV_BAND1));
++    private static final int DIV_BAND2 = Math.max(1, resolveInt("coderyo.lod.div.b2", "CODERYO_LOD_DIV_B2", DEFAULT_DIV_BAND2));
++    private static final int DIV_BAND3 = Math.max(1, resolveInt("coderyo.lod.div.b3", "CODERYO_LOD_DIV_B3", DEFAULT_DIV_BAND3));
++    private static final int DIV_FAR = Math.max(1, resolveInt("coderyo.lod.div.far", "CODERYO_LOD_DIV_FAR", DEFAULT_DIV_FAR));
++
++    private LodConfig() {
++    }
++
++    /** Whether L0 DAB AI throttling is enabled. Resolved once at class-load (default false). */
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++
++    /** Whether per-band throttle counters are recorded. Only consulted when {@link #isEnabled()}. */
++    public static boolean isDebug() {
++        return DEBUG;
++    }
++
++    static double nearSq() {
++        return NEAR_SQ;
++    }
++
++    static double band1Sq() {
++        return BAND1_SQ;
++    }
++
++    static double band2Sq() {
++        return BAND2_SQ;
++    }
++
++    static double band3Sq() {
++        return BAND3_SQ;
++    }
++
++    static int divNear() {
++        return DIV_NEAR;
++    }
++
++    static int divBand1() {
++        return DIV_BAND1;
++    }
++
++    static int divBand2() {
++        return DIV_BAND2;
++    }
++
++    static int divBand3() {
++        return DIV_BAND3;
++    }
++
++    static int divFar() {
++        return DIV_FAR;
++    }
++
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
++        }
++        return fallback;
++    }
++
++    private static double resolveDouble(final String property, final String env, final double fallback) {
++        String raw = System.getProperty(property);
++        if (raw == null) {
++            raw = System.getenv(env);
++        }
++        if (raw == null) {
++            return fallback;
++        }
++        try {
++            return Double.parseDouble(raw.trim());
++        } catch (final NumberFormatException ex) {
++            return fallback;
++        }
++    }
++
++    private static int resolveInt(final String property, final String env, final int fallback) {
++        String raw = System.getProperty(property);
++        if (raw == null) {
++            raw = System.getenv(env);
++        }
++        if (raw == null) {
++            return fallback;
++        }
++        try {
++            return Integer.parseInt(raw.trim());
++        } catch (final NumberFormatException ex) {
++            return fallback;
++        }
++    }
++}
+diff --git a/com/coderyo/lod/LodManager.java b/com/coderyo/lod/LodManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..07e06abe21af6ce67a4abf340beb731e9f177384
+--- /dev/null
++++ b/com/coderyo/lod/LodManager.java
+@@ -0,0 +1,151 @@
++/*
++ * coderyoMC — player-relative simulation LOD manager (the reusable distance->fidelity seam).
++ *
++ * Given an entity (or position) this computes the distance to the nearest player -> a LOD band ->
++ * a per-subsystem target rate / fidelity. It is the ONE seam every LOD layer queries: L0 (the DAB
++ * AI/path throttle) today; redstone-LOD / fluid-LOD later all plug in here so the distance->band
++ * policy lives in exactly one place.
++ *
++ * NORTH STAR: the farther from a player, the cheaper/lower-frequency the simulation, bounded by the
++ * error standard (>=90/80/70/60/50 fidelity at 0/16/32/48/64+ blocks; Tier-1 invariants at ALL
++ * distances). See pathfinding-elision-design.md §2.1.
++ */
++package com.coderyo.lod;
++
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.entity.player.Player;
++
++/**
++ * The reusable LOD framework: distance-to-nearest-player -&gt; {@link LodBand} -&gt; per-subsystem
++ * rate/fidelity. Stateless façade over {@link LodConfig}; the only per-entity state is a tiny
++ * per-tick distance cache stored ON the entity (single-writer per region -&gt; race-free).
++ *
++ * <h2>Cheapness</h2>
++ * The nearest-player distance is the only non-trivial cost (a player scan). It is computed at most
++ * <em>once per entity per tick</em> and cached on the entity ({@link Mob#coderyoLodDistSq()} keyed
++ * by {@link Mob#coderyoLodTick()}); every further query in the same tick (band, divisor, fidelity)
++ * reuses the cached value. So adding more LOD subsystems costs nothing beyond the first lookup.
++ *
++ * <h2>Thread-safety / per-region</h2>
++ * No cross-region shared mutable state. The per-tick cache lives on the entity, and an entity is
++ * ticked by exactly one region worker per tick (single-writer invariant), so the cache is
++ * thread-confined by construction — it never re-enters the mid-tick task queue that crashed issue
++ * #24. The player scan reads the level's player list read-only.
++ *
++ * <h2>L0 throttle contract</h2>
++ * {@link #shouldRunAiThisTick(Mob, Level)} answers the DAB question: should this mob re-decide goals
++ * + repath THIS tick, or coast on its current goal/path? It returns {@code true} every tick in the
++ * NEAR band (full vanilla) and every {@code divisor}-th tick farther out. The phase is keyed by the
++ * mob's id so the whole horde does not re-decide on the same tick (spreads the cost, like vanilla's
++ * {@code idBasedTickCount % 2}). It NEVER gates target/aggro selection — callers must keep that at
++ * full cadence (Tier-1: aggro 100% identical).
++ */
++public final class LodManager {
++
++    /** Sentinel distance-squared meaning "no player found" (treated as the FAR band). */
++    public static final double NO_PLAYER = Double.MAX_VALUE;
++
++    private LodManager() {
++    }
++
++    /** Whether the LOD-driven AI throttle (L0 DAB) is active. Convenience over {@link LodConfig}. */
++    public static boolean dabEnabled() {
++        return LodConfig.isEnabled();
++    }
++
++    /**
++     * Squared distance from {@code mob} to the nearest player, computed at most once per server tick
++     * and cached on the entity. {@link #NO_PLAYER} if no player exists in the level.
++     *
++     * <p>Cheap by construction: subsequent calls in the same tick return the cached value with no
++     * player scan. The cache key is {@link net.minecraft.server.MinecraftServer#currentTick}.
++     */
++    public static double nearestPlayerDistanceSq(final Mob mob, final Level level) {
++        final int now = net.minecraft.server.MinecraftServer.currentTick;
++        if (mob.coderyoLodTick() == now) {
++            return mob.coderyoLodDistSq();
++        }
++        final double distSq = computeNearestPlayerDistanceSq(mob, level);
++        mob.coderyoSetLodCache(now, distSq);
++        return distSq;
++    }
++
++    private static double computeNearestPlayerDistanceSq(final Mob mob, final Level level) {
++        final Player player = level.getNearestPlayer(mob, -1.0);
++        if (player == null) {
++            return NO_PLAYER;
++        }
++        return mob.distanceToSqr(player);
++    }
++
++    /** Map a raw squared distance to its LOD band. */
++    public static LodBand bandForSq(final double distSq) {
++        if (distSq < LodConfig.nearSq()) {
++            return LodBand.NEAR;
++        }
++        if (distSq < LodConfig.band1Sq()) {
++            return LodBand.BAND1;
++        }
++        if (distSq < LodConfig.band2Sq()) {
++            return LodBand.BAND2;
++        }
++        if (distSq < LodConfig.band3Sq()) {
++            return LodBand.BAND3;
++        }
++        return LodBand.FAR;
++    }
++
++    /** The LOD band of {@code mob} this tick (uses the per-tick distance cache). */
++    public static LodBand bandFor(final Mob mob, final Level level) {
++        return bandForSq(nearestPlayerDistanceSq(mob, level));
++    }
++
++    /** The AI-throttle divisor for a band: re-decide goals + repath every N ticks (1 = vanilla). */
++    public static int aiDivisor(final LodBand band) {
++        switch (band) {
++            case NEAR:
++                return LodConfig.divNear();
++            case BAND1:
++                return LodConfig.divBand1();
++            case BAND2:
++                return LodConfig.divBand2();
++            case BAND3:
++                return LodConfig.divBand3();
++            case FAR:
++            default:
++                return LodConfig.divFar();
++        }
++    }
++
++    /**
++     * The DAB decision: should {@code mob} run its (expensive) goal re-decision + repath THIS tick?
++     *
++     * <p>Returns {@code true} when LOD/DAB is disabled (so the caller takes the vanilla path), every
++     * tick in the NEAR band, and every {@code divisor}-th tick in farther bands. On a {@code false}
++     * tick the caller keeps the mob's current goal/path (no re-decision) — cheap. The off-frame
++     * phase is offset by the mob id so a horde does not re-decide in lockstep.
++     *
++     * <p><b>Tier-1:</b> callers MUST still run target/aggro selection + navigation path-following
++     * every tick; this only throttles goal re-decision + repath frequency.
++     */
++    public static boolean shouldRunAiThisTick(final Mob mob, final Level level) {
++        if (!LodConfig.isEnabled()) {
++            return true; // vanilla cadence
++        }
++        final LodBand band = bandFor(mob, level);
++        final int divisor = aiDivisor(band);
++        final boolean run;
++        if (divisor <= 1) {
++            run = true;
++        } else {
++            final int tick = net.minecraft.server.MinecraftServer.currentTick;
++            // Phase by entity id so the horde's re-decisions spread across the divisor window.
++            run = ((tick + mob.getId()) % divisor) == 0;
++        }
++        if (LodConfig.isDebug()) {
++            LodStats.record(band, run);
++        }
++        return run;
++    }
++}
+diff --git a/com/coderyo/lod/LodStats.java b/com/coderyo/lod/LodStats.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..61aad1b9041c61a0549a3c940f50f66b4ca2fd7e
+--- /dev/null
++++ b/com/coderyo/lod/LodStats.java
+@@ -0,0 +1,94 @@
++/*
++ * coderyoMC — LOD throttle debug counters (per band: ran vs skipped).
++ */
++package com.coderyo.lod;
++
++import java.util.concurrent.atomic.LongAdder;
++
++/**
++ * Per-band tally of L0 DAB throttle decisions: how many mob-ticks ran their AI re-decision vs were
++ * throttled (coasted on the current goal/path). Debug-only; the validation harness reads the
++ * headline throttle rate from the periodic / shutdown log. The headline win metric is the SKIP rate
++ * far from players.
++ *
++ * <p><b>Concurrency.</b> The only shared state L0 adds, and it is just {@link LongAdder}s — lock-free
++ * and contention-friendly, so multiple region worker threads record concurrently without the
++ * shared-queue race class (issue #24). No per-mob mutable structure here.
++ */
++public final class LodStats {
++
++    private static final LongAdder[] RAN = newBands();
++    private static final LongAdder[] SKIPPED = newBands();
++
++    private static LongAdder[] newBands() {
++        final LongAdder[] a = new LongAdder[LodBand.values().length];
++        for (int i = 0; i < a.length; i++) {
++            a[i] = new LongAdder();
++        }
++        return a;
++    }
++
++    static {
++        if (LodConfig.isEnabled() && LodConfig.isDebug()) {
++            Runtime.getRuntime().addShutdownHook(new Thread(LodStats::printTally, "coderyo-lod-tally"));
++        }
++    }
++
++    private LodStats() {
++    }
++
++    /** Record one throttle decision for {@code band}: {@code ran} true if AI re-decided this tick. */
++    public static void record(final LodBand band, final boolean ran) {
++        if (ran) {
++            RAN[band.ordinal()].increment();
++        } else {
++            SKIPPED[band.ordinal()].increment();
++        }
++        maybeLog();
++    }
++
++    private static volatile long lastLogMs = 0L;
++
++    private static void maybeLog() {
++        final long now = System.currentTimeMillis();
++        if (now - lastLogMs >= 2000L) {
++            lastLogMs = now;
++            printTally();
++        }
++    }
++
++    private static void printTally() {
++        final StringBuilder sb = new StringBuilder("[coderyo-lod] DAB throttle tally: ");
++        long totalRan = 0L;
++        long totalSkip = 0L;
++        for (final LodBand band : LodBand.values()) {
++            final long ran = RAN[band.ordinal()].sum();
++            final long skip = SKIPPED[band.ordinal()].sum();
++            totalRan += ran;
++            totalSkip += skip;
++            final long bandTotal = ran + skip;
++            final double skipRate = bandTotal == 0L ? 0.0 : (double) skip / (double) bandTotal;
++            sb.append(band.name()).append("(ran=").append(ran)
++                .append(",skip=").append(skip)
++                .append(",skip%=").append(String.format(java.util.Locale.ROOT, "%.3f", skipRate))
++                .append(") ");
++        }
++        final long total = totalRan + totalSkip;
++        final double overall = total == 0L ? 0.0 : (double) totalSkip / (double) total;
++        sb.append("| overall-skip%=").append(String.format(java.util.Locale.ROOT, "%.4f", overall))
++            .append(" totalRan=").append(totalRan).append(" totalSkip=").append(totalSkip);
++        System.out.println(sb);
++    }
++
++    /** Overall fraction of mob-ticks throttled (skipped AI re-decision) since boot. */
++    public static double overallSkipRate() {
++        long ran = 0L;
++        long skip = 0L;
++        for (final LodBand band : LodBand.values()) {
++            ran += RAN[band.ordinal()].sum();
++            skip += SKIPPED[band.ordinal()].sum();
++        }
++        final long total = ran + skip;
++        return total == 0L ? 0.0 : (double) skip / (double) total;
++    }
++}
+diff --git a/net/minecraft/world/entity/Mob.java b/net/minecraft/world/entity/Mob.java
+index a521068fe97243adbf1e7e9b14fe7f0b19f1e65c..ad5a3aecfbf582767245d944d0e53182402131b1 100644
+--- a/net/minecraft/world/entity/Mob.java
++++ b/net/minecraft/world/entity/Mob.java
+@@ -155,6 +155,16 @@ public abstract class Mob extends LivingEntity implements Targeting, EquipmentUs
+     private int homeRadius = -1;
+     public boolean aware = true; // CraftBukkit
+     public net.kyori.adventure.util.TriState despawnInPeacefulOverride = net.kyori.adventure.util.TriState.NOT_SET; // Paper - allow changing despawnInPeaceful
++    // coderyo start - LOD L0 DAB: per-tick nearest-player distance cache (single-writer per region -> race-free)
++    private int coderyoLodTick = Integer.MIN_VALUE;
++    private double coderyoLodDistSq = Double.MAX_VALUE;
++    /** Server tick the cached LOD distance was computed for (see com.coderyo.lod.LodManager). */
++    public int coderyoLodTick() { return this.coderyoLodTick; }
++    /** Cached squared distance to the nearest player for {@link #coderyoLodTick()}. */
++    public double coderyoLodDistSq() { return this.coderyoLodDistSq; }
++    /** Store the per-tick LOD distance cache (called at most once per entity per tick). */
++    public void coderyoSetLodCache(final int tick, final double distSq) { this.coderyoLodTick = tick; this.coderyoLodDistSq = distSq; }
++    // coderyo end - LOD L0 DAB
+ 
+     protected Mob(final EntityType<? extends Mob> type, final Level level) {
+         super(type, level);
+@@ -841,6 +851,15 @@ public abstract class Mob extends LivingEntity implements Targeting, EquipmentUs
+         this.sensing.tick();
+         profiler.pop();
+         int idBasedTickCount = this.tickCount + this.getId();
++        // coderyo start - LOD L0 DAB: distance-banded AI throttle.
++        // Tier-1 invariant: target/aggro selection ALWAYS runs at full cadence (never throttled),
++        // so the aggro target is 100% identical to vanilla regardless of distance. We only throttle
++        // the expensive GOAL RE-DECISION (goalSelector.tick()'s canUse/goalCleanup/goalUpdate sweep)
++        // and, through it, repath frequency. On a throttled tick the mob keeps its current running
++        // goal driving its current path (tickRunningGoals), and navigation.tick() below still follows
++        // the path every tick -> no freeze, no stuck, just a slightly later re-decision when far.
++        final boolean coderyoRunGoalDecision =
++            com.coderyo.lod.LodManager.shouldRunAiThisTick(this, this.level());
+         if (idBasedTickCount % 2 != 0 && this.tickCount > 1) {
+             profiler.push("targetSelector");
+             this.targetSelector.tickRunningGoals(false);
+@@ -853,9 +872,15 @@ public abstract class Mob extends LivingEntity implements Targeting, EquipmentUs
+             this.targetSelector.tick();
+             profiler.pop();
+             profiler.push("goalSelector");
+-            this.goalSelector.tick();
++            if (coderyoRunGoalDecision) {
++                this.goalSelector.tick();
++            } else {
++                // Throttled: keep the current running goal driving the path; skip re-selection.
++                this.goalSelector.tickRunningGoals(false);
++            }
+             profiler.pop();
+         }
++        // coderyo end - LOD L0 DAB
+ 
+         profiler.push("navigation");
+         this.navigation.tick();
+diff --git a/net/minecraft/world/entity/ai/navigation/PathNavigation.java b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+index 5e9c6c30167865b63db0541c94afbc227c0bda91..0670fe893c0248589367d568ada2372ead480389 100644
+--- a/net/minecraft/world/entity/ai/navigation/PathNavigation.java
++++ b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+@@ -242,6 +242,20 @@ public abstract class PathNavigation {
+             return false;
+         }
+         // Paper end - Perf: Optimise pathfinding
++        // coderyo start - LOD L0 DAB: distance-banded REPATH throttle (the path-bound MSPT lever).
++        // When DAB says throttle this tick AND the mob already has a live path toward a target, COAST
++        // on that path instead of recomputing (which is the expensive A* / L1 createPath). This is
++        // the same idea vanilla already uses (MeleeAttackGoal's ticksUntilNextPathRecalculation), just
++        // distance-banded. Tier-1 safe: the target/aggro is unchanged (the goal already chose it); we
++        // only stretch HOW OFTEN we repath toward a target the mob is already pathing to, so a far mob
++        // reacts to target movement slightly later but still reaches it (path-following continues every
++        // tick). Never throttles when there is no live path (must compute one) or in the NEAR band.
++        if (this.mob instanceof net.minecraft.world.entity.Mob coderyoMob
++            && this.path != null && !this.path.isDone()
++            && !com.coderyo.lod.LodManager.shouldRunAiThisTick(coderyoMob, this.level)) {
++            return true; // keep the current path this tick
++        }
++        // coderyo end - LOD L0 DAB
+         Path newPath = this.createPath(target, 1);
+         // Paper start - Perf: Optimise pathfinding
+         if (newPath != null && this.moveTo(newPath, speedModifier)) {
