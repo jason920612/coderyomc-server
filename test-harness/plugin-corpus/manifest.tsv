@@ -1,0 +1,9 @@
+plugin	version	declared_mc_support	declares_26_2	source	url	notes
+LuckPerms	5.5.53	1.8.9-1.21.11, 26.1-26.2	yes	modrinth	https://cdn.modrinth.com/data/Vebnzrzj/versions/MBSY8toc/LuckPerms-Bukkit-5.5.53.jar	Permissions. Standalone, no hard deps. Bukkit loader build.
+WorldEdit	7.4.4-beta-01	1.21.4-1.21.11, 26.1-26.2	yes	modrinth	https://cdn.modrinth.com/data/1u6JkXh5/versions/ESAHQFYo/worldedit-bukkit-7.4.4-beta-01.jar	World editing. First WE build listing 26.2 (beta channel). Standalone.
+ViaVersion	5.10.1-SNAPSHOT+1012	1.8.9-26.2	yes	modrinth	https://cdn.modrinth.com/data/P1OZGk5p/versions/z0sCGSmk/ViaVersion-5.10.1-SNAPSHOT.jar	Protocol translation. Snapshot build explicitly built for mc26.2. Paper loader.
+VaultUnlocked	2.20.2	1.8-26.2	yes	modrinth	https://cdn.modrinth.com/data/ayRaM8J7/versions/cLNipSgw/VaultUnlocked-2.20.2.jar	Vault fork w/ Folia support + 26.2 tag. Economy API shim; no economy provider bundled.
+PlaceholderAPI	2.12.2	1.8-1.21.11, 26.1-26.1.2	no	modrinth	https://cdn.modrinth.com/data/lKEzGugV/versions/UmbIiI5H/PlaceholderAPI-2.12.2.jar	Placeholders. Newest build stops at 26.1.2 — NO 26.2 tag yet. Standalone.
+WorldGuard	7.0.17	1.21.11, 26.1-26.1.2	no	modrinth	https://cdn.modrinth.com/data/DKY9btbd/versions/pI4UHLJL/worldguard-bukkit-7.0.17.jar	Region protection. Newest build stops at 26.1.2 — NO 26.2 tag. Depends on WorldEdit.
+EssentialsX	2.22.0	1.8.8-1.21.11, 26.1.2	no	modrinth	https://cdn.modrinth.com/data/hXiIvTyT/versions/nY6VN1XH/EssentialsX-2.22.0.jar	Core utilities. Modrinth stable stops at 26.1.2 (site claims 26.2 via snapshot repo). NO 26.2-tagged stable.
+CoreProtect	23.2	1.16-1.21.11	no	modrinth	https://cdn.modrinth.com/data/Lu3KuzdV/versions/6W2ad1iI/CoreProtect-CE-23.2.jar	Block logging (Community Edition fork; official PlayPro is dev-build only). Stops at 1.21.11 — NO 26.2 tag.
