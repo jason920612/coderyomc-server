@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Cache the multi-GB paperweight upstream work so applyAllPatches
+          # does not re-download/re-decompile Minecraft every run.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Cache paperweight upstream
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/paperweight
+            .gradle/caches/paperweight
+            coderyo-server/.gradle/caches/paperweight
+          key: paperweight-${{ runner.os }}-${{ hashFiles('gradle.properties') }}
+          restore-keys: |
+            paperweight-${{ runner.os }}-
+
+      - name: Apply patches (materialize upstream)
+        run: ./gradlew applyAllPatches --stacktrace
+
+      - name: Assemble
+        run: ./gradlew assemble --stacktrace
