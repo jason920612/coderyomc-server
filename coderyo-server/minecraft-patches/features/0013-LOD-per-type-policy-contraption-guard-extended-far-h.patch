@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Fri, 26 Jun 2026 00:55:31 +0800
+Subject: [PATCH] LOD per-type policy + contraption guard + extended
+ far-hostile throttle
+
+
+diff --git a/com/coderyo/lod/LodConfig.java b/com/coderyo/lod/LodConfig.java
+index 4344d3f67199edc48f29ad3bfd9c0b916422b921..a548f7aaae7729a49378fa4e2676d029d70c387c 100644
+--- a/com/coderyo/lod/LodConfig.java
++++ b/com/coderyo/lod/LodConfig.java
+@@ -62,10 +62,51 @@ public final class LodConfig {
+     /** Environment variable key for the LOD debug counters flag. */
+     public static final String DEBUG_ENV = "CODERYO_LOD_DEBUG";
+ 
++    /** System property key for the per-entity-type policy master flag (the contraption guard). */
++    public static final String POLICY_PROPERTY = "coderyo.lod.policy.enabled";
++    /** Environment variable key for the per-entity-type policy master flag. */
++    public static final String POLICY_ENV = "CODERYO_LOD_POLICY_ENABLED";
++
++    /** System property key for the extended far-hostile throttle (look/sensor/non-essential ticks). */
++    public static final String EXTENDED_PROPERTY = "coderyo.lod.extended.enabled";
++    /** Environment variable key for the extended far-hostile throttle. */
++    public static final String EXTENDED_ENV = "CODERYO_LOD_EXTENDED_ENABLED";
++
+     /** {@code lod.dab.enabled} default — OFF (full vanilla AI cadence at all distances). */
+     public static final boolean DEFAULT_ENABLED = false;
+     /** {@code lod.debug} default — quiet. */
+     public static final boolean DEFAULT_DEBUG = false;
++    /**
++     * {@code lod.policy.enabled} default — ON. Per-entity-type policy is the contraption guard; it is
++     * on by default whenever DAB is enabled so villagers / farm animals / named-leashed-ridden mobs
++     * are protected unless an operator explicitly opts out. (Inert while {@code dab.enabled} is off.)
++     */
++    public static final boolean DEFAULT_POLICY = true;
++    /**
++     * {@code lod.extended.enabled} default — ON when DAB is on. Throttles look-control + sensor +
++     * non-essential behavior ticks for FAR HOSTILE mobs only (bounded by the band fidelity floor;
++     * movement / path-following / aggro stay every tick). Inert while {@code dab.enabled} is off.
++     */
++    public static final boolean DEFAULT_EXTENDED = true;
++
++    /** Per-class exemption defaults — villagers, tamed pets, and breeding/baby animals never throttle. */
++    public static final boolean DEFAULT_EXEMPT_VILLAGERS = true;
++    public static final boolean DEFAULT_EXEMPT_TAMED = true;
++    public static final boolean DEFAULT_EXEMPT_BREEDING = true;
++    /**
++     * Whether persistence-required mobs are exempt (default true): a player-built mob farm typically
++     * keeps its mobs with PersistenceRequired, so exempting them protects farm cadence. An operator
++     * who wants distant persistent HOSTILE mobs throttled anyway (or to benchmark the raw hostile win
++     * on a stable population) can set {@code coderyo.lod.policy.exempt.persistent=false}.
++     */
++    public static final boolean DEFAULT_EXEMPT_PERSISTENT = true;
++
++    /**
++     * Passive-class divisor CAP (default 2): non-exempt passive/creature mobs are throttled at most
++     * this gently regardless of band, so their breeding/cooldown cadence stays within the Tier-3
++     * floor (>=95% of vanilla) even far out. 1 would mean "never throttle passives".
++     */
++    public static final int DEFAULT_PASSIVE_DIV_CAP = 2;
+ 
+     // --- Band edge radii (blocks). Distances are compared squared internally for cheapness. ---
+     /** Outer edge of the NEAR band (default 16). Inside this, AI is always full vanilla cadence. */
+@@ -86,6 +127,19 @@ public final class LodConfig {
+ 
+     private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
+     private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, DEFAULT_DEBUG);
++    private static final boolean POLICY = resolveBoolean(POLICY_PROPERTY, POLICY_ENV, DEFAULT_POLICY);
++    private static final boolean EXTENDED = resolveBoolean(EXTENDED_PROPERTY, EXTENDED_ENV, DEFAULT_EXTENDED);
++
++    private static final boolean EXEMPT_VILLAGERS =
++        resolveBoolean("coderyo.lod.policy.exempt.villagers", "CODERYO_LOD_EXEMPT_VILLAGERS", DEFAULT_EXEMPT_VILLAGERS);
++    private static final boolean EXEMPT_TAMED =
++        resolveBoolean("coderyo.lod.policy.exempt.tamed", "CODERYO_LOD_EXEMPT_TAMED", DEFAULT_EXEMPT_TAMED);
++    private static final boolean EXEMPT_BREEDING =
++        resolveBoolean("coderyo.lod.policy.exempt.breeding", "CODERYO_LOD_EXEMPT_BREEDING", DEFAULT_EXEMPT_BREEDING);
++    private static final boolean EXEMPT_PERSISTENT =
++        resolveBoolean("coderyo.lod.policy.exempt.persistent", "CODERYO_LOD_EXEMPT_PERSISTENT", DEFAULT_EXEMPT_PERSISTENT);
++    private static final int PASSIVE_DIV_CAP =
++        Math.max(1, resolveInt("coderyo.lod.policy.passive.divcap", "CODERYO_LOD_PASSIVE_DIVCAP", DEFAULT_PASSIVE_DIV_CAP));
+ 
+     private static final double NEAR = resolveDouble("coderyo.lod.band.near", "CODERYO_LOD_BAND_NEAR", DEFAULT_NEAR);
+     private static final double BAND1 = resolveDouble("coderyo.lod.band.b1", "CODERYO_LOD_BAND_B1", DEFAULT_BAND1);
+@@ -116,6 +170,48 @@ public final class LodConfig {
+         return DEBUG;
+     }
+ 
++    /**
++     * Whether per-entity-type policy (the contraption guard) is active. When false, every throttleable
++     * mob is treated uniformly (legacy L0 behavior). Default true; inert while DAB is off.
++     */
++    public static boolean isPolicyEnabled() {
++        return POLICY;
++    }
++
++    /**
++     * Whether the extended far-hostile throttle (look-control + sensor + non-essential behavior ticks)
++     * is active. Only ever applies to FAR HOSTILE mobs and is bounded by the band fidelity floor.
++     * Default true; inert while DAB is off.
++     */
++    public static boolean isExtendedEnabled() {
++        return EXTENDED;
++    }
++
++    /** Whether villagers / wandering traders are exempt from throttling (default true). */
++    public static boolean exemptVillagers() {
++        return EXEMPT_VILLAGERS;
++    }
++
++    /** Whether tamed animals are exempt from throttling (default true). */
++    public static boolean exemptTamed() {
++        return EXEMPT_TAMED;
++    }
++
++    /** Whether baby / in-love (breeding-cadence) animals are exempt from throttling (default true). */
++    public static boolean exemptBreeding() {
++        return EXEMPT_BREEDING;
++    }
++
++    /** Whether persistence-required mobs are exempt from throttling (default true). */
++    public static boolean exemptPersistent() {
++        return EXEMPT_PERSISTENT;
++    }
++
++    /** The maximum divisor applied to PASSIVE-class mobs regardless of band (default 2). */
++    public static int passiveDivCap() {
++        return PASSIVE_DIV_CAP;
++    }
++
+     static double nearSq() {
+         return NEAR_SQ;
+     }
+diff --git a/com/coderyo/lod/LodEntityClass.java b/com/coderyo/lod/LodEntityClass.java
+index a758e48f8790399d9cd08472859af1bf6b371b1d..dbb5b82d0c04d979e7c4f95c16d44f24ba25d31b 100644
+--- a/com/coderyo/lod/LodEntityClass.java
++++ b/com/coderyo/lod/LodEntityClass.java
+@@ -51,4 +51,4 @@ public enum LodEntityClass {
+     public boolean throttleable() {
+         return this != EXEMPT;
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/com/coderyo/lod/LodManager.java b/com/coderyo/lod/LodManager.java
+index 07e06abe21af6ce67a4abf340beb731e9f177384..8007c1fcb5e6268093705eb5bf984b097193a5b8 100644
+--- a/com/coderyo/lod/LodManager.java
++++ b/com/coderyo/lod/LodManager.java
+@@ -118,6 +118,33 @@ public final class LodManager {
+         }
+     }
+ 
++    /**
++     * The effective AI-throttle divisor for {@code mob} this tick, after applying the per-entity-type
++     * policy on top of the raw band divisor:
++     * <ul>
++     *   <li><b>EXEMPT</b> -&gt; 1 (never throttle — the contraption guard).</li>
++     *   <li><b>PASSIVE</b> -&gt; {@code min(bandDivisor, passiveDivCap)} (very conservative).</li>
++     *   <li><b>HOSTILE</b> -&gt; the full band divisor (the aggressive win).</li>
++     * </ul>
++     * When policy is disabled the raw band divisor is used for every throttleable mob (legacy L0).
++     */
++    public static int effectiveDivisor(final Mob mob, final LodBand band) {
++        final int bandDiv = aiDivisor(band);
++        if (!LodConfig.isPolicyEnabled()) {
++            return bandDiv;
++        }
++        final LodEntityClass cls = LodPolicy.classify(mob);
++        switch (cls) {
++            case EXEMPT:
++                return 1; // never throttle
++            case PASSIVE:
++                return Math.min(bandDiv, LodConfig.passiveDivCap());
++            case HOSTILE:
++            default:
++                return bandDiv;
++        }
++    }
++
+     /**
+      * The DAB decision: should {@code mob} run its (expensive) goal re-decision + repath THIS tick?
+      *
+@@ -134,7 +161,7 @@ public final class LodManager {
+             return true; // vanilla cadence
+         }
+         final LodBand band = bandFor(mob, level);
+-        final int divisor = aiDivisor(band);
++        final int divisor = effectiveDivisor(mob, band); // per-entity-type policy applied here
+         final boolean run;
+         if (divisor <= 1) {
+             run = true;
+@@ -145,7 +172,47 @@ public final class LodManager {
+         }
+         if (LodConfig.isDebug()) {
+             LodStats.record(band, run);
++            // Per policy-class tally proves the contraption guard: EXEMPT must stay skip ~ 0.
++            LodStats.recordClass(LodPolicy.classify(mob), run);
+         }
+         return run;
+     }
++
++    /**
++     * The EXTENDED far-hostile throttle: should {@code mob} run its non-essential per-tick AI work
++     * (look-control aim, brain/sensor refresh, non-essential behavior) THIS tick? Captures more of the
++     * entity_tick cost than the goal/path throttle alone.
++     *
++     * <p><b>Strictly conservative — Tier-1 preserving:</b>
++     * <ul>
++     *   <li>Returns {@code true} (run everything, vanilla) unless DAB AND the extended flag are on.</li>
++     *   <li>Only ever throttles <b>HOSTILE</b>-class mobs (per the policy) — EXEMPT/PASSIVE always run.
++     *       So villagers / farm animals / pets keep every sensor + look tick.</li>
++     *   <li>Never throttles inside the NEAR band (full vanilla close to the player).</li>
++     *   <li>Uses the SAME band divisor + id phase as the goal/path throttle, so a hostile mob that
++     *       re-decides this tick also refreshes its look/sensor this tick — they stay in lock-step,
++     *       and movement / path-following / aggro are NEVER gated by this (the caller keeps those
++     *       every tick). This only coarsens the cosmetic/perception cadence of distant monsters,
++     *       bounded by the band fidelity floor.</li>
++     * </ul>
++     */
++    public static boolean shouldRunExtendedThisTick(final Mob mob, final Level level) {
++        if (!LodConfig.isEnabled() || !LodConfig.isExtendedEnabled()) {
++            return true; // vanilla — run all per-tick AI work
++        }
++        final LodBand band = bandFor(mob, level);
++        if (band.isNear()) {
++            return true; // full vanilla inside the near radius
++        }
++        // Extended throttle is HOSTILE-only: never coarsen perception of timing-sensitive entities.
++        if (LodPolicy.classify(mob) != LodEntityClass.HOSTILE) {
++            return true;
++        }
++        final int divisor = aiDivisor(band);
++        if (divisor <= 1) {
++            return true;
++        }
++        final int tick = net.minecraft.server.MinecraftServer.currentTick;
++        return ((tick + mob.getId()) % divisor) == 0;
++    }
+ }
+diff --git a/com/coderyo/lod/LodPolicy.java b/com/coderyo/lod/LodPolicy.java
+index 039daac3a66a249700e061d3331b220844628419..6c86a8471e0483c4be373021a4292e79fe332dc1 100644
+--- a/com/coderyo/lod/LodPolicy.java
++++ b/com/coderyo/lod/LodPolicy.java
+@@ -85,4 +85,4 @@ public final class LodPolicy {
+         // 4. Everything else — conservative throttle.
+         return LodEntityClass.PASSIVE;
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/com/coderyo/lod/LodStats.java b/com/coderyo/lod/LodStats.java
+index 61aad1b9041c61a0549a3c940f50f66b4ca2fd7e..928e2661c86dfe976aca70a24d40aaaf90f148c5 100644
+--- a/com/coderyo/lod/LodStats.java
++++ b/com/coderyo/lod/LodStats.java
+@@ -47,6 +47,28 @@ public final class LodStats {
+         maybeLog();
+     }
+ 
++    private static final LongAdder[] CLS_RAN = newClassArr();
++    private static final LongAdder[] CLS_SKIP = newClassArr();
++    private static LongAdder[] newClassArr() {
++        final LongAdder[] a = new LongAdder[LodEntityClass.values().length];
++        for (int i = 0; i < a.length; i++) a[i] = new LongAdder();
++        return a;
++    }
++    /** Per policy-class ran/skip tally (proves the contraption guard: EXEMPT stays skip ~ 0). */
++    public static void recordClass(final LodEntityClass cls, final boolean ran) {
++        (ran ? CLS_RAN : CLS_SKIP)[cls.ordinal()].increment();
++    }
++    static String classTally() {
++        final StringBuilder sb = new StringBuilder("[coderyo-lod] CLASS tally: ");
++        for (final LodEntityClass c : LodEntityClass.values()) {
++            final long r = CLS_RAN[c.ordinal()].sum(), s = CLS_SKIP[c.ordinal()].sum();
++            final long t = r + s;
++            sb.append(c.name()).append("(ran=").append(r).append(",skip=").append(s)
++              .append(",skip%=").append(t == 0 ? "-" : String.format(java.util.Locale.ROOT, "%.3f", (double) s / t)).append(") ");
++        }
++        return sb.toString();
++    }
++
+     private static volatile long lastLogMs = 0L;
+ 
+     private static void maybeLog() {
+@@ -78,6 +100,7 @@ public final class LodStats {
+         sb.append("| overall-skip%=").append(String.format(java.util.Locale.ROOT, "%.4f", overall))
+             .append(" totalRan=").append(totalRan).append(" totalSkip=").append(totalSkip);
+         System.out.println(sb);
++        System.out.println(classTally());
+     }
+ 
+     /** Overall fraction of mob-ticks throttled (skipped AI re-decision) since boot. */
+diff --git a/net/minecraft/world/entity/Mob.java b/net/minecraft/world/entity/Mob.java
+index ad5a3aecfbf582767245d944d0e53182402131b1..a131d9906be3826ee6ccf027eeae209218d4a561 100644
+--- a/net/minecraft/world/entity/Mob.java
++++ b/net/minecraft/world/entity/Mob.java
+@@ -847,9 +847,20 @@ public abstract class Mob extends LivingEntity implements Targeting, EquipmentUs
+         }
+         // Paper end - Allow nerfed mobs to jump and float
+         ProfilerFiller profiler = Profiler.get();
++        // coderyo start - LOD extended far-hostile throttle: should non-essential per-tick AI work run?
++        // Computed once (caches the per-tick nearest-player distance). HOSTILE-only, never NEAR, never
++        // EXEMPT/PASSIVE -> only coarsens distant monsters' perception/aim cadence, bounded by the band
++        // fidelity floor. Movement / path-following / aggro are NOT gated by this (kept every tick).
++        final boolean coderyoRunExtended =
++            com.coderyo.lod.LodManager.shouldRunExtendedThisTick(this, this.level());
+         profiler.push("sensing");
+-        this.sensing.tick();
++        // The line-of-sight sensing cache is the heaviest non-essential perception work; on a throttled
++        // tick a far hostile mob keeps last tick's sensing snapshot (it still chases its current target).
++        if (coderyoRunExtended) {
++            this.sensing.tick();
++        }
+         profiler.pop();
++        // coderyo end - LOD extended far-hostile throttle
+         int idBasedTickCount = this.tickCount + this.getId();
+         // coderyo start - LOD L0 DAB: distance-banded AI throttle.
+         // Tier-1 invariant: target/aggro selection ALWAYS runs at full cadence (never throttled),
+@@ -890,11 +901,17 @@ public abstract class Mob extends LivingEntity implements Targeting, EquipmentUs
+         profiler.pop();
+         profiler.push("controls");
+         profiler.push("move");
+-        this.moveControl.tick();
++        this.moveControl.tick(); // Tier-1: movement ALWAYS ticks (mob keeps following its path).
+         profiler.popPush("look");
+-        this.lookControl.tick();
++        // coderyo start - LOD extended far-hostile throttle: look-control is cosmetic head-aim; a far
++        // hostile mob can hold its current head rotation on a throttled tick without changing where it
++        // goes. jump/move stay every tick. Never affects EXEMPT/PASSIVE/NEAR (coderyoRunExtended=true).
++        if (coderyoRunExtended) {
++            this.lookControl.tick();
++        }
++        // coderyo end - LOD extended far-hostile throttle
+         profiler.popPush("jump");
+-        this.jumpControl.tick();
++        this.jumpControl.tick(); // Tier-1: jump control stays every tick.
+         profiler.pop();
+         profiler.pop();
+     }

@@ -1,0 +1,57 @@
+--- /dev/null
++++ b/com/coderyo/lod/LodEntityClass.java
+@@ -1,0 +_,54 @@
++/*
++ * coderyoMC — per-entity-type LOD policy class.
++ *
++ * The per-entity-type policy is the main guard that makes LOD/DAB plausibly default-on: the classic
++ * DAB contraption complaint (villager breeders, farm-animal breeding/cooldown cadence, mob-farm
++ * timing) is overwhelmingly about TIMING-SENSITIVE passive/utility entities, NOT hostile combat AI.
++ * So we split entities into policy classes and apply LOD aggressiveness per class:
++ *
++ *   HOSTILE  -> throttle aggressively far away (the big, low-gameplay-risk win).
++ *   PASSIVE  -> throttle very conservatively (gentle divisors, NEAR + an extra full-rate band).
++ *   EXEMPT   -> never throttle (timing-sensitive / player-attached / persistent entities).
++ *
++ * See pathfinding-elision-design.md §2.1 / §8 (the DAB timing-sensitivity hazard).
++ */
++package com.coderyo.lod;
++
++/**
++ * The LOD policy class an entity belongs to. Determines how aggressively the L0 DAB throttle (and the
++ * extended far-entity throttle) may slow a mob's AI when it is far from any player.
++ *
++ * <p>Classification is performed by {@link LodPolicy#classify}; the per-class aggressiveness is read
++ * from {@link LodConfig} so it is tunable without a rebuild.
++ */
++public enum LodEntityClass {
++    /**
++     * Hostile / monster AI (zombies, skeletons, creepers, …). The big LOD win and the lowest
++     * gameplay risk: their far-away "think slower" drift is imperceptible and they run no
++     * timing-sensitive contraption logic. Eligible for the full divisor table AND the extended
++     * far-entity throttle (look/sensor/non-essential behavior coarsening).
++     */
++    HOSTILE,
++
++    /**
++     * Passive / farm animals and other creatures that are NOT exempt. Throttled only very
++     * conservatively: a gentle divisor and an extra full-rate band, never the extended throttle.
++     * This keeps breeding/cooldown cadence within the error standard's Tier-3 floor (>=95% of
++     * vanilla cadence inside the full-rate radius) while still saving some far-away AI cost.
++     */
++    PASSIVE,
++
++    /**
++     * Never throttled — full vanilla cadence at every distance. Reserved for entities whose exact
++     * AI timing is gameplay-load-bearing or that are attached to a player:
++     * villagers (breeders / trades), tamed / named / persistence-required mobs, vehicles, leashed or
++     * ridden entities, and anything a player is riding or recently interacted with. This is the
++     * mob-farm / villager-breeder contraption guard.
++     */
++    EXEMPT;
++
++    /** True if this class is allowed to be throttled at all (HOSTILE or PASSIVE). */
++    public boolean throttleable() {
++        return this != EXEMPT;
++    }
++}

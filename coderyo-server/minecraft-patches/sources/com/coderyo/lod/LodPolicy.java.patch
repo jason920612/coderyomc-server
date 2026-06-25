@@ -1,0 +1,91 @@
+--- /dev/null
++++ b/com/coderyo/lod/LodPolicy.java
+@@ -1,0 +_,88 @@
++/*
++ * coderyoMC — per-entity-type LOD policy classifier.
++ *
++ * Maps a concrete {@link net.minecraft.world.entity.Mob} to its {@link LodEntityClass}, applying the
++ * contraption-safety exemptions BEFORE the hostile/passive split. The classification is intentionally
++ * conservative: anything whose AI timing could be load-bearing (villagers, farm-animal breeding,
++ * tamed/named/persistent mobs, vehicles/leashed/ridden, recently player-touched) is EXEMPT — full
++ * vanilla cadence at every distance — so LOD/DAB cannot measurably regress a common villager-breeder
++ * or mob-farm. Only HOSTILE monster AI gets the aggressive far-away throttle (the big, low-risk win).
++ *
++ * See pathfinding-elision-design.md §2.1 / §8 and the LOD safety scope (per-type policy + contraption
++ * guard).
++ */
++package com.coderyo.lod;
++
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.entity.animal.Animal;
++import net.minecraft.world.entity.monster.Enemy;
++
++/**
++ * Classifies a {@link Mob} into a {@link LodEntityClass}. Pure / side-effect-free and cheap
++ * (instanceof + a few boolean field reads), safe to call every tick from any region worker.
++ *
++ * <p><b>Decision order (first match wins):</b>
++ * <ol>
++ *   <li><b>EXEMPT — player-attached / load-bearing.</b> A player is riding it; it is a vehicle, a
++ *       passenger, or leashed; it has a custom name; it requires persistence; or it was hurt by a
++ *       player recently ({@code lastHurtByPlayerMemoryTime} &gt; 0). These never throttle.</li>
++ *   <li><b>EXEMPT — timing-sensitive utility.</b> Villagers / wandering traders (breeders, trades),
++ *       tamed animals, and baby / in-love animals (breeding + cooldown cadence). These never
++ *       throttle. Gated by {@code coderyo.lod.policy.exempt.villagers} /
++ *       {@code .exempt.tamed} / {@code .exempt.breeding} so an operator can opt a category back in.</li>
++ *   <li><b>HOSTILE.</b> Implements {@link Enemy} (every monster) — the aggressive-throttle class.</li>
++ *   <li><b>PASSIVE.</b> Everything else (ambient/water/creature mobs) — conservative throttle.</li>
++ * </ol>
++ *
++ * <p>If per-type policy is disabled ({@code coderyo.lod.policy.enabled=false}) the classifier still
++ * runs but {@link LodManager} treats every throttleable mob uniformly (legacy behavior), so the flag
++ * is a clean kill-switch.
++ */
++public final class LodPolicy {
++
++    private LodPolicy() {
++    }
++
++    /**
++     * The LOD policy class of {@code mob}. Never returns {@code null}.
++     *
++     * <p>Applies the contraption-safety exemptions first, so a named/leashed/ridden/persistent or
++     * recently-player-interacted entity is EXEMPT regardless of whether it is hostile.
++     */
++    public static LodEntityClass classify(final Mob mob) {
++        // 1. Player-attached / explicitly-kept entities: never throttle, regardless of hostility.
++        if (mob.isVehicle()                       // something is riding it (incl. a player)
++            || mob.isPassenger()                  // it is riding something (minecart/boat/another mob)
++            || mob.isLeashed()                    // leashed to a fence/player
++            || mob.hasCustomName()                // nametagged -> player cares about it
++            || mob.lastHurtByPlayerMemoryTime > 0 // a player recently hit it -> never throttle
++            || (LodConfig.exemptPersistent() && mob.isPersistenceRequired()) // persistent -> keep exact
++        ) {
++            return LodEntityClass.EXEMPT;
++        }
++
++        // 2. Timing-sensitive utility entities (the classic DAB contraption complaint).
++        if (LodConfig.exemptVillagers()
++            && mob instanceof net.minecraft.world.entity.npc.villager.AbstractVillager) {
++            return LodEntityClass.EXEMPT; // breeders / trades / restock cadence
++        }
++        if (mob instanceof Animal animal) {
++            if (LodConfig.exemptTamed()
++                && mob instanceof net.minecraft.world.entity.TamableAnimal tamable
++                && tamable.isTame()) {
++                return LodEntityClass.EXEMPT; // pets — player cares, follow/sit timing
++            }
++            if (LodConfig.exemptBreeding() && (animal.isBaby() || animal.isInLove())) {
++                return LodEntityClass.EXEMPT; // breeding + growth + love cooldown cadence
++            }
++        }
++
++        // 3. Hostile monster AI — the aggressive-throttle class (low gameplay risk, big win).
++        if (mob instanceof Enemy) {
++            return LodEntityClass.HOSTILE;
++        }
++
++        // 4. Everything else — conservative throttle.
++        return LodEntityClass.PASSIVE;
++    }
++}
