@@ -1,0 +1,584 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Fri, 26 Jun 2026 06:32:04 +0800
+Subject: [PATCH] neighbor-scan sharing: per-entity shared superset across
+ collision+sensors+AI (flag-gated)
+
+
+diff --git a/com/coderyo/neighborshare/NeighborShare.java b/com/coderyo/neighborshare/NeighborShare.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..251cd6d70a5f5e81679fe36a72ecd24265b614bf
+--- /dev/null
++++ b/com/coderyo/neighborshare/NeighborShare.java
+@@ -0,0 +1,351 @@
++/*
++ * coderyoMC — per-entity neighbor-scan sharing (query ELIMINATION).
++ *
++ * A mob runs MULTIPLE separate "scan nearby entities" passes per tick:
++ *   - collision / push  (LivingEntity.pushEntities -> getPushableEntities -> getEntities)
++ *   - Brain sensors     (NearestLivingEntitySensor etc. -> getEntitiesOfClass)
++ *   - AI targeting      (NearestAttackableTargetGoal etc. -> getEntitiesOfClass)
++ * These scan OVERLAPPING nearby-entity sets per tick for the SAME mob. This class
++ * computes the neighbor SUPERSET ONCE per entity per tick (a single section scan
++ * over the largest box any pass needs) and SHARES it, so each pass FILTERS from the
++ * shared list instead of re-scanning the world. That ELIMINATES the redundant scans
++ * (N -> 1 + cheap filters), distinct from re-laying-out one scan (which never won).
++ *
++ * Correctness is the gate: the superset is built by the IDENTICAL section-grid
++ * iteration with a strictly larger box and NO predicate, so filtering it by a pass's
++ * (smaller) box + class + except + predicate reproduces the EXACT set and order of a
++ * direct scan (superset box ⊇ pass box; the filter is the same intersects+class+pred
++ * the vanilla inner loop runs). Thread-confined to the owning entity's tick; no
++ * cross-region shared state. Flag-gated, default OFF.
++ */
++package com.coderyo.neighborshare;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.function.Predicate;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.phys.AABB;
++
++/**
++ * Thread-confined façade for per-entity neighbor-scan sharing. All mutable state is
++ * a {@link ThreadLocal} "active body" context plus per-entity fields on {@link Entity}
++ * — never shared across threads, so it is safe under regionized parallel ticking
++ * (#24 single-writer: the cache is read/written only on the body's own tick thread).
++ */
++public final class NeighborShare {
++
++    private NeighborShare() {
++    }
++
++    /** The entity whose tick is currently executing (set by {@code Mob.tick}). */
++    private static final ThreadLocal<Entity> ACTIVE_BODY = new ThreadLocal<>();
++
++    // --- global scan instrumentation (debug only) ---------------------------
++    // Atomic so region workers + orchestrator all contribute; dumped each second from
++    // the server tick. Counts are observability only (no behavior depends on them).
++    private static final java.util.concurrent.atomic.AtomicLong DIRECT_SCANS = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong SUPERSET_SCANS = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong SHARED_QUERIES = new java.util.concurrent.atomic.AtomicLong();
++    static final java.util.concurrent.atomic.AtomicLong DIAG_NOBODY = new java.util.concurrent.atomic.AtomicLong();
++    static final java.util.concurrent.atomic.AtomicLong DIAG_NOTCONTAINED = new java.util.concurrent.atomic.AtomicLong();
++    static final java.util.concurrent.atomic.AtomicLong DIAG_OPENS = new java.util.concurrent.atomic.AtomicLong();
++    private static long lastDumpTick = Long.MIN_VALUE;
++
++    /**
++     * Open the sharing window for {@code body}'s tick. While open, qualifying
++     * {@code getEntitiesOfClass}/{@code getEntities} calls whose box is contained in
++     * the body's superset box are served by filtering the shared list. Idempotent
++     * for re-entrancy: only the OUTERMOST open/close pair manages the context, so a
++     * nested mob tick (passenger ticking its vehicle, etc.) does not clobber it.
++     *
++     * @return {@code true} if this call opened the window (caller must {@link #close}).
++     */
++    public static boolean open(final Entity body) {
++        if (!NeighborShareConfig.isEnabled() || body == null) {
++            return false;
++        }
++        if (NeighborShareConfig.isDebug()) { DIAG_OPENS.incrementAndGet(); }
++        if (ACTIVE_BODY.get() != null) {
++            return false; // already inside another body's window; do not nest
++        }
++        ACTIVE_BODY.set(body);
++        // invalidate any stale superset from a previous tick / previous body
++        body.coderyoNeighborTick = Long.MIN_VALUE;
++        return true;
++    }
++
++    /** Close the sharing window (only the opener calls this). */
++    public static void close(final Entity body) {
++        ACTIVE_BODY.remove();
++        if (body != null) {
++            // drop the reference list so entities are not retained past the tick
++            body.coderyoNeighborList = null;
++        }
++    }
++
++    /**
++     * Attempt to serve a {@code getEntitiesOfClass(clazz, box, predicate)} query from
++     * the active body's shared superset. Returns the filtered list, or {@code null} to
++     * signal "not shareable — run the vanilla scan".
++     *
++     * <p>Shareable iff: sharing on; there is an active body; the query level is the
++     * body's level; and the query box is CONTAINED in the superset box (so the superset
++     * is a strict superset of the query). The superset is the section-storage scan only
++     * (no dragon parts) — exactly what vanilla {@code getEntitiesOfClass} returns.
++     */
++    @SuppressWarnings("unchecked")
++    public static <T extends Entity> List<T> tryGetEntitiesOfClass(final Level level, final Class<T> clazz,
++                                                                   final AABB box, final Predicate<? super T> predicate) {
++        final Entity body = ACTIVE_BODY.get();
++        if (body == null || body.level() != level || body.isRemoved()) {
++            if (NeighborShareConfig.isDebug()) { DIAG_NOBODY.incrementAndGet(); }
++            return null;
++        }
++        final List<Entity> superset = ensureSuperset(body, box);
++        if (superset == null) {
++            if (NeighborShareConfig.isDebug()) { DIAG_NOTCONTAINED.incrementAndGet(); }
++            return null; // box not contained in (capped) superset -> fall back to vanilla scan
++        }
++        if (NeighborShareConfig.isDebug()) {
++            SHARED_QUERIES.incrementAndGet();
++        }
++        final List<T> ret = new ArrayList<>();
++        // Vanilla inner loop, reproduced exactly: intersects(box) + class instanceof + predicate,
++        // in superset (section) iteration order. No `except` on this path (vanilla has none here).
++        for (int i = 0, n = superset.size(); i < n; i++) {
++            final Entity e = superset.get(i);
++            if (!clazz.isInstance(e)) {
++                continue;
++            }
++            if (!e.getBoundingBox().intersects(box)) {
++                continue;
++            }
++            final T casted = (T) e;
++            if (predicate != null && !predicate.test(casted)) {
++                continue;
++            }
++            ret.add(casted);
++        }
++        if (NeighborShareConfig.isVerify()) {
++            verifyClass(level, clazz, box, predicate, ret);
++        }
++        return ret;
++    }
++
++    /** Self-check: the shared filtered list must equal the real vanilla class scan (same order). */
++    private static <T extends Entity> void verifyClass(final Level level, final Class<T> clazz, final AABB box,
++                                                       final Predicate<? super T> predicate, final List<T> shared) {
++        final List<T> vanilla = new ArrayList<>();
++        ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel) level)
++            .moonrise$getEntityLookup().getEntities(clazz, null, box, vanilla, predicate);
++        if (!listsEqual(shared, vanilla)) {
++            logMismatch("getEntitiesOfClass(" + clazz.getSimpleName() + ")", shared, vanilla);
++        }
++    }
++
++    /**
++     * Attempt to serve a {@code getEntities(except, box, selector)} query (the
++     * collision/push path) from the active body's shared superset. Returns the filtered
++     * list (dragon parts NOT appended — the caller's vanilla path appends them after),
++     * or {@code null} to fall back. The superset is the section scan, so filtering it by
++     * {@code e != except && box.intersects && selector} reproduces vanilla's section
++     * portion exactly; the caller re-runs {@code addToGetEntities} for dragon parts.
++     */
++    public static List<Entity> tryGetEntities(final Level level, final Entity except,
++                                              final AABB box, final Predicate<? super Entity> selector) {
++        final Entity body = ACTIVE_BODY.get();
++        if (body == null || body.level() != level || body.isRemoved()) {
++            return null;
++        }
++        final List<Entity> superset = ensureSuperset(body, box);
++        if (superset == null) {
++            return null;
++        }
++        if (NeighborShareConfig.isDebug()) {
++            SHARED_QUERIES.incrementAndGet();
++        }
++        final List<Entity> ret = new ArrayList<>();
++        for (int i = 0, n = superset.size(); i < n; i++) {
++            final Entity e = superset.get(i);
++            if (e == except) {
++                continue;
++            }
++            if (!e.getBoundingBox().intersects(box)) {
++                continue;
++            }
++            if (selector != null && !selector.test(e)) {
++                continue;
++            }
++            ret.add(e);
++        }
++        if (NeighborShareConfig.isVerify()) {
++            // Compare against the vanilla section scan ONLY (dragon parts are appended by
++            // the caller identically on both paths, so excluding them keeps the check exact).
++            final List<Entity> vanilla = new ArrayList<>();
++            ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel) level)
++                .moonrise$getEntityLookup().getEntities(except, box, vanilla, selector);
++            if (!listsEqual(ret, vanilla)) {
++                logMismatch("getEntities(except," + (selector == null ? "null" : "sel") + ")", ret, vanilla);
++            }
++        }
++        return ret;
++    }
++
++    private static boolean listsEqual(final List<? extends Entity> a, final List<? extends Entity> b) {
++        if (a.size() != b.size()) {
++            return false;
++        }
++        for (int i = 0, n = a.size(); i < n; i++) {
++            if (a.get(i) != b.get(i)) { // object identity AND order
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static void logMismatch(final String which, final List<? extends Entity> shared, final List<? extends Entity> vanilla) {
++        org.slf4j.LoggerFactory.getLogger("coderyo-neighborshare").error(
++            "NEIGHBORSHARE-VERIFY MISMATCH in {} : shared={} vanilla={} (HARD FAIL - back off this pass)",
++            which, shared.size(), vanilla.size());
++    }
++
++    /**
++     * Lazily build (once per tick) and return the body's superset list, provided the
++     * query {@code box} is contained in the superset box. If the superset has not been
++     * built this tick, build it now over {@code body.getBoundingBox().inflate(R)} where
++     * R = max(query reach, body follow range) capped at {@link NeighborShareConfig#maxRange()}.
++     * Returns {@code null} if the query box is NOT contained (the pass must scan itself).
++     */
++    private static List<Entity> ensureSuperset(final Entity body, final AABB box) {
++        final long now = body.level().getGameTime();
++        List<Entity> superset = body.coderyoNeighborList;
++        AABB supersetBox = body.coderyoNeighborBox;
++
++        if (superset != null && body.coderyoNeighborTick == now && supersetBox != null
++            && contains(supersetBox, box)) {
++            return superset; // hot path: reuse this-tick superset
++        }
++
++        // Need to (re)build. The superset box must cover this query box AND the body's
++        // own follow-range reach (so later, smaller passes are also covered). Build from
++        // the body's CURRENT bounding box inflated by R.
++        final AABB bodyBox = body.getBoundingBox();
++        final double reach = requiredReach(bodyBox, box, body);
++        if (reach < 0.0D) {
++            return null; // query box not centered on / coverable by the body -> not shareable
++        }
++        final double r = Math.min(reach, NeighborShareConfig.maxRange());
++        final AABB newSuper = bodyBox.inflate(r, r, r);
++        if (!contains(newSuper, box)) {
++            // capped superset still cannot cover this query (huge bespoke box) -> fall back
++            return null;
++        }
++        superset = scanSuperset(body.level(), newSuper);
++        body.coderyoNeighborList = superset;
++        body.coderyoNeighborBox = newSuper;
++        body.coderyoNeighborTick = now;
++        return superset;
++    }
++
++    /**
++     * The inflate radius the superset needs: enough to cover both the query box and the
++     * body's follow-range reach, measured outward from the body's bounding box. Returns
++     * a negative sentinel when the query box extends outside what an inflate of the body
++     * box could ever cover symmetrically in a way we can prove (we require the query box
++     * to be centered-ish on the body — its faces no further out than the max single-axis
++     * inflate). For the targeted passes (collision = bb un-inflated; sensors/targeting =
++     * bb.inflate(followRange)) this always holds.
++     */
++    private static double requiredReach(final AABB bodyBox, final AABB queryBox, final Entity body) {
++        // Per-axis outward extent of the query box beyond the body box, both sides.
++        final double dxMin = bodyBox.minX - queryBox.minX;
++        final double dxMax = queryBox.maxX - bodyBox.maxX;
++        final double dyMin = bodyBox.minY - queryBox.minY;
++        final double dyMax = queryBox.maxY - bodyBox.maxY;
++        final double dzMin = bodyBox.minZ - queryBox.minZ;
++        final double dzMax = queryBox.maxZ - bodyBox.maxZ;
++        double reach = 0.0D;
++        reach = Math.max(reach, Math.max(dxMin, dxMax));
++        reach = Math.max(reach, Math.max(dyMin, dyMax));
++        reach = Math.max(reach, Math.max(dzMin, dzMax));
++        // Also pre-size for the body's follow range so the FIRST query (which may be the
++        // small collision box) still builds a superset big enough for the later sensor box.
++        final double follow = bodyFollowRange(body);
++        if (follow > reach) {
++            reach = follow;
++        }
++        return reach;
++    }
++
++    private static double bodyFollowRange(final Entity body) {
++        if (body instanceof net.minecraft.world.entity.LivingEntity living) {
++            return living.getAttributeValue(net.minecraft.world.entity.ai.attributes.Attributes.FOLLOW_RANGE);
++        }
++        return 0.0D;
++    }
++
++    /** True iff {@code outer} fully contains {@code inner} (closed-box containment). */
++    private static boolean contains(final AABB outer, final AABB inner) {
++        return outer.minX <= inner.minX && outer.maxX >= inner.maxX
++            && outer.minY <= inner.minY && outer.maxY >= inner.maxY
++            && outer.minZ <= inner.minZ && outer.maxZ >= inner.maxZ;
++    }
++
++    /**
++     * Build the superset: the section-storage scan over {@code box}, class {@code Entity},
++     * {@code except=null}, {@code predicate=null}. Uses the same Moonrise entity-lookup
++     * grid iteration the vanilla queries use, so the result is exactly the union the
++     * individual passes would each have scanned.
++     */
++    private static List<Entity> scanSuperset(final Level level, final AABB box) {
++        if (NeighborShareConfig.isDebug()) {
++            SUPERSET_SCANS.incrementAndGet();
++        }
++        final List<Entity> ret = new ArrayList<>();
++        ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel) level)
++            .moonrise$getEntityLookup().getEntities(Entity.class, null, box, ret, null);
++        return ret;
++    }
++
++    /** Debug: record that a vanilla (non-shared) section scan ran (flag on, but not shareable). */
++    public static void countDirectScan() {
++        if (NeighborShareConfig.isDebug()) {
++            DIRECT_SCANS.incrementAndGet();
++        }
++    }
++
++    /**
++     * Debug: once per ~20 ticks (1s) emit a scan-count line and reset the counters.
++     * Called from the server tick (orchestrator thread). Shows the elimination ratio:
++     * {@code superset} = the ONE scan-per-sharing-body per tick; {@code shared} = the
++     * pass queries served by filtering it (the eliminated scans); {@code direct} = the
++     * non-shareable queries that still scanned. Win = shared &gt;&gt; superset.
++     */
++    public static void maybeDumpCounters(final long serverTick) {
++        if (!NeighborShareConfig.isDebug()) {
++            return;
++        }
++        if (lastDumpTick != Long.MIN_VALUE && serverTick - lastDumpTick < 20L) {
++            return;
++        }
++        lastDumpTick = serverTick;
++        final long superset = SUPERSET_SCANS.getAndSet(0);
++        final long shared = SHARED_QUERIES.getAndSet(0);
++        final long direct = DIRECT_SCANS.getAndSet(0);
++        if (superset == 0 && shared == 0 && direct == 0) {
++            return;
++        }
++        final long vanillaWould = shared + superset + direct; // what vanilla would have section-scanned
++        final long actualScans = superset + direct; // what we actually section-scanned
++        final long eliminated = vanillaWould - actualScans;
++        final long nobody = DIAG_NOBODY.getAndSet(0);
++        final long notContained = DIAG_NOTCONTAINED.getAndSet(0);
++        final long opens = DIAG_OPENS.getAndSet(0);
++        org.slf4j.LoggerFactory.getLogger("coderyo-neighborshare").info(
++            "NEIGHBORSHARE tick#{} window~1s: vanilla-scans={} actual-scans={} (superset={} direct={}) "
++                + "shared-served={} ELIMINATED={} ({}%) [diag mob.tick-opens={} nobody={} notContained={}]",
++            serverTick, vanillaWould, actualScans, superset, direct, shared, eliminated,
++            vanillaWould == 0 ? 0 : (eliminated * 100 / vanillaWould), opens, nobody, notContained);
++    }
++}
+diff --git a/com/coderyo/neighborshare/NeighborShareConfig.java b/com/coderyo/neighborshare/NeighborShareConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7cc3c3dfe32ba0c98d98bcaa1f0ec1122b599c5
+--- /dev/null
++++ b/com/coderyo/neighborshare/NeighborShareConfig.java
+@@ -0,0 +1,114 @@
++/*
++ * coderyoMC — per-entity neighbor-scan sharing (query ELIMINATION). Clean-room
++ * independent implementation. A mob runs MULTIPLE separate "scan nearby entities"
++ * passes per tick (collision/push, Brain sensors, AI targeting); this computes the
++ * neighbor superset ONCE per entity per tick and SHARES it across those passes,
++ * eliminating the redundant world scans. Flag-gated, default OFF.
++ */
++package com.coderyo.neighborshare;
++
++/**
++ * Dormancy switch + tunables for per-entity neighbor-scan sharing.
++ *
++ * <p>Purely additive, same pattern as {@link com.coderyo.region.RegionConfig} and
++ * {@link com.coderyo.entitycache.EntityCacheConfig}: read from a system property /
++ * environment variable, default <strong>false</strong>. With it false — the default
++ * — every {@code getEntitiesOfClass}/{@code getEntities} call runs the byte-for-byte
++ * vanilla section scan, so the server is vanilla-equivalent.
++ *
++ * <pre>
++ *   -Dcoderyo.neighborshare.enabled=true   (system property, takes precedence)
++ *   CODERYO_NEIGHBORSHARE_ENABLED=true       (environment variable, fallback)
++ *   -Dcoderyo.neighborshare.debug=true       (per-tick scan-count instrumentation)
++ *   -Dcoderyo.neighborshare.maxRange=64.0    (cap on the superset inflate radius)
++ * </pre>
++ *
++ * <p>The shared list is a single broad {@code Entity}-class scan over the largest
++ * box any of the mob's passes needs (its bounding box inflated by its follow range,
++ * which is &ge; the un-inflated collision box and &ge; each sensor/targeting box).
++ * Each pass then <em>filters</em> from that list by its own (smaller) box + class +
++ * except + predicate. Because the superset is built by the identical section-grid
++ * iteration with a strictly larger box and no predicate, filtering it reproduces the
++ * <em>exact</em> set and order of a direct scan (superset ⊇ pass box; the filter is
++ * the same {@code box.intersects} + class + predicate the vanilla inner loop runs).
++ */
++public final class NeighborShareConfig {
++
++    /** System property key. */
++    public static final String PROPERTY = "coderyo.neighborshare.enabled";
++    /** Environment variable key. */
++    public static final String ENV = "CODERYO_NEIGHBORSHARE_ENABLED";
++    /** Debug (per-tick scan-count instrumentation) system property key. */
++    public static final String DEBUG_PROPERTY = "coderyo.neighborshare.debug";
++    /** Debug environment variable key. */
++    public static final String DEBUG_ENV = "CODERYO_NEIGHBORSHARE_DEBUG";
++    /** Max superset inflate radius cap system property key. */
++    public static final String MAX_RANGE_PROPERTY = "coderyo.neighborshare.maxRange";
++    /** Self-verify (compare shared filter vs vanilla scan every query) system property key. */
++    public static final String VERIFY_PROPERTY = "coderyo.neighborshare.verify";
++
++    /** {@code neighborshare.enabled} default — OFF (vanilla path). */
++    public static final boolean DEFAULT_ENABLED = false;
++    /** Default cap on the superset inflate radius (blocks). Follow-range rarely exceeds this. */
++    public static final double DEFAULT_MAX_RANGE = 64.0D;
++
++    private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
++    private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, false);
++    private static final double MAX_RANGE = resolveDouble(MAX_RANGE_PROPERTY, DEFAULT_MAX_RANGE);
++    private static final boolean VERIFY = resolveBoolean(VERIFY_PROPERTY, "CODERYO_NEIGHBORSHARE_VERIFY", false);
++
++    private NeighborShareConfig() {
++    }
++
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
++        }
++        return fallback;
++    }
++
++    private static double resolveDouble(final String property, final double fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            try {
++                return Double.parseDouble(prop.trim());
++            } catch (final NumberFormatException ignored) {
++                // fall through to default
++            }
++        }
++        return fallback;
++    }
++
++    /**
++     * Whether per-entity neighbor-scan sharing is enabled. Resolved once at
++     * class-load. Default {@link #DEFAULT_ENABLED} (false) → vanilla scans run.
++     */
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++
++    /** Whether per-tick scan-count instrumentation is enabled. */
++    public static boolean isDebug() {
++        return DEBUG;
++    }
++
++    /** Cap on the superset inflate radius (blocks). */
++    public static double maxRange() {
++        return MAX_RANGE;
++    }
++
++    /**
++     * Whether self-verification is on: every shared-then-filtered query ALSO runs the
++     * real vanilla section scan and asserts the two lists are equal (same set, same
++     * order). A mismatch is logged as a HARD FAILURE. For the correctness gate only —
++     * doubles the query cost, so never for benchmarking.
++     */
++    public static boolean isVerify() {
++        return VERIFY;
++    }
++}
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 687ea967bdaf557bb53c2b24c8e0f89169febec6..5f34b66f8fef34431e2e0efe7ad7e787206c6046 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1627,6 +1627,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         this.tickCount++;
+         this.tickRateManager.tick();
+         this.tickChildren(haveTime);
++        com.coderyo.neighborshare.NeighborShare.maybeDumpCounters(this.tickCount); // coderyo - neighbor-scan elimination instrumentation (debug only)
+         if (nano - this.lastServerStatus >= STATUS_EXPIRE_TIME_NANOS) {
+             this.lastServerStatus = nano;
+             this.status = this.buildServerStatus();
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index 1530810cdb74810e37e3e22ce4fcda4ee7511055..d5f9c39daec582c5f8ae4d42e5aa5278faedd1b8 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -280,6 +280,12 @@ public abstract class Entity
+     public float yRotO;
+     public float xRotO;
+     private AABB bb = INITIAL_AABB;
++    // coderyoMC - per-entity neighbor-scan sharing (query elimination): the once-per-tick
++    // shared superset neighbor list + the box it covers + the game-tick it was built on.
++    // Thread-confined to this entity's own tick; never shared cross-region (#24 single-writer).
++    public java.util.List<Entity> coderyoNeighborList;
++    public AABB coderyoNeighborBox;
++    public long coderyoNeighborTick = Long.MIN_VALUE;
+     public boolean onGround;
+     public boolean horizontalCollision;
+     public boolean verticalCollision;
+diff --git a/net/minecraft/world/entity/Mob.java b/net/minecraft/world/entity/Mob.java
+index a131d9906be3826ee6ccf027eeae209218d4a561..4148131b7dd0fa58f141c69344dc3d89ffd06b42 100644
+--- a/net/minecraft/world/entity/Mob.java
++++ b/net/minecraft/world/entity/Mob.java
+@@ -413,10 +413,23 @@ public abstract class Mob extends LivingEntity implements Targeting, EquipmentUs
+ 
+     @Override
+     public void tick() {
+-        super.tick();
+-        if (!this.level().isClientSide() && this.tickCount % 5 == 0) {
+-            this.updateControlFlags();
++        // coderyo start - per-entity neighbor-scan sharing (query elimination): open a
++        // once-per-tick sharing window so this mob's MULTIPLE nearby-entity scans
++        // (collision/push, Brain sensors, AI targeting) share ONE superset section scan
++        // instead of each re-scanning the world. Flag-gated (default OFF) -> when off
++        // open() is a no-op and the vanilla scans run byte-for-byte. Thread-confined.
++        final boolean coderyoOpenedShare = com.coderyo.neighborshare.NeighborShare.open(this);
++        try {
++            super.tick();
++            if (!this.level().isClientSide() && this.tickCount % 5 == 0) {
++                this.updateControlFlags();
++            }
++        } finally {
++            if (coderyoOpenedShare) {
++                com.coderyo.neighborshare.NeighborShare.close(this);
++            }
+         }
++        // coderyo end
+     }
+ 
+     protected void updateControlFlags() {
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 64ce9bb9536c57c9ff8c21f6bba74e42e47d8808..67b0150c45924b5e7128dfb90dfabbb29610f7ad 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -283,6 +283,17 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     @Override
+     public final <T extends Entity> List<T> getEntitiesOfClass(final Class<T> entityClass, final AABB boundingBox, final Predicate<? super T> predicate) {
+         Profiler.get().incrementCounter("getEntities");
++        // coderyo start - neighbor-scan sharing: if the active mob's tick has a shared
++        // superset that contains this query box, FILTER it instead of re-scanning. The
++        // superset is the same section scan with a larger box + no predicate, so the
++        // filter (box.intersects + class + predicate, same order) returns the IDENTICAL
++        // set. Returns null when not shareable (flag off / box not contained) -> vanilla.
++        final List<T> coderyoShared = com.coderyo.neighborshare.NeighborShare.tryGetEntitiesOfClass(this, entityClass, boundingBox, predicate);
++        if (coderyoShared != null) {
++            return coderyoShared;
++        }
++        com.coderyo.neighborshare.NeighborShare.countDirectScan();
++        // coderyo end
+         final List<T> ret = new java.util.ArrayList<>();
+ 
+         ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel)this).moonrise$getEntityLookup().getEntities(entityClass, null, boundingBox, ret, predicate);
+@@ -1835,6 +1846,17 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     @Override
+     public List<Entity> getEntities(final @Nullable Entity except, final AABB bb, final Predicate<? super Entity> selector) {
+         Profiler.get().incrementCounter("getEntities");
++        // coderyo start - neighbor-scan sharing (collision/push path): filter the active
++        // mob's shared superset (section scan, no dragon parts) by `e != except &&
++        // bb.intersects && selector`, then re-append dragon parts via addToGetEntities so
++        // the result is byte-identical to the vanilla section-scan + parts below.
++        final List<Entity> coderyoShared = com.coderyo.neighborshare.NeighborShare.tryGetEntities(this, except, bb, selector);
++        if (coderyoShared != null) {
++            ca.spottedleaf.moonrise.common.PlatformHooks.get().addToGetEntities((Level)(Object)this, except, bb, selector, coderyoShared);
++            return coderyoShared;
++        }
++        com.coderyo.neighborshare.NeighborShare.countDirectScan();
++        // coderyo end
+         // Paper start - rewrite chunk system
+         final List<Entity> ret = new java.util.ArrayList<>();
+ 
