@@ -1,0 +1,5 @@
+# benchmark run output — regenerate via bench.sh / run-all.sh
+run-*/
+*.tsv
+*.class
+*.log
