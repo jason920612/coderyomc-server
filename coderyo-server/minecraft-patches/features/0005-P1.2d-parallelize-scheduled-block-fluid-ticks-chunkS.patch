@@ -1,0 +1,594 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 25 Jun 2026 12:16:14 +0800
+Subject: [PATCH] P1.2d: parallelize scheduled block/fluid ticks + chunkSource
+ random ticks per region
+
+
+diff --git a/com/coderyo/region/Region.java b/com/coderyo/region/Region.java
+index 0e8e60227bf905861ad1d4db1713bcf31a109c8a..7275ec9edf23adc86650f9fbd4628ddfdf32ca60 100644
+--- a/com/coderyo/region/Region.java
++++ b/com/coderyo/region/Region.java
+@@ -54,11 +54,22 @@ public final class Region {
+      */
+     private final RandomSource random;
+ 
++    /**
++     * Per-region random-tick RNG (P1.2d). Random block ticking ({@code optimiseRandomTick})
++     * requires a {@code SimpleThreadUnsafeRandom} specifically (it relies on its raw
++     * {@code nextInt()} masking). The vanilla per-level {@code simpleRandom} field is shared
++     * and thread-unsafe, so each region random-ticks with THIS instance instead — two regions
++     * never contend a shared random-tick RNG. Seeded distinctly from {@link #random}.
++     */
++    private final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom randomTickRandom;
++
+     public Region(final RegionId id, final ResourceKey<Level> dimension) {
+         this.id = id;
+         this.dimension = dimension;
+         // Distinct, deterministic seed per region; never the shared level RNG.
+         this.random = RandomSource.create(id.value() * 0x9E3779B97F4A7C15L + 0x1234567L);
++        this.randomTickRandom = new ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom(
++            id.value() * 0xD1B54A32D192ED03L + 0x7654321L);
+     }
+ 
+     /**
+@@ -69,6 +80,14 @@ public final class Region {
+         return this.random;
+     }
+ 
++    /**
++     * This region's own random-tick RNG (a {@code SimpleThreadUnsafeRandom}, as required by
++     * the optimised random-tick path). Owned by the single tick thread; never shared.
++     */
++    public ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom randomTickRandom() {
++        return this.randomTickRandom;
++    }
++
+     public RegionId id() {
+         return this.id;
+     }
+diff --git a/com/coderyo/region/RegionLifecycle.java b/com/coderyo/region/RegionLifecycle.java
+index 2b6cc8348a5f715867ef89152c196191e779726a..29aa9305ca67acb472da7386c7909e361fa1f1ae 100644
+--- a/com/coderyo/region/RegionLifecycle.java
++++ b/com/coderyo/region/RegionLifecycle.java
+@@ -74,6 +74,16 @@ public final class RegionLifecycle {
+         return merger == null ? List.of() : merger.regions();
+     }
+ 
++    /**
++     * Snapshot of all loaded chunk keys in {@code level}'s dimension, or an empty set if the
++     * subsystem has not yet seen this dimension. Used by the orchestrator (P1.2d) to compute the
++     * unowned-chunk remainder for the scheduled/random-tick fallback.
++     */
++    public static it.unimi.dsi.fastutil.longs.LongSet loadedChunkKeysOf(final ServerLevel level) {
++        final RegionMerger merger = MERGERS.get(level.dimension());
++        return merger == null ? it.unimi.dsi.fastutil.longs.LongSets.emptySet() : merger.loadedChunkKeys();
++    }
++
+     /**
+      * Resolve the live {@link Region} for a {@link RegionId} in {@code dimension}, or
+      * {@code null} if no such region currently exists. Used by the ownership-transfer
+diff --git a/com/coderyo/region/RegionTickOrchestrator.java b/com/coderyo/region/RegionTickOrchestrator.java
+index c937c4fbac0276068c3926d34431a83ad45aff62..0ea6fa5683fc9cb107f4dd7f99f3e3ae73c86b7f 100644
+--- a/com/coderyo/region/RegionTickOrchestrator.java
++++ b/com/coderyo/region/RegionTickOrchestrator.java
+@@ -24,22 +24,27 @@ import org.slf4j.LoggerFactory;
+  * <p><b>What is parallelized (per region, on worker threads):</b>
+  * <ul>
+  *   <li>the region's inbound task queue (drained by {@link Region#tick});</li>
++ *   <li><b>scheduled block + fluid ticks</b> (redstone, fluid spread, falling blocks) for the
++ *       region's owned chunks — P1.2d, drained per-region via {@code LevelTicks.coderyoTickRegion};</li>
++ *   <li><b>random block ticks</b> (crop/sapling/leaf growth, fire spread, etc.) for the region's
++ *       owned chunks — P1.2d, via {@code coderyoTickRegionRandomTicks} with the region's RNG;</li>
+  *   <li><b>entity ticking</b> for entities whose chunk is owned by the region;</li>
+  *   <li><b>block-entity ticking</b> for tickers whose chunk is owned by the region.</li>
+  * </ul>
+  * Independent regions (disjoint owned-chunk sets, possibly in the SAME level) run these
+  * concurrently on distinct {@code TickThread} workers — the demonstrable parallelism.
+  *
+- * <p><b>What stays on the orchestrator (main thread) for this first cut — documented
+- * fallback for P1.2c:</b>
++ * <p><b>What stays on the orchestrator (main thread) — documented fallback:</b>
+  * <ul>
+  *   <li>ALL per-level global work in {@code ServerLevel.tick}: world border, weather,
+- *       sleep/time-skip, raids, dragon fight, {@code chunkSource.tick} (natural spawning +
+- *       random ticks), block events, scoreboard, debug synchronizers;</li>
+- *   <li><b>scheduled block/fluid ticks</b> ({@code LevelTicks} are level-global priority
+- *       queues; partitioning their internal ordering safely is deferred);</li>
+- *   <li>entities / block-entities in <b>unowned</b> chunks (no region) — ticked on the
+- *       orchestrator as a correctness fallback so nothing is dropped.</li>
++ *       sleep/time-skip, raids, dragon fight, block events, scoreboard, debug synchronizers;</li>
++ *   <li>{@code chunkSource.tick}'s structural + spawning work: ticket/distance updates, player
++ *       chunk loader, <b>natural mob spawning</b> (shared spawn-state / mob caps), thunder
++ *       (creates entities + shares {@code Level.randValue}), inhabited-time, chunk broadcast.
++ *       Only the pure random-block-tick slice is partitioned per region;</li>
++ *   <li>entities / block-entities / scheduled-ticks / random-ticks in <b>unowned</b> chunks
++ *       (no region) — handled on the orchestrator as a correctness fallback so nothing is
++ *       dropped (the suppressed vanilla drains would otherwise miss them).</li>
+  * </ul>
+  *
+  * <p><b>Ordering.</b> Per level we first run {@code level.tick(haveTime)} with the parallel
+@@ -121,7 +126,12 @@ public final class RegionTickOrchestrator {
+         final List<Region> regions = RegionLifecycle.regionsOf(level);
+         if (regions.isEmpty()) {
+             // No regions formed yet for this level: fall back to ticking everything on the
+-            // orchestrator so nothing is dropped (correctness over parallelism).
++            // orchestrator so nothing is dropped (correctness over parallelism). This includes
++            // the scheduled + random ticks the suppressed vanilla drains skipped (P1.2d): run
++            // them over every loaded chunk on the orchestrator with the level's own RNG path.
++            if (level.coderyoScheduledTicksRun()) {
++                level.coderyoTickScheduledAndRandomFallbackAll();
++            }
+             tickUnownedFallback(level, level.coderyoTickingEntitiesSnapshot(),
+                 snapshotBlockEntities(level));
+             return;
+@@ -171,15 +181,16 @@ public final class RegionTickOrchestrator {
+             }
+         }
+ 
++        // Whether the suppressed scheduled-block/fluid + random-block ticks should run this tick
++        // (matches the vanilla !isDebug() && runs gate). When true, each region drains them for
++        // its OWNED chunks on its worker thread, in vanilla order (scheduled -> random -> entities).
++        final boolean scheduledRun = level.coderyoScheduledTicksRun();
++
+         // 3) Fan out: each region ticks its own disjoint buckets in parallel; barrier-join.
++        // EVERY region runs the body (it always owns >=1 chunk -> always has scheduled/random
++        // ticks to consider), not only those with entities/block-entities.
+         final List<TickingBlockEntity> removedBEs = java.util.Collections.synchronizedList(new ArrayList<>());
+-        final List<Region> activeWork = new ArrayList<>();
+-        for (final Region r : regions) {
+-            final RegionWork w = work.get(r.id().value());
+-            if (w != null && (!w.entities.isEmpty() || !w.blockEntities.isEmpty())) {
+-                activeWork.add(r);
+-            }
+-        }
++        final List<Region> activeWork = new ArrayList<>(regions);
+ 
+         scheduler().submitTick(activeWork, region -> {
+             final RegionWork w = work.get(region.id().value());
+@@ -187,6 +198,18 @@ public final class RegionTickOrchestrator {
+             final Thread self = Thread.currentThread();
+             w.workerThreadName = self.getName();
+             w.workerThreadId = self.threadId();
++
++            // Vanilla relative order within this region's owned chunks:
++            //   scheduled block ticks -> scheduled fluid ticks -> random block ticks -> entities
++            //   -> block-entities. Regions are disjoint + gap-separated, so none of these reach
++            //   another region's chunks; each uses the region's OWN RNG (never Level.random).
++            if (scheduledRun) {
++                final it.unimi.dsi.fastutil.longs.LongSet owned = region.chunkKeysSnapshot();
++                w.scheduledTicks = level.coderyoTickRegionScheduledTicks(owned, region.random());
++                level.coderyoTickRegionRandomTicks(owned, region.randomTickRandom());
++                w.ranScheduledRandom = true;
++            }
++
+             // Ticks only this region's chunks.
+             for (final Entity e : w.entities) {
+                 level.coderyoTickOneEntity(e);
+@@ -204,7 +227,23 @@ public final class RegionTickOrchestrator {
+             }
+         });
+ 
+-        // 4) Orchestrator-thread fallback for unowned entities / block-entities + pruning.
++        // 4) Orchestrator-thread fallback for any unowned chunks' scheduled/random ticks (loaded
++        //    chunks not yet in a region) + unowned entities / block-entities + pruning.
++        if (scheduledRun) {
++            final it.unimi.dsi.fastutil.longs.LongSet loaded = RegionLifecycle.loadedChunkKeysOf(level);
++            final it.unimi.dsi.fastutil.longs.LongSet unowned = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
++            final it.unimi.dsi.fastutil.longs.LongIterator lit = loaded.iterator();
++            while (lit.hasNext()) {
++                final long ck = lit.nextLong();
++                if (index.regionOf(level.dimension(), ck) == null) {
++                    unowned.add(ck);
++                }
++            }
++            if (!unowned.isEmpty()) {
++                level.coderyoTickRegionScheduledTicks(unowned, level.getRandom());
++                level.coderyoTickRegionRandomTicks(unowned, level.coderyoSimpleRandom());
++            }
++        }
+         tickUnownedFallback(level, unownedEntities, tickBEs ? unownedBEs : List.of());
+         level.coderyoPruneBlockEntityTickers(removedBEs);
+ 
+@@ -254,9 +293,10 @@ public final class RegionTickOrchestrator {
+             final double ms = r.lastTickNanos() / 1_000_000.0d;
+             final double tps = ms > 0.0 ? Math.min(20.0, 1000.0 / Math.max(ms, 0.05) / 1.0) : 20.0;
+             LOGGER.info(
+-                "tick#{} region R{} [{}] ticked on thread '{}' (id={}) -- {} entit(y/ies), {} block-entit(y/ies), {} ms, ~{} TPS-budget",
++                "tick#{} region R{} [{}] ticked on thread '{}' (id={}) -- {} entit(y/ies), {} block-entit(y/ies), {} scheduled-tick(s){}, {} ms, ~{} TPS-budget",
+                 serverTick, r.id().value(), dim, w.workerThreadName, w.workerThreadId,
+                 w.entities.size(), w.blockEntities.size(),
++                w.scheduledTicks, w.ranScheduledRandom ? "+random" : "",
+                 String.format(java.util.Locale.ROOT, "%.3f", ms),
+                 String.format(java.util.Locale.ROOT, "%.1f", tps));
+         }
+@@ -276,6 +316,8 @@ public final class RegionTickOrchestrator {
+         final List<TickingBlockEntity> blockEntities = new ArrayList<>();
+         volatile String workerThreadName = "?";
+         volatile long workerThreadId = -1L;
++        volatile int scheduledTicks = 0;
++        volatile boolean ranScheduledRandom = false;
+ 
+         RegionWork(final Region region) {
+             this.region = region;
+diff --git a/com/coderyo/region/merge/RegionMerger.java b/com/coderyo/region/merge/RegionMerger.java
+index 31128ea6a05c5887139832a58796e35d32916705..b6645b1083df28701dd82e2f5e6fdc5af413e3d8 100644
+--- a/com/coderyo/region/merge/RegionMerger.java
++++ b/com/coderyo/region/merge/RegionMerger.java
+@@ -129,6 +129,15 @@ public final class RegionMerger {
+         return this.loadedChunks.size();
+     }
+ 
++    /**
++     * Snapshot of all currently-loaded chunk keys in this dimension (defensive copy). Used by
++     * the orchestrator to compute the unowned-chunk remainder for the scheduled/random-tick
++     * fallback (P1.2d), so no loaded chunk's ticks are dropped while regions are forming.
++     */
++    public it.unimi.dsi.fastutil.longs.LongSet loadedChunkKeys() {
++        return new LongOpenHashSet(this.loadedChunks);
++    }
++
+     /**
+      * Recomputes the region partition from the current loaded-chunk set via flood-fill
+      * over the Chebyshev-{@code mergeRadius} adjacency relation, then rebuilds the
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index c3adbe0753f6a4158f25126ed7443f8a958763d9..ef7045a6e5025827fdb2b9ad14a4d3f233f21cc7 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -182,6 +182,13 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+     }
+     // Paper end - chunk tick iteration optimisations
+ 
++    // coderyoMC - P1.2d: orchestrator-thread fallback to run the level-global random block ticks
++    // when no region has formed yet (the suppressed vanilla call inside tickChunks was skipped).
++    // Single-threaded on the orchestrator; uses the shared shuffleRandom/simpleRandom safely.
++    public void coderyoIterateTickingChunksFallback() {
++        this.iterateTickingChunksFaster();
++    }
++
+     public ServerChunkCache(
+         final ServerLevel level,
+         final LevelStorageSource.LevelStorageAccess levelStorage,
+@@ -596,7 +603,14 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         }
+ 
+         profiler.popPush("tickTickingChunks");
++        // coderyoMC start - P1.2d: when region.enabled, per-chunk random block ticks are run
++        // PER-REGION on worker threads (partitioned by owned chunk, region RNG). Skip the
++        // level-global random-tick iteration here so each random tick runs exactly once.
++        // Natural mob spawning + thunder above stay on the orchestrator (shared spawn-state).
++        // region.enabled=false => coderyoIsParallelTickActive() is false => vanilla path runs.
++        if (!this.level.coderyoIsParallelTickActive()) {
+         this.iterateTickingChunksFaster(); // Paper - chunk tick iteration optimizations
++        } // coderyoMC end - P1.2d
+         if (doMobSpawning) {
+             profiler.popPush("customSpawners");
+             this.level.tickCustomSpawners(this.spawnEnemies);
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index bb7cb4a3ef6d5c13b9575c3de0b8c0dc008ac9b7..c078be792f1d52b82dacd03d232bb16118bc48ae 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -840,7 +840,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         }
+ 
+         profiler.push("tickPending");
+-        if (!this.isDebug() && runs) {
++        // coderyoMC start - P1.2d: when region.enabled, scheduled block/fluid ticks are drained
++        // PER-REGION on worker threads (partitioned by owned chunk), so skip the level-global
++        // drain here. region.enabled=false => coderyoIsParallelTickActive() is always false =>
++        // byte-for-byte vanilla drain below.
++        if (!this.isDebug() && runs && !this.coderyoIsParallelTickActive()) {
+             long tick = this.getGameTime();
+             profiler.push("blockTicks");
+             this.blockTicks.tick(tick, paperConfig().environment.maxBlockTicks, this::tickBlock); // Paper - configurable max block ticks
+@@ -848,6 +852,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             this.fluidTicks.tick(tick, paperConfig().environment.maxFluidTicks, this::tickFluid); // Paper - configurable max fluid ticks
+             profiler.pop();
+         }
++        // coderyoMC end - P1.2d
+ 
+         profiler.popPush("raid");
+         if (runs) {
+@@ -1035,6 +1040,171 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     }
+     // coderyoMC end - P1.2b
+ 
++    // coderyoMC start - P1.2d: per-region scheduled block/fluid ticks + per-region random ticks.
++    // These run on a region worker thread restricted to chunks the region owns, using the
++    // region's OWN RNG (never the shared thread-unsafe Level.random / ServerChunkCache fields).
++    // ONLY invoked when region.enabled=true.
++
++    /** Whether scheduled-tick / random-tick draining should run at all this tick (matches the
++     *  {@code !isDebug() && runs} gate that guards the vanilla drains in tick()). */
++    public boolean coderyoScheduledTicksRun() {
++        return !this.isDebug() && this.tickRateManager().runsNormally();
++    }
++
++    /** The level's shared optimised random-tick RNG (orchestrator-thread fallback only). */
++    public ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom coderyoSimpleRandom() {
++        return this.simpleRandom;
++    }
++
++    /**
++     * Orchestrator-thread fallback when NO region has formed yet: drain scheduled block/fluid
++     * ticks and run random block ticks over EVERY loaded chunk, so the suppressed vanilla drains
++     * miss nothing. Runs single-threaded on the orchestrator, so it uses the level's own shared
++     * RNG (no concurrency). Equivalent to the vanilla level-global drains for this transient.
++     */
++    public void coderyoTickScheduledAndRandomFallbackAll() {
++        final long tick = this.getGameTime();
++        this.blockTicks.tick(tick, paperConfig().environment.maxBlockTicks, this::tickBlock);
++        this.fluidTicks.tick(tick, paperConfig().environment.maxFluidTicks, this::tickFluid);
++        // Random ticks: defer to the chunk source's own iteration (already skipped above only
++        // when regions exist; here no region exists so re-run the level-global random ticks).
++        this.getChunkSource().coderyoIterateTickingChunksFallback();
++    }
++
++    /**
++     * Drain this region's scheduled block ticks then fluid ticks (vanilla order), restricted to
++     * {@code ownedChunkKeys}, on the calling region worker thread. Uses {@code regionRandom} for
++     * block-tick randomness instead of the shared {@code Level.random}.
++     */
++    public int coderyoTickRegionScheduledTicks(final it.unimi.dsi.fastutil.longs.LongSet ownedChunkKeys,
++                                               final net.minecraft.util.RandomSource regionRandom) {
++        final long tick = this.getGameTime();
++        int ran = this.blockTicks.coderyoTickRegion(tick, paperConfig().environment.maxBlockTicks,
++            ownedChunkKeys, (pos, type) -> this.coderyoTickBlock(pos, type, regionRandom));
++        ran += this.fluidTicks.coderyoTickRegion(tick, paperConfig().environment.maxFluidTicks,
++            ownedChunkKeys, this::coderyoTickFluid);
++        return ran;
++    }
++
++    /** Exact vanilla {@link #tickBlock} body, but with a region-supplied RNG (no shared
++     *  {@code Level.random}) and without the shared mid-tick-task counter. */
++    private void coderyoTickBlock(final BlockPos pos, final Block type, final net.minecraft.util.RandomSource regionRandom) {
++        BlockState state = this.getBlockState(pos);
++        if (state.is(type)) {
++            state.tick(this, pos, regionRandom);
++        }
++    }
++
++    /** Exact vanilla {@link #tickFluid} body (fluid ticks take no RNG), without the shared
++     *  mid-tick-task counter. */
++    private void coderyoTickFluid(final BlockPos pos, final Fluid type) {
++        BlockState blockState = this.getBlockState(pos);
++        FluidState fluidState = blockState.getFluidState();
++        if (fluidState.is(type)) {
++            fluidState.tick(this, pos, blockState);
++        }
++    }
++
++    /**
++     * Run per-chunk random block ticks for this region's entity-ticking, loaded, owned chunks,
++     * on the calling region worker thread, using {@code regionRandom} instead of the shared
++     * {@code ServerLevel.simpleRandom}. Mirrors {@code ServerChunkCache.iterateTickingChunksFaster}
++     * scoped to owned chunks.
++     *
++     * <p>Deliberately partitions ONLY the pure, region-local random-tick slice
++     * ({@code tickChunk} → {@code optimiseRandomTick} + ice/snow precipitation). Natural mob
++     * spawning, thunder (both create entities and share spawn-state / {@code Level.randValue}),
++     * inhabited-time accounting, and chunk-broadcast stay on the orchestrator inside
++     * {@code chunkSource.tick}. So this covers random block ticks only; see P1-integration-notes
++     * §10 for the documented fallback boundary.
++     */
++    public void coderyoTickRegionRandomTicks(final it.unimi.dsi.fastutil.longs.LongSet ownedChunkKeys,
++                                             final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom regionRandom) {
++        final int randomTickSpeed = this.getGameRules().get(GameRules.RANDOM_TICK_SPEED);
++        final net.minecraft.server.level.ServerChunkCache cache = this.getChunkSource();
++        final it.unimi.dsi.fastutil.longs.LongIterator it = ownedChunkKeys.iterator();
++        while (it.hasNext()) {
++            final long chunkKey = it.nextLong();
++            final LevelChunk chunk = cache.getChunkAtIfLoadedImmediately(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
++            if (chunk == null) {
++                continue;
++            }
++            // Only entity-ticking-ready chunks random-tick in vanilla; shouldTickBlocksAt gates
++            // the same readiness used by iterateTickingChunksFaster's entity-ticking chunk list.
++            if (!this.shouldTickBlocksAt(chunkKey)) {
++                continue;
++            }
++            this.coderyoTickChunkRandom(chunk, randomTickSpeed, regionRandom);
++        }
++    }
++
++    /** Vanilla {@link #tickChunk} body (ice/snow precipitation + random block ticks) with a
++     *  region-supplied {@link ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom}
++     *  instead of the shared {@code this.simpleRandom}. */
++    private void coderyoTickChunkRandom(final LevelChunk chunk, final int tickSpeed,
++                                        final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom regionRandom) {
++        ChunkPos chunkPos = chunk.getPos();
++        int minX = chunkPos.getMinBlockX();
++        int minZ = chunkPos.getMinBlockZ();
++        if (!this.paperConfig().environment.disableIceAndSnow) {
++            for (int i = 0; i < tickSpeed; i++) {
++                if (regionRandom.nextInt(48) == 0) {
++                    this.tickPrecipitation(this.getBlockRandomPos(minX, 0, minZ, 15, regionRandom));
++                }
++            }
++        }
++        if (tickSpeed > 0) {
++            this.coderyoOptimiseRandomTick(chunk, tickSpeed, regionRandom);
++        }
++    }
++
++    /** Vanilla {@code optimiseRandomTick} body with a region-supplied RNG (no shared
++     *  {@code this.simpleRandom}); the per-region single-writer worker owns this chunk. */
++    private void coderyoOptimiseRandomTick(final LevelChunk chunk, final int tickSpeed,
++                                           final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom regionRandom) {
++        final LevelChunkSection[] sections = chunk.getSections();
++        final int minSection = ca.spottedleaf.moonrise.common.util.WorldUtil.getMinSection((ServerLevel)(Object)this);
++        final boolean doubleTickFluids = !ca.spottedleaf.moonrise.common.PlatformHooks.get().configFixMC224294();
++
++        final ChunkPos cpos = chunk.getPos();
++        final int offsetX = cpos.x() << 4;
++        final int offsetZ = cpos.z() << 4;
++
++        for (int sectionIndex = 0, sectionsLen = sections.length; sectionIndex < sectionsLen; sectionIndex++) {
++            final int offsetY = (sectionIndex + minSection) << 4;
++            final LevelChunkSection section = sections[sectionIndex];
++            final net.minecraft.world.level.chunk.PalettedContainer<net.minecraft.world.level.block.state.BlockState> states = section.getStates();
++            if (!section.isRandomlyTickingBlocks()) {
++                continue;
++            }
++
++            final ca.spottedleaf.moonrise.common.list.ShortList tickList = ((ca.spottedleaf.moonrise.patches.block_counting.BlockCountingChunkSection)section).moonrise$getTickingBlockList();
++
++            for (int i = 0; i < tickSpeed; ++i) {
++                final int tickingBlocks = tickList.size();
++                final int index = regionRandom.nextInt() & ((16 * 16 * 16) - 1);
++
++                if (index >= tickingBlocks) {
++                    continue;
++                }
++
++                final int location = (int)tickList.getRaw(index) & 0xFFFF;
++                final BlockState state = states.get(location);
++
++                final BlockPos pos = new BlockPos((location & 15) | offsetX, ((location >>> (4 + 4)) & 15) | offsetY, ((location >>> 4) & 15) | offsetZ);
++
++                state.randomTick((ServerLevel)(Object)this, pos, regionRandom);
++                if (doubleTickFluids) {
++                    final FluidState fluidState = state.getFluidState();
++                    if (fluidState.isRandomlyTicking()) {
++                        fluidState.randomTick((ServerLevel)(Object)this, pos, regionRandom);
++                    }
++                }
++            }
++        }
++    }
++    // coderyoMC end - P1.2d
++
+     @Override
+     public boolean shouldTickBlocksAt(final long chunkPos) {
+         // Paper start - rewrite chunk system
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 4d1e7cd93f6ee272017b704d3c820d3b1e6ee821..fb626858132622eb292c9d5b29ec0eefb686dcfb 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -2129,6 +2129,17 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         return new BlockPos(xo + (val & 15), yo + (val >> 16 & yMask), zo + (val >> 8 & 15));
+     }
+ 
++    // coderyoMC start - P1.2d: region-RNG variant of getBlockRandomPos. The vanilla overload
++    // above mutates the shared Level.randValue field, which is unsafe to touch from concurrent
++    // region worker threads. Region-local random ticking passes its own RandomSource so two
++    // regions never contend the shared field. Only called when region.enabled=true.
++    public BlockPos getBlockRandomPos(final int xo, final int yo, final int zo, final int yMask,
++                                      final net.minecraft.util.RandomSource regionRandom) {
++        int val = regionRandom.nextInt();
++        return new BlockPos(xo + (val & 15), yo + (val >> 16 & yMask), zo + (val >> 8 & 15));
++    }
++    // coderyoMC end - P1.2d
++
+     public boolean noSave() {
+         return false;
+     }
+diff --git a/net/minecraft/world/ticks/LevelTicks.java b/net/minecraft/world/ticks/LevelTicks.java
+index 7bf9e93692debcef511bfa316aeef32ae8a7d3b7..31f09312a7c4cb9a1ca658c4511fc87eeee883b7 100644
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -198,6 +198,91 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         this.toRunThisTickSet.clear();
+     }
+ 
++    // coderyoMC start - P1.2d: per-region scheduled-tick partitioning.
++    // When region.enabled=true, each region drains the scheduled ticks of ONLY its
++    // owned chunks, on its own worker thread, instead of the level-global tick() draining
++    // everything on the orchestrator. Regions own disjoint chunk sets separated by gaps of
++    // unloaded chunks (merge rule, mergeRadius >= 1), so two regions never share a chunk
++    // container and a scheduled tick in one region cannot reach another region's chunks.
++    //
++    // Correctness invariants preserved per region:
++    //   - per-chunk drain order is the exact vanilla DRAIN_ORDER (PriorityQueue.poll());
++    //   - cross-chunk ordering within a region follows the same INTRA_TICK_DRAIN_ORDER as
++    //     vanilla (we merge the per-chunk heads through a region-local priority queue);
++    //   - willTickThisTick(pos,type) answers correctly DURING the drain via a thread-local
++    //     "to run this tick" set (redstone repeater/comparator/torch rely on it), so two
++    //     regions draining concurrently each see only their own pending set.
++    //
++    // The shared fields (containersToTick / toRunThisTick / toRunThisTickSet) are NOT touched
++    // here, so concurrent region drains do not race. region.enabled=false never calls this and
++    // the vanilla tick() path below runs byte-for-byte.
++
++    /** Per-thread set of ticks this region will run this tick; makes willTickThisTick correct
++     *  for the region worker mid-drain without touching the shared toRunThisTickSet. */
++    private final ThreadLocal<Set<ScheduledTick<?>>> coderyoRegionRunSet = new ThreadLocal<>();
++
++    /**
++     * Drain and run the scheduled ticks for the given owned chunk set ONLY, on the calling
++     * region worker thread. Mirrors {@link #tick} semantics (collect eligible ticks up to
++     * {@code maxTicksToProcess}, run them via {@code output} in drain order, then clean up),
++     * but scoped to {@code ownedChunkKeys} using region-local scratch so it is safe to run
++     * concurrently with other regions' drains.
++     *
++     * @param ownedChunkKeys packed chunk keys ({@link ChunkPos#pack(int,int)}) this region owns.
++     */
++    public int coderyoTickRegion(final long currentTick, final int maxTicksToProcess,
++                                 final it.unimi.dsi.fastutil.longs.LongSet ownedChunkKeys,
++                                 final BiConsumer<BlockPos, T> output) {
++        // 1) Collect eligible containers (owned + tickCheck-passing + due) into a region-local
++        //    priority queue ordered like CONTAINER_DRAIN_ORDER (peek's INTRA_TICK_DRAIN_ORDER).
++        final java.util.PriorityQueue<LevelChunkTicks<T>> containers = new java.util.PriorityQueue<>(CONTAINER_DRAIN_ORDER);
++        final it.unimi.dsi.fastutil.longs.LongIterator keyIt = ownedChunkKeys.iterator();
++        while (keyIt.hasNext()) {
++            final long chunkKey = keyIt.nextLong();
++            final LevelChunkTicks<T> container = this.allContainers.get(chunkKey);
++            if (container == null) {
++                continue;
++            }
++            final ScheduledTick<T> next = container.peek();
++            if (next != null && next.triggerTick() <= currentTick && this.tickCheck.test(chunkKey)) {
++                containers.add(container);
++            }
++        }
++
++        // 2) Collect ticks to run this tick, in cross-chunk drain order, up to the budget.
++        final java.util.List<ScheduledTick<T>> toRun = new java.util.ArrayList<>();
++        final Set<ScheduledTick<?>> runSet = new ObjectOpenCustomHashSet<>(ScheduledTick.UNIQUE_TICK_HASH);
++        LevelChunkTicks<T> top;
++        while (toRun.size() < maxTicksToProcess && (top = containers.poll()) != null) {
++            final ScheduledTick<T> tick = top.poll();
++            if (tick != null) {
++                toRun.add(tick);
++                runSet.add(tick);
++            }
++            final ScheduledTick<T> nextInContainer = top.peek();
++            if (nextInContainer != null && nextInContainer.triggerTick() <= currentTick) {
++                containers.add(top);
++            } else if (nextInContainer != null) {
++                // Keep nextTickForContainer consistent so a later vanilla tick() (if the region
++                // path is ever disabled mid-run) re-schedules this container correctly.
++                this.updateContainerScheduling(nextInContainer);
++            }
++        }
++
++        // 3) Run the collected ticks; expose the per-region run set so willTickThisTick works.
++        this.coderyoRegionRunSet.set(runSet);
++        try {
++            for (final ScheduledTick<T> tick : toRun) {
++                runSet.remove(tick);
++                output.accept(tick.pos(), tick.type());
++            }
++        } finally {
++            this.coderyoRegionRunSet.remove();
++        }
++        return toRun.size();
++    }
++    // coderyoMC end - P1.2d
++
+     @Override
+     public boolean hasScheduledTick(final BlockPos pos, final T block) {
+         LevelChunkTicks<T> tickContainer = this.allContainers.get(ChunkPos.pack(pos));
+@@ -206,6 +291,12 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+ 
+     @Override
+     public boolean willTickThisTick(final BlockPos pos, final T type) {
++        // coderyoMC start - P1.2d: during a per-region drain, answer from the region-local set.
++        final Set<ScheduledTick<?>> regionSet = this.coderyoRegionRunSet.get();
++        if (regionSet != null) {
++            return regionSet.contains(ScheduledTick.probe(type, pos));
++        }
++        // coderyoMC end - P1.2d
+         this.calculateTickSetIfNeeded();
+         return this.toRunThisTickSet.contains(ScheduledTick.probe(type, pos));
+     }
