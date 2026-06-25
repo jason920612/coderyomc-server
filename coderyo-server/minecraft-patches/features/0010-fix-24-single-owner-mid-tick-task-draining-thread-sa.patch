@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 25 Jun 2026 21:42:03 +0800
+Subject: [PATCH] fix(#24): single-owner mid-tick task draining + thread-safe
+ entity/nav bookkeeping under parallel region ticking
+
+
+diff --git a/com/coderyo/region/RegionWorkerThread.java b/com/coderyo/region/RegionWorkerThread.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffe80bf4a621a38b34706eb2d28311dfefd348d3
+--- /dev/null
++++ b/com/coderyo/region/RegionWorkerThread.java
+@@ -0,0 +1,34 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import ca.spottedleaf.moonrise.common.util.TickThread;
++
++/**
++ * The worker thread that the {@link WorkStealingRegionScheduler} ticks regions on.
++ *
++ * <p>It IS a {@link TickThread} so Moonrise's tick-thread assertions (fired throughout
++ * entity / block-entity ticking) pass on region workers — the assertion reads
++ * {@code instanceof TickThread}. We reuse only that public, non-Folia identity check and
++ * NONE of Folia's region threading.
++ *
++ * <p><b>Why this is a top-level public type (issue #24).</b> The parallel region tick
++ * re-enters per-level shared state that must be drained / mutated on a single owner (e.g.
++ * the {@code ServerChunkCache} mid-tick task queue). The discriminator "am I on a region
++ * worker, not the orchestrator?" is {@link #isCurrent()} — so the shared mid-tick queue is
++ * polled only by the orchestrator (single-owner draining), never by a region worker. This
++ * preserves single-writer-per-target without changing the disabled (vanilla) path.
++ */
++public final class RegionWorkerThread extends TickThread {
++
++    RegionWorkerThread(final Runnable run, final int idx) {
++        super(run, "coderyo-region-worker-" + idx);
++    }
++
++    /** True iff the calling thread is a region scheduler worker (not the orchestrator/main). */
++    public static boolean isCurrent() {
++        return Thread.currentThread() instanceof RegionWorkerThread;
++    }
++}
+diff --git a/com/coderyo/region/WorkStealingRegionScheduler.java b/com/coderyo/region/WorkStealingRegionScheduler.java
+index 07ba921e8394a4930a41abd42b564aae5a02f40f..d9aeb49b327f5078ccb7f7348deb8a89161ddc7b 100644
+--- a/com/coderyo/region/WorkStealingRegionScheduler.java
++++ b/com/coderyo/region/WorkStealingRegionScheduler.java
+@@ -4,7 +4,6 @@
+  */
+ package com.coderyo.region;
+ 
+-import ca.spottedleaf.moonrise.common.util.TickThread;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.concurrent.CompletableFuture;
+@@ -184,15 +183,4 @@ public final class WorkStealingRegionScheduler implements RegionScheduler {
+         }
+         LOGGER.info("WorkStealingRegionScheduler shut down (clean={})", clean);
+     }
+-
+-    /**
+-     * Pool worker that IS a {@link TickThread}, so Moonrise tick-thread assertions pass on
+-     * region workers (the assertion reads {@code instanceof TickThread}). We reuse only that
+-     * public, non-Folia identity check — no Folia region threading.
+-     */
+-    private static final class RegionWorkerThread extends TickThread {
+-        RegionWorkerThread(final Runnable run, final int idx) {
+-            super(run, "coderyo-region-worker-" + idx);
+-        }
+-    }
+ }
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 490ee896154d5a5a7e0518715035806241dcfff1..96f05dc98609a614380fb56da3a6760bfeb25859 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -208,8 +208,19 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     private final LevelTicks<Block> blockTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded);
+     private final LevelTicks<Fluid> fluidTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded);
+     private final PathTypeCache pathTypesByPosCache = new PathTypeCache();
+-    private final Set<Mob> navigatingMobs = new ObjectOpenHashSet<>();
+-    private volatile boolean isUpdatingNavigations;
++    // coderyoMC start - issue #24: thread-safe navigation bookkeeping under parallel region ticking.
++    // navigatingMobs is mutated (add/remove) from entity tracking callbacks AND iterated in
++    // sendBlockUpdated; both are reachable on region worker threads (scheduled block ticks call
++    // setBlock -> notifyAndUpdatePhysics -> sendBlockUpdated; spawning/removal call the tracking
++    // callbacks). Concurrent ObjectOpenHashSet mutation+iteration corrupts the open-addressing table.
++    // Regions are spatially disjoint so the navigation recompute targets disjoint mobs, but the
++    // shared CONTAINER still needs to be safe. A synchronized set keeps it correct; the per-thread
++    // isUpdatingNavigations recursion guard means one worker recomputing navigations does not trip the
++    // false-positive "recursive call" warning for another. region.enabled=false => one thread =>
++    // behaviourally identical to the plain set/volatile.
++    private final Set<Mob> navigatingMobs = java.util.Collections.synchronizedSet(new ObjectOpenHashSet<>());
++    private final ThreadLocal<Boolean> coderyoUpdatingNavigations = ThreadLocal.withInitial(() -> Boolean.FALSE);
++    // coderyoMC end - issue #24
+     protected final Raids raids;
+     private final ObjectLinkedOpenHashSet<BlockEventData> blockEvents = new ObjectLinkedOpenHashSet<>();
+     private final List<BlockEventData> blockEventsToReschedule = new ArrayList<>(64);
+@@ -352,7 +363,30 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+ 
+     @Override
+     public final void moonrise$midTickTasks() {
++        // coderyoMC start - issue #24: single-owner mid-tick task draining.
++        // The mid-tick task queue lives on each ServerChunkCache's MainThreadExecutor (one
++        // shared BlockableEventLoop per level). Vanilla drains it from guardEntityTick after
++        // every entity. Under region.enabled, entity ticking fans out across region worker
++        // threads, so MULTIPLE workers would call chunkSource.pollTask() on the SAME shared
++        // queue concurrently. BlockableEventLoop.pollTask is peek-then-remove (TOCTOU); two
++        // workers race and one hits AbstractQueue.remove() on an empty queue ->
++        // NoSuchElementException -> the whole region tick aborts (the profiling §1 crash).
++        //
++        // Worse, executing a mid-tick chunk-system task on region B's worker could run work
++        // targeting region A's chunks (cross-region write). So we make the drain SINGLE-OWNER:
++        // ONLY the orchestrator (main) thread polls the level's shared mid-tick queue. Region
++        // workers skip it — the orchestrator already drains these tasks heavily before the
++        // parallel phase (runAllTasksAtTickStart), inside its own suppressed level.tick(), and
++        // after the barrier / while waiting for the next tick. Mid-tick draining is a chunk-
++        // progression OPTIMISATION (keep chunk-system tasks flowing during the tick), not a
++        // correctness requirement for the entity tick: chunk loads still complete at the tick
++        // boundary, so skipping it on workers cannot deadlock. region.enabled=false =>
++        // RegionWorkerThread.isCurrent() is always false => byte-for-byte vanilla drain.
++        if (com.coderyo.region.RegionWorkerThread.isCurrent()) {
++            return;
++        }
+         ((ca.spottedleaf.moonrise.patches.chunk_system.server.ChunkSystemMinecraftServer)this.server).moonrise$executeMidTickTasks();
++        // coderyoMC end - issue #24
+     }
+ 
+     @Override
+@@ -2180,7 +2214,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+ 
+     @Override
+     public void sendBlockUpdated(final BlockPos pos, final BlockState old, final BlockState current, final @Block.UpdateFlags int updateFlags) {
+-        if (this.isUpdatingNavigations) {
++        if (this.coderyoUpdatingNavigations.get()) { // coderyoMC - issue #24: per-thread recursion guard
+             String message = "recursive call to sendBlockUpdated";
+             Util.logAndPauseIfInIde("recursive call to sendBlockUpdated", new IllegalStateException("recursive call to sendBlockUpdated"));
+         }
+@@ -2194,12 +2228,16 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             List<PathNavigation> navigationsToUpdate = new ObjectArrayList<>();
+ 
+             try { // Paper - catch CME see below why
++            // coderyoMC - issue #24: iterate the synchronized navigatingMobs set under its monitor so a
++            // concurrent add/remove from another region worker cannot corrupt the open-addressing table.
++            synchronized (this.navigatingMobs) { // coderyoMC - issue #24
+             for (Mob navigatingMob : this.navigatingMobs) {
+                 PathNavigation pathNavigation = navigatingMob.getNavigation();
+                 if (pathNavigation.shouldRecomputePath(pos)) {
+                     navigationsToUpdate.add(pathNavigation);
+                 }
+             }
++            } // coderyoMC - issue #24
+             // Paper start - catch CME see below why
+             } catch (final java.util.ConcurrentModificationException concurrentModificationException) {
+                 // This can happen because the pathfinder update below may trigger a chunk load, which in turn may cause more navigators to register
+@@ -2211,13 +2249,13 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             // Paper end - catch CME see below why
+ 
+             try {
+-                this.isUpdatingNavigations = true;
++                this.coderyoUpdatingNavigations.set(Boolean.TRUE); // coderyoMC - issue #24: per-thread guard
+ 
+                 for (PathNavigation navigation : navigationsToUpdate) {
+                     navigation.recomputePath();
+                 }
+             } finally {
+-                this.isUpdatingNavigations = false;
++                this.coderyoUpdatingNavigations.set(Boolean.FALSE); // coderyoMC - issue #24
+             }
+         }
+         } // Paper - option to disable pathfinding updates
+@@ -3196,7 +3234,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             }
+ 
+             if (entity instanceof Mob mob) {
+-                if (false && ServerLevel.this.isUpdatingNavigations) { // Paper - Remove unnecessary onTrackingStart during navigation warning
++                if (false && ServerLevel.this.coderyoUpdatingNavigations.get()) { // Paper - Remove unnecessary onTrackingStart during navigation warning
+                     String message = "onTrackingStart called during navigation iteration";
+                     Util.logAndPauseIfInIde(
+                         "onTrackingStart called during navigation iteration", new IllegalStateException("onTrackingStart called during navigation iteration")
+@@ -3267,7 +3305,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             }
+ 
+             if (entity instanceof Mob mob) {
+-                if (false && ServerLevel.this.isUpdatingNavigations) { // Paper - Remove unnecessary onTrackingStart during navigation warning
++                if (false && ServerLevel.this.coderyoUpdatingNavigations.get()) { // Paper - Remove unnecessary onTrackingStart during navigation warning
+                     String message = "onTrackingStart called during navigation iteration";
+                     Util.logAndPauseIfInIde(
+                         "onTrackingStart called during navigation iteration", new IllegalStateException("onTrackingStart called during navigation iteration")
+diff --git a/net/minecraft/world/level/entity/EntityTickList.java b/net/minecraft/world/level/entity/EntityTickList.java
+index a30409eddfaded878a3ac54bb526fd2e4b887c57..33a2a6d3ddceed75d37cb3f284286391293b1714 100644
+--- a/net/minecraft/world/level/entity/EntityTickList.java
++++ b/net/minecraft/world/level/entity/EntityTickList.java
+@@ -15,19 +15,38 @@ public class EntityTickList {
+         // Paper - rewrite chunk system
+     }
+ 
++    // coderyoMC start - issue #24: thread-safe membership mutation under parallel region ticking.
++    // The backing IteratorSafeOrderedReferenceSet is NOT thread-safe. Under region.enabled,
++    // entity ticking fans out across region worker threads; an entity that removes itself during
++    // its own tick (falling block landing, mob death, item pickup) reaches EntityTickList.remove on
++    // the worker thread (via Moonrise's EntityCallbacks.onTickingEnd), and freshly-spawned mobs reach
++    // add on a region worker (P1.2e per-region spawning). Two workers mutating the set concurrently
++    // (or a worker racing the orchestrator) corrupted the set's internal Reference2IntLinkedOpenHashMap
++    // (ArrayIndexOutOfBounds in defrag -> entity slices corruption -> ChunkMap tracker NPE crash).
++    // Mutations are O(1) and rare relative to the per-entity tick body, so guarding them on the set
++    // monitor is cheap. forEach() iteration only runs on the orchestrator BEFORE the parallel fan-out
++    // (RegionTickOrchestrator snapshots first), so it never overlaps a worker mutation; it is left
++    // unsynchronized to keep the disabled (single-threaded) path byte-for-byte vanilla.
+     public void add(final Entity entity) {
+         this.ensureActiveIsNotIterated();
++        synchronized (this.entities) { // coderyoMC - issue #24
+         this.entities.add(entity); // Paper - rewrite chunk system
++        } // coderyoMC - issue #24
+     }
+ 
+     public void remove(final Entity entity) {
+         this.ensureActiveIsNotIterated();
++        synchronized (this.entities) { // coderyoMC - issue #24
+         this.entities.remove(entity); // Paper - rewrite chunk system
++        } // coderyoMC - issue #24
+     }
+ 
+     public boolean contains(final Entity entity) {
++        synchronized (this.entities) { // coderyoMC - issue #24
+         return this.entities.contains(entity); // Paper - rewrite chunk system
++        } // coderyoMC - issue #24
+     }
++    // coderyoMC end - issue #24
+ 
+     public void forEach(final Consumer<Entity> output) {
+         // Paper start - rewrite chunk system
