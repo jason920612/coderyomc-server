@@ -1,0 +1,1245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 25 Jun 2026 18:01:27 +0800
+Subject: [PATCH] GPU #19: offload BlendedNoise at interpolator cell batch
+ (stock terrain hot path)
+
+
+diff --git a/com/coderyo/compute/Ap2GpuBridge.java b/com/coderyo/compute/Ap2GpuBridge.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..081ee8765af1a9f78cde6eaa5087d613c0fff618
+--- /dev/null
++++ b/com/coderyo/compute/Ap2GpuBridge.java
+@@ -0,0 +1,135 @@
++/*
++ * coderyoMC — GPU compute SPI (design-spec §6). Clean-room implementation under
++ * the com.coderyo.compute namespace; no upstream package is touched.
++ */
++package com.coderyo.compute;
++
++import net.minecraft.world.level.levelgen.DensityFunction;
++import net.minecraft.world.level.levelgen.DensityFunctions;
++
++/**
++ * Makes the {@code BlendedNoise} GPU offload actually reach the stock 3D terrain hot
++ * path (issue #19).
++ *
++ * <p><b>Why this exists.</b> On stock overworld worldgen the heavy {@code BlendedNoise}
++ * ({@code base_3d_noise}) is wired so it is reached only through a per-point
++ * {@code compute()} call, never a batched {@code fillArray}: the terrain slide is built
++ * from {@code DensityFunctions.lerp}, which expands to {@code mul(factor, add(noise,
++ * const))}. Vanilla {@code Ap2.fillArray} for {@code MUL}/{@code MIN}/{@code MAX}
++ * batch-fills only {@code argument1}; {@code argument2} (the side carrying
++ * {@code base_3d_noise}) is evaluated <em>per cell corner</em> via {@code compute()}.
++ * So {@code BlendedNoise.fillArray} — the batched cell-corner entry the GPU bridge hooks
++ * — never fires. Verified empirically with entry probes.
++ *
++ * <p><b>What this does.</b> When GPU worldgen is enabled, this batch-fills
++ * {@code argument2} over the WHOLE cell-corner lattice via its own {@code fillArray}
++ * (which propagates down to {@code BlendedNoise.fillArray} → the GPU dispatch), then
++ * applies the exact same per-corner combine ({@code *} / {@code min} / {@code max}) with
++ * the identical short-circuit semantics. This is bit-identical to vanilla: each operand
++ * value at a corner is independent of the short-circuit, so batching {@code argument2}
++ * cannot change the output — it only does throwaway work for the short-circuited corners
++ * (off the tick path, on the chunk-gen worker pool).
++ *
++ * <p>With {@code gpu.worldgen.enabled=false} (default) this delegates straight to the
++ * EXACT upstream per-point combine — byte-for-byte vanilla, no extra allocation.
++ */
++public final class Ap2GpuBridge {
++
++    private Ap2GpuBridge() {
++    }
++
++    /**
++     * Batched {@code Ap2.fillArray}. {@code argument1} is filled into {@code output}
++     * first (exactly as upstream); the combine with {@code argument2} is then done
++     * per-corner — batched via {@code fillArray} when GPU is enabled, else exactly as
++     * upstream per-point.
++     */
++    public static void fillArray(final double[] output,
++                                 final DensityFunction.ContextProvider contextProvider,
++                                 final DensityFunctions.TwoArgumentSimpleFunction.Type type,
++                                 final DensityFunction argument1,
++                                 final DensityFunction argument2) {
++        argument1.fillArray(output, contextProvider);
++
++        // ADD already batch-fills argument2 in vanilla; nothing to gain by re-routing.
++        if (type == DensityFunctions.TwoArgumentSimpleFunction.Type.ADD || !ComputeConfig.isEnabled()) {
++            combinePerPoint(output, contextProvider, type, argument2);
++            return;
++        }
++
++        // GPU on: batch-fill argument2 over the whole lattice (reaches BlendedNoise.fillArray
++        // → one GPU dispatch), then combine per corner with identical short-circuit results.
++        final int n = output.length;
++        final double[] v2 = new double[n];
++        argument2.fillArray(v2, contextProvider);
++        switch (type) {
++            case MUL:
++                for (int i = 0; i < n; i++) {
++                    final double v = output[i];
++                    output[i] = v == 0.0 ? 0.0 : v * v2[i];
++                }
++                break;
++            case MIN: {
++                final double min = argument2.minValue();
++                for (int i = 0; i < n; i++) {
++                    final double v = output[i];
++                    output[i] = v < min ? v : Math.min(v, v2[i]);
++                }
++                break;
++            }
++            case MAX: {
++                final double max = argument2.maxValue();
++                for (int i = 0; i < n; i++) {
++                    final double v = output[i];
++                    output[i] = v > max ? v : Math.max(v, v2[i]);
++                }
++                break;
++            }
++            default:
++                // Unreachable (ADD handled above); keep exact upstream as a safety net.
++                combinePerPoint(output, contextProvider, type, argument2);
++        }
++    }
++
++    /** Exact upstream {@code Ap2.fillArray} per-point combine. */
++    private static void combinePerPoint(final double[] output,
++                                        final DensityFunction.ContextProvider contextProvider,
++                                        final DensityFunctions.TwoArgumentSimpleFunction.Type type,
++                                        final DensityFunction argument2) {
++        final int n = output.length;
++        switch (type) {
++            case ADD: {
++                final double[] v2 = new double[n];
++                argument2.fillArray(v2, contextProvider);
++                for (int i = 0; i < n; i++) {
++                    output[i] += v2[i];
++                }
++                break;
++            }
++            case MUL:
++                for (int i = 0; i < n; i++) {
++                    final double v = output[i];
++                    output[i] = v == 0.0 ? 0.0 : v * argument2.compute(contextProvider.forIndex(i));
++                }
++                break;
++            case MIN: {
++                final double min = argument2.minValue();
++                for (int i = 0; i < n; i++) {
++                    final double v = output[i];
++                    output[i] = v < min ? v : Math.min(v, argument2.compute(contextProvider.forIndex(i)));
++                }
++                break;
++            }
++            case MAX: {
++                final double max = argument2.maxValue();
++                for (int i = 0; i < n; i++) {
++                    final double v = output[i];
++                    output[i] = v > max ? v : Math.max(v, argument2.compute(contextProvider.forIndex(i)));
++                }
++                break;
++            }
++            default:
++                throw new IllegalStateException("unknown Ap2 type: " + type);
++        }
++    }
++}
+diff --git a/com/coderyo/compute/BlendedNoiseGpuBridge.java b/com/coderyo/compute/BlendedNoiseGpuBridge.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a17bd8088f7e17a0087e7b68fbacb09c561f2c04
+--- /dev/null
++++ b/com/coderyo/compute/BlendedNoiseGpuBridge.java
+@@ -0,0 +1,169 @@
++/*
++ * coderyoMC — GPU compute SPI (design-spec §6). Clean-room implementation under
++ * the com.coderyo.compute namespace; no upstream package is touched.
++ */
++package com.coderyo.compute;
++
++import java.util.concurrent.atomic.AtomicLong;
++import net.minecraft.world.level.levelgen.DensityFunction;
++import net.minecraft.world.level.levelgen.synth.BlendedNoise;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Production hook for the stock 3D terrain density noise — {@code BlendedNoise}
++ * (issue #19, design-spec §6.2). This is the dominant per-cell-corner compute on
++ * stock overworld worldgen: the final density function sampled by the
++ * {@code NoiseChunk} interpolator at a coarse cell-corner lattice wraps a
++ * {@code BlendedNoise} ({@code BASE_3D_NOISE_OVERWORLD}) deep in its tree, and the
++ * interpolator's {@code fillArray} tree-walk reaches {@code BlendedNoise.fillArray}
++ * for each cell-corner column (the live, batched entry point — unlike the
++ * {@code DensityFunctions.Noise.fillArray} hook of issue #14, which is dormant on
++ * stock gen because stock wraps its climate {@code Noise} nodes in {@code FlatCache}).
++ *
++ * <p>{@code BlendedNoise} is a {@code SimpleFunction}: its default {@code fillArray}
++ * loops {@code compute()} per cell corner. We override {@code fillArray} to batch the
++ * cell-corner sample points and evaluate them in one OpenCL dispatch that reproduces
++ * {@code compute()} bit-exactly (three {@code PerlinNoise} octave stacks —
++ * {@code mainNoise}/{@code minLimitNoise}/{@code maxLimitNoise} — the y-smear fudge,
++ * the {@code clampedLerp} blend, and the final {@code /128.0}).
++ *
++ * <p><b>Routing (correctness-first):</b>
++ * <ul>
++ *   <li>{@code gpu.worldgen.enabled=false} (default) or CPU backend selected →
++ *       delegate to the EXACT upstream {@code contextProvider.fillAllDirectly(output,
++ *       node)}. Byte-for-byte vanilla; no allocation, no GPU probe beyond the one-time
++ *       backend selection.</li>
++ *   <li>GPU backend selected AND the lattice clears the batch threshold AND the
++ *       {@code BlendedNoise} is GPU-offloadable → batch the cell-corner coordinates and
++ *       route through {@link ComputeBackend#sampleNoise}. The backend reproduces
++ *       {@code BlendedNoise.compute()} bit-exactly (parity-gated at startup); any
++ *       per-job failure degrades transparently to CPU via the registry's fallback.</li>
++ *   <li>Otherwise → exact upstream fill.</li>
++ * </ul>
++ */
++public final class BlendedNoiseGpuBridge {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyo-compute");
++    private static volatile ComputeBackend backend;
++    /** Diagnostic: number of BlendedNoise cell-corner batches seen (entry probe). */
++    private static final AtomicLong ENTRIES = new AtomicLong();
++    /** Diagnostic: number of BlendedNoise lattices actually dispatched to the GPU. */
++    private static final AtomicLong GPU_DISPATCHES = new AtomicLong();
++
++    private BlendedNoiseGpuBridge() {
++    }
++
++    private static ComputeBackend backend() {
++        ComputeBackend local = backend;
++        if (local == null) {
++            synchronized (BlendedNoiseGpuBridge.class) {
++                local = backend;
++                if (local == null) {
++                    local = ComputeBackendRegistry.get().select();
++                    backend = local;
++                }
++            }
++        }
++        return local;
++    }
++
++    /**
++     * Fill {@code output} with {@code BlendedNoise.compute()} at every cell-corner
++     * described by {@code contextProvider}. Always produces values identical to the
++     * vanilla per-point fill; only the compute engine differs, gated on the flag and
++     * selected backend.
++     */
++    public static void fillArray(final BlendedNoise node,
++                                 final double[] output,
++                                 final DensityFunction.ContextProvider contextProvider) {
++        // Default & CPU path: byte-for-byte vanilla.
++        if (!ComputeConfig.isEnabled()) {
++            contextProvider.fillAllDirectly(output, node);
++            return;
++        }
++
++        // Entry probe (debug): confirm the hook is LIVE on stock gen — i.e. that
++        // BlendedNoise.fillArray is actually reached during real forceload worldgen,
++        // not just at startup (issue #19 verifies #14's dormant-hook mistake is fixed).
++        if (ComputeConfig.isDebug()) {
++            final long e = ENTRIES.incrementAndGet();
++            if (e == 1L || (e % 5000L) == 0L) {
++                LOGGER.info("[compute] BlendedNoise.fillArray ENTRY probe — batch #{} (cellCorners={}) — stock terrain hook is LIVE",
++                    e, output.length);
++            }
++        }
++
++        final ComputeBackend active = backend();
++        if (active == null || "cpu".equals(active.name())) {
++            contextProvider.fillAllDirectly(output, node);
++            return;
++        }
++
++        final int count = output.length;
++        if (count < ComputeConfig.batchThreshold()) {
++            contextProvider.fillAllDirectly(output, node);
++            return;
++        }
++
++        final BlendedNoiseSpec spec = BlendedNoiseSpec.from(node);
++        if (spec == null) {
++            contextProvider.fillAllDirectly(output, node);
++            return;
++        }
++
++        final int[] bx = new int[count];
++        final int[] by = new int[count];
++        final int[] bz = new int[count];
++        for (int i = 0; i < count; i++) {
++            final DensityFunction.FunctionContext ctx = contextProvider.forIndex(i);
++            bx[i] = ctx.blockX();
++            by[i] = ctx.blockY();
++            bz[i] = ctx.blockZ();
++        }
++
++        // CPU fallback / parity sampler: EXACTLY the vanilla BlendedNoise.compute arithmetic.
++        final NoiseJob.Sampler scalar = i ->
++            node.compute(new DensityFunction.SinglePointContext(bx[i], by[i], bz[i]));
++
++        final NoiseJob job = NoiseJob.blendedNoise(count, bx, by, bz, spec, scalar);
++        final NoiseResult result;
++        try {
++            result = active.sampleNoise(job);
++        } catch (final Throwable t) {
++            // Never let a compute error escape into worldgen — exact upstream fill.
++            contextProvider.fillAllDirectly(output, node);
++            return;
++        }
++        final double[] raw = result.raw();
++
++        if (ComputeConfig.isDebug()) {
++            final long n = GPU_DISPATCHES.incrementAndGet();
++            // Runtime bit-exact parity audit on the REAL production cell-corner batch:
++            // every Nth dispatch, re-evaluate the vanilla scalar (BlendedNoise.compute)
++            // and assert GPU == vanilla bit-for-bit (Double.doubleToLongBits). Proves the
++            // stock-terrain offload is bit-exact on the actual data, not just at startup.
++            if (n == 1L || (n % 1000L) == 0L) {
++                int mismatches = 0;
++                int firstBad = -1;
++                for (int i = 0; i < count; i++) {
++                    if (Double.doubleToLongBits(raw[i]) != Double.doubleToLongBits(scalar.sampleAt(i))) {
++                        if (firstBad < 0) {
++                            firstBad = i;
++                        }
++                        mismatches++;
++                    }
++                }
++                if (mismatches == 0) {
++                    LOGGER.info("[compute] BlendedNoise GPU offload active — dispatch #{} (cellCorners={}, mainOct={}, limitOct={}, backend={}) — runtime parity OK (bit-exact vs vanilla)",
++                        n, count, spec.mainOctaveCount(), spec.limitOctaveCount(), result.producedBy());
++                } else {
++                    LOGGER.warn("[compute] BlendedNoise GPU dispatch #{} runtime parity MISMATCH: {}/{} corners differ (first @corner {})",
++                        n, mismatches, count, firstBad);
++                }
++            }
++        }
++
++        System.arraycopy(raw, 0, output, 0, count);
++    }
++}
+diff --git a/com/coderyo/compute/BlendedNoiseSpec.java b/com/coderyo/compute/BlendedNoiseSpec.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..63bd22f5010b8afdf4a0a9d8406183ad68e50054
+--- /dev/null
++++ b/com/coderyo/compute/BlendedNoiseSpec.java
+@@ -0,0 +1,183 @@
++/*
++ * coderyoMC — GPU compute SPI (design-spec §6). Clean-room implementation under
++ * the com.coderyo.compute namespace; no upstream package is touched.
++ */
++package com.coderyo.compute;
++
++import net.minecraft.world.level.levelgen.synth.BlendedNoise;
++import net.minecraft.world.level.levelgen.synth.ImprovedNoise;
++import net.minecraft.world.level.levelgen.synth.PerlinNoise;
++
++/**
++ * Flattened, GPU-offloadable descriptor of a vanilla {@code BlendedNoise} — the stock
++ * 3D terrain density noise (issue #19, design-spec §6.2).
++ *
++ * <p>It captures the EXACT private state {@code BlendedNoise.compute()} reads — the
++ * three {@code PerlinNoise} octave stacks ({@code mainNoise} up to 8 octaves,
++ * {@code minLimitNoise}/{@code maxLimitNoise} up to 16 octaves each), each octave's
++ * 256-byte permutation table and offsets, plus the derived multipliers
++ * ({@code xzMultiplier}/{@code yMultiplier}), the {@code xzFactor}/{@code yFactor}
++ * divisors, and the {@code smearScaleMultiplier} — so the
++ * {@link com.coderyo.compute.opencl.BlendedNoiseKernel} reproduces
++ * {@code compute()} bit-exactly. The CPU parity oracle re-evaluates the very same
++ * {@code BlendedNoise} object, so the comparison is GPU-vs-vanilla.
++ *
++ * <p><b>Octave layout.</b> Each stack is flattened in {@code compute()} iteration
++ * order: octave {@code i} corresponds to {@code stack.getOctaveNoise(i)} (which is
++ * {@code noiseLevels[len-1-i]}) and uses {@code pow = 2^-i}. The kernel walks
++ * {@code i = 0 .. count} mirroring the {@code pow /= 2.0} accumulation. A
++ * null/zero-amplitude octave is marked {@code present[i]==0} and contributes nothing,
++ * exactly as {@code compute()} skips a null {@code ImprovedNoise}.
++ *
++ * <p>Note {@code compute()} does NOT pre-multiply per-octave amplitudes (unlike
++ * {@code PerlinNoise.getValue}): it divides each octave's noise by {@code pow} and
++ * sums. So the kernel needs only the permutation/offsets and {@code present}; the
++ * scalar {@code pow} ladder is recomputed in-kernel identically.
++ */
++public final class BlendedNoiseSpec {
++
++    private final int mainOctaveCount;   // octaves of mainNoise (loop runs 0..8 in vanilla)
++    private final int limitOctaveCount;  // octaves of min/max stacks (loop runs 0..16)
++
++    // mainNoise stack
++    private final int[] mainPerm;        // mainOctaveCount * 256
++    private final double[] mainXo;
++    private final double[] mainYo;
++    private final double[] mainZo;
++    private final int[] mainPresent;
++
++    // minLimitNoise stack
++    private final int[] minPerm;
++    private final double[] minXo;
++    private final double[] minYo;
++    private final double[] minZo;
++    private final int[] minPresent;
++
++    // maxLimitNoise stack
++    private final int[] maxPerm;
++    private final double[] maxXo;
++    private final double[] maxYo;
++    private final double[] maxZo;
++    private final int[] maxPresent;
++
++    private final double xzMultiplier;
++    private final double yMultiplier;
++    private final double xzFactor;
++    private final double yFactor;
++    private final double smearScaleMultiplier;
++
++    private BlendedNoiseSpec(final int mainOctaveCount, final int limitOctaveCount,
++                             final int[] mainPerm, final double[] mainXo, final double[] mainYo, final double[] mainZo, final int[] mainPresent,
++                             final int[] minPerm, final double[] minXo, final double[] minYo, final double[] minZo, final int[] minPresent,
++                             final int[] maxPerm, final double[] maxXo, final double[] maxYo, final double[] maxZo, final int[] maxPresent,
++                             final double xzMultiplier, final double yMultiplier, final double xzFactor, final double yFactor,
++                             final double smearScaleMultiplier) {
++        this.mainOctaveCount = mainOctaveCount;
++        this.limitOctaveCount = limitOctaveCount;
++        this.mainPerm = mainPerm;
++        this.mainXo = mainXo;
++        this.mainYo = mainYo;
++        this.mainZo = mainZo;
++        this.mainPresent = mainPresent;
++        this.minPerm = minPerm;
++        this.minXo = minXo;
++        this.minYo = minYo;
++        this.minZo = minZo;
++        this.minPresent = minPresent;
++        this.maxPerm = maxPerm;
++        this.maxXo = maxXo;
++        this.maxYo = maxYo;
++        this.maxZo = maxZo;
++        this.maxPresent = maxPresent;
++        this.xzMultiplier = xzMultiplier;
++        this.yMultiplier = yMultiplier;
++        this.xzFactor = xzFactor;
++        this.yFactor = yFactor;
++        this.smearScaleMultiplier = smearScaleMultiplier;
++    }
++
++    /** Extract a GPU spec from a live {@code BlendedNoise}; never null for a standard layout. */
++    public static BlendedNoiseSpec from(final BlendedNoise noise) {
++        // Vanilla compute() loops main over [0,8) and min/max over [0,16), using
++        // getOctaveNoise(i) = noiseLevels[len-1-i]. We extract exactly those counts.
++        final Stack main = extractStack(noise.coderyoMainNoise(), 8);
++        final Stack min = extractStack(noise.coderyoMinLimitNoise(), 16);
++        final Stack max = extractStack(noise.coderyoMaxLimitNoise(), 16);
++        if (main == null || min == null || max == null) {
++            return null;
++        }
++        return new BlendedNoiseSpec(
++            8, 16,
++            main.perm, main.xo, main.yo, main.zo, main.present,
++            min.perm, min.xo, min.yo, min.zo, min.present,
++            max.perm, max.xo, max.yo, max.zo, max.present,
++            noise.coderyoXzMultiplier(), noise.coderyoYMultiplier(),
++            noise.coderyoXzFactor(), noise.coderyoYFactor(), noise.coderyoSmearScaleMultiplier());
++    }
++
++    private static final class Stack {
++        final int[] perm;
++        final double[] xo;
++        final double[] yo;
++        final double[] zo;
++        final int[] present;
++
++        Stack(final int count) {
++            this.perm = new int[count * 256];
++            this.xo = new double[count];
++            this.yo = new double[count];
++            this.zo = new double[count];
++            this.present = new int[count];
++        }
++    }
++
++    /**
++     * Extract {@code count} octaves in {@code compute()} iteration order: octave
++     * {@code i} = {@code perlin.getOctaveNoise(i)}. A null octave (zero amplitude) is
++     * marked absent, exactly as {@code compute()} skips it.
++     */
++    private static Stack extractStack(final PerlinNoise perlin, final int count) {
++        final Stack s = new Stack(count);
++        for (int i = 0; i < count; i++) {
++            final ImprovedNoise octave = perlin.getOctaveNoise(i);
++            if (octave != null) {
++                final int[] p = octave.coderyoPermutationUnsigned();
++                System.arraycopy(p, 0, s.perm, i * 256, 256);
++                s.xo[i] = octave.xo;
++                s.yo[i] = octave.yo;
++                s.zo[i] = octave.zo;
++                s.present[i] = 1;
++            } else {
++                s.present[i] = 0;
++            }
++        }
++        return s;
++    }
++
++    public int mainOctaveCount() { return this.mainOctaveCount; }
++    public int limitOctaveCount() { return this.limitOctaveCount; }
++
++    public int[] mainPerm() { return this.mainPerm; }
++    public double[] mainXo() { return this.mainXo; }
++    public double[] mainYo() { return this.mainYo; }
++    public double[] mainZo() { return this.mainZo; }
++    public int[] mainPresent() { return this.mainPresent; }
++
++    public int[] minPerm() { return this.minPerm; }
++    public double[] minXo() { return this.minXo; }
++    public double[] minYo() { return this.minYo; }
++    public double[] minZo() { return this.minZo; }
++    public int[] minPresent() { return this.minPresent; }
++
++    public int[] maxPerm() { return this.maxPerm; }
++    public double[] maxXo() { return this.maxXo; }
++    public double[] maxYo() { return this.maxYo; }
++    public double[] maxZo() { return this.maxZo; }
++    public int[] maxPresent() { return this.maxPresent; }
++
++    public double xzMultiplier() { return this.xzMultiplier; }
++    public double yMultiplier() { return this.yMultiplier; }
++    public double xzFactor() { return this.xzFactor; }
++    public double yFactor() { return this.yFactor; }
++    public double smearScaleMultiplier() { return this.smearScaleMultiplier; }
++}
+diff --git a/com/coderyo/compute/NoiseJob.java b/com/coderyo/compute/NoiseJob.java
+index 1c13f335a92a19c140d9d4c0b92dcb6d5d7fe0b6..f9388e6409b711480be04dba39b0e561d83a0287 100644
+--- a/com/coderyo/compute/NoiseJob.java
++++ b/com/coderyo/compute/NoiseJob.java
+@@ -63,6 +63,7 @@ public final class NoiseJob {
+     private final Sampler sampler;
+     private final Primitive primitive;          // nullable
+     private final NormalNoiseSpec normalNoise;  // nullable (issue #14 NormalNoise offload)
++    private final BlendedNoiseSpec blendedNoise; // nullable (issue #19 stock-terrain BlendedNoise offload)
+ 
+     /**
+      * @param count   number of sample points
+@@ -75,12 +76,12 @@ public final class NoiseJob {
+      */
+     public NoiseJob(final int count, final int[] blockX, final int[] blockY, final int[] blockZ,
+                     final long seed, final Sampler sampler, final Primitive primitive) {
+-        this(count, blockX, blockY, blockZ, seed, sampler, primitive, null);
++        this(count, blockX, blockY, blockZ, seed, sampler, primitive, null, null);
+     }
+ 
+     private NoiseJob(final int count, final int[] blockX, final int[] blockY, final int[] blockZ,
+                      final long seed, final Sampler sampler, final Primitive primitive,
+-                     final NormalNoiseSpec normalNoise) {
++                     final NormalNoiseSpec normalNoise, final BlendedNoiseSpec blendedNoise) {
+         if (count < 0) {
+             throw new IllegalArgumentException("count < 0: " + count);
+         }
+@@ -95,12 +96,13 @@ public final class NoiseJob {
+         this.sampler = Objects.requireNonNull(sampler, "sampler");
+         this.primitive = primitive;
+         this.normalNoise = normalNoise;
++        this.blendedNoise = blendedNoise;
+     }
+ 
+     /** CPU-only job (no GPU-offloadable primitive descriptor). */
+     public NoiseJob(final int count, final int[] blockX, final int[] blockY, final int[] blockZ,
+                     final long seed, final Sampler sampler) {
+-        this(count, blockX, blockY, blockZ, seed, sampler, null, null);
++        this(count, blockX, blockY, blockZ, seed, sampler, null, null, null);
+     }
+ 
+     /**
+@@ -111,7 +113,18 @@ public final class NoiseJob {
+      */
+     public static NoiseJob normalNoise(final int count, final int[] blockX, final int[] blockY,
+                                        final int[] blockZ, final NormalNoiseSpec spec, final Sampler scalarSampler) {
+-        return new NoiseJob(count, blockX, blockY, blockZ, 0L, scalarSampler, null, spec);
++        return new NoiseJob(count, blockX, blockY, blockZ, 0L, scalarSampler, null, spec, null);
++    }
++
++    /**
++     * Build a GPU-offloadable {@code BlendedNoise} job (issue #19): the value at each
++     * point equals the vanilla {@code BlendedNoise.compute()} (stock 3D terrain density)
++     * of the supplied {@link BlendedNoiseSpec}. The scalar {@code sampler} is the CPU
++     * fallback / parity oracle and MUST equal that for each coordinate.
++     */
++    public static NoiseJob blendedNoise(final int count, final int[] blockX, final int[] blockY,
++                                        final int[] blockZ, final BlendedNoiseSpec spec, final Sampler scalarSampler) {
++        return new NoiseJob(count, blockX, blockY, blockZ, 0L, scalarSampler, null, null, spec);
+     }
+ 
+     /**
+@@ -182,6 +195,15 @@ public final class NoiseJob {
+         return this.normalNoise != null;
+     }
+ 
++    /** The optional GPU-offloadable {@code BlendedNoise} descriptor, or null. */
++    public BlendedNoiseSpec blendedNoise() {
++        return this.blendedNoise;
++    }
++
++    public boolean hasBlendedNoise() {
++        return this.blendedNoise != null;
++    }
++
+     /** Convenience: evaluate one point through the carried scalar sampler. */
+     public double sampleAt(final int i) {
+         return this.sampler.sampleAt(i);
+diff --git a/com/coderyo/compute/ParitySelfCheck.java b/com/coderyo/compute/ParitySelfCheck.java
+index af148ff514bac93f498cb5f3f2d8e40e22dae8f8..f23d4d757e596a26a41f624f09293216c0b696e7 100644
+--- a/com/coderyo/compute/ParitySelfCheck.java
++++ b/com/coderyo/compute/ParitySelfCheck.java
+@@ -7,7 +7,9 @@ package com.coderyo.compute;
+ import com.coderyo.compute.opencl.ImprovedNoiseReference;
+ import com.coderyo.compute.opencl.OpenClComputeBackend;
+ import com.coderyo.compute.cpu.CpuComputeBackend;
++import net.minecraft.world.level.levelgen.DensityFunction;
+ import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
++import net.minecraft.world.level.levelgen.synth.BlendedNoise;
+ import net.minecraft.world.level.levelgen.synth.NormalNoise;
+ 
+ /**
+@@ -39,6 +41,78 @@ final class ParitySelfCheck {
+         if (normal != null) {
+             return "NormalNoise-node parity: " + normal;
+         }
++        final String blended = runBlendedNoise(opencl, tolerance);
++        if (blended != null) {
++            return "BlendedNoise-node parity: " + blended;
++        }
++        return null;
++    }
++
++    /**
++     * issue #19: stock 3D terrain {@code BlendedNoise} parity. Builds a deterministic
++     * {@code BlendedNoise} (fixed seed, the stock {@code BASE_3D_NOISE_OVERWORLD}
++     * scaling), samples a lattice on the GPU via the {@code BlendedNoiseSpec} path, and
++     * asserts every value matches the vanilla {@code BlendedNoise.compute()} bit-for-bit.
++     * The vanilla object IS the oracle — this proves the kernel replays all three
++     * PerlinNoise stacks, the y-smear fudge, the blend selector, and the final scaling
++     * exactly before any real stock terrain is generated.
++     */
++    private static String runBlendedNoise(final OpenClComputeBackend opencl, final double tolerance) {
++        final long seed = 0x5B1E0DED7E44A19L;
++        // Stock BASE_3D_NOISE_OVERWORLD scaling (xzScale=0.25, yScale=0.125,
++        // xzFactor=80, yFactor=160, smearScaleMultiplier=8).
++        final BlendedNoise noise = new BlendedNoise(
++            new XoroshiroRandomSource(seed), 0.25, 0.125, 80.0, 160.0, 8.0);
++
++        final int n = 16 * 16 * 8; // 2048 points, deterministic lattice
++        final int[] bx = new int[n];
++        final int[] by = new int[n];
++        final int[] bz = new int[n];
++        int idx = 0;
++        for (int x = 0; x < 16; x++) {
++            for (int z = 0; z < 16; z++) {
++                for (int y = 0; y < 8; y++) {
++                    bx[idx] = x * 4 - 11;
++                    by[idx] = y * 8 - 24; // span across cell heights / sign change
++                    bz[idx] = z * 3 - 7;
++                    idx++;
++                }
++            }
++        }
++
++        final double[] cpuVals = new double[n];
++        for (int i = 0; i < n; i++) {
++            cpuVals[i] = noise.compute(new DensityFunction.SinglePointContext(bx[i], by[i], bz[i]));
++        }
++
++        final BlendedNoiseSpec spec = BlendedNoiseSpec.from(noise);
++        if (spec == null) {
++            return "BlendedNoiseSpec extraction returned null (not GPU-offloadable layout)";
++        }
++
++        final NoiseResult gpu;
++        try {
++            final NoiseJob job = NoiseJob.blendedNoise(n, bx, by, bz, spec,
++                i -> noise.compute(new DensityFunction.SinglePointContext(bx[i], by[i], bz[i])));
++            gpu = opencl.sampleNoise(job);
++        } catch (final Throwable t) {
++            return "GPU sampleNoise(blended) threw " + t.getClass().getSimpleName() + ": " + t.getMessage();
++        }
++
++        if (gpu.count() != n) {
++            return "result count mismatch: expected " + n + " got " + gpu.count();
++        }
++        for (int i = 0; i < n; i++) {
++            final double a = cpuVals[i];
++            final double b = gpu.value(i);
++            final boolean ok = tolerance == 0.0
++                ? Double.doubleToLongBits(a) == Double.doubleToLongBits(b)
++                : Math.abs(a - b) <= tolerance;
++            if (!ok) {
++                return String.format("sample %d at (%d,%d,%d): cpu=%s gpu=%s (tol=%s)",
++                    i, bx[i], by[i], bz[i], a, b, tolerance);
++            }
++        }
+         return null;
+     }
+ 
+diff --git a/com/coderyo/compute/opencl/BlendedNoiseKernel.java b/com/coderyo/compute/opencl/BlendedNoiseKernel.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3909c77f2c1948304dc96c0c3ee527a938bca866
+--- /dev/null
++++ b/com/coderyo/compute/opencl/BlendedNoiseKernel.java
+@@ -0,0 +1,197 @@
++/*
++ * coderyoMC — GPU compute SPI (design-spec §6). Clean-room implementation under
++ * the com.coderyo.compute namespace; no upstream package is touched.
++ */
++package com.coderyo.compute.opencl;
++
++/**
++ * OpenCL C kernel for the stock 3D terrain density noise — vanilla
++ * {@code BlendedNoise.compute()} (issue #19, design-spec §6.2). This is the dominant
++ * per-cell-corner compute on stock overworld worldgen; one GPU dispatch evaluates a
++ * whole interpolator cell-corner lattice.
++ *
++ * <p><b>Bit-exactness (§6.2 / R6).</b> The kernel mirrors, in {@code double}
++ * precision, the EXACT arithmetic of {@code BlendedNoise.compute()}:
++ * <ul>
++ *   <li>three {@code PerlinNoise} octave stacks — {@code mainNoise} (8 octaves),
++ *       {@code minLimitNoise}/{@code maxLimitNoise} (16 octaves each), each octave's
++ *       {@code ImprovedNoise.noise(..., yScale, yFudge)} (the y-smear / fudge form),</li>
++ *   <li>the {@code pow}-ladder ({@code pow /= 2.0}) and the per-octave {@code / pow}
++ *       accumulation, the {@code PerlinNoise.wrap} (long floor) on each coordinate,</li>
++ *   <li>the {@code factor = (mainNoiseValue/10 + 1)/2} blend selector and its
++ *       {@code isMax}/{@code isMin} short-circuits,</li>
++ *   <li>the final {@code Mth.clampedLerp(factor, blendMin/512, blendMax/512) / 128}.</li>
++ * </ul>
++ * The same gradient table, the same {@code Mth.floor}, the same {@code smoothstep},
++ * the same {@code 1.0E-7f} (float) fudge epsilon promoted to double. {@code FP_CONTRACT
++ * OFF} keeps {@code a*b+c} as two IEEE-754 ops, so the result is bit-identical to the
++ * CPU twin (the vanilla {@code BlendedNoise} object, the parity oracle).
++ *
++ * <p>Requires {@code cl_khr_fp64}; a device without it makes the backend report
++ * unavailable and the registry falls back to CPU.
++ */
++final class BlendedNoiseKernel {
++
++    private BlendedNoiseKernel() {
++    }
++
++    static final String SOURCE =
++        "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n" +
++        "#pragma OPENCL FP_CONTRACT OFF\n" +
++        "\n" +
++        "__constant int GRAD[16][3] = {\n" +
++        "  {1,1,0},{-1,1,0},{1,-1,0},{-1,-1,0},\n" +
++        "  {1,0,1},{-1,0,1},{1,0,-1},{-1,0,-1},\n" +
++        "  {0,1,1},{0,-1,1},{0,1,-1},{0,-1,-1},\n" +
++        "  {1,1,0},{0,-1,1},{-1,1,0},{0,-1,-1}\n" +
++        "};\n" +
++        "\n" +
++        "static inline double grad_dot(int hash, double x, double y, double z) {\n" +
++        "  int h = hash & 15;\n" +
++        "  return (double)GRAD[h][0]*x + (double)GRAD[h][1]*y + (double)GRAD[h][2]*z;\n" +
++        "}\n" +
++        "static inline double smoothstep(double t) {\n" +
++        "  return t*t*t*(t*(t*6.0 - 15.0) + 10.0);\n" +
++        "}\n" +
++        "static inline double lerpd(double a, double p0, double p1) {\n" +
++        "  return p0 + a*(p1 - p0);\n" +
++        "}\n" +
++        "static inline int P(__global const int* perm, int x) {\n" +
++        "  return perm[x & 0xFF] & 0xFF;\n" +
++        "}\n" +
++        "\n" +
++        "// Mth.floor(double) == (int)Math.floor(v).\n" +
++        "static inline int mfloor(double x) {\n" +
++        "  return (int)floor(x);\n" +
++        "}\n" +
++        "\n" +
++        "// PerlinNoise.wrap: x - lfloor(x/3.3554432E7 + 0.5) * 3.3554432E7\n" +
++        "static inline double pwrap(double x) {\n" +
++        "  double q = x / 3.3554432E7 + 0.5;\n" +
++        "  long f = (long)floor(q);\n" +
++        "  return x - (double)f * 3.3554432E7;\n" +
++        "}\n" +
++        "\n" +
++        "// ImprovedNoise.noise(_x,_y,_z, yScale, yFudge) — the y-smear/fudge form used\n" +
++        "// by BlendedNoise. perm at perm+off256, offsets (xo,yo,zo).\n" +
++        "static inline double improved_y(__global const int* perm, int off256,\n" +
++        "                                double xo, double yo, double zo,\n" +
++        "                                double _x, double _y, double _z,\n" +
++        "                                double yScale, double yFudge) {\n" +
++        "  __global const int* p = perm + off256;\n" +
++        "  double x = _x + xo;\n" +
++        "  double y = _y + yo;\n" +
++        "  double z = _z + zo;\n" +
++        "  int xf = mfloor(x);\n" +
++        "  int yf = mfloor(y);\n" +
++        "  int zf = mfloor(z);\n" +
++        "  double xr = x - (double)xf;\n" +
++        "  double yr = y - (double)yf;\n" +
++        "  double zr = z - (double)zf;\n" +
++        "  double yrFudge;\n" +
++        "  if (yScale != 0.0) {\n" +
++        "    double fudgeLimit = (yFudge >= 0.0 && yFudge < yr) ? yFudge : yr;\n" +
++        "    // 1.0E-7F is a float literal in Java, promoted to double: 1.0000000116860974E-7.\n" +
++        "    yrFudge = floor(fudgeLimit / yScale + 1.0000000116860974E-7) * yScale;\n" +
++        "  } else {\n" +
++        "    yrFudge = 0.0;\n" +
++        "  }\n" +
++        "  // sampleAndLerp(xf,yf,zf, xr, yr - yrFudge, zr, yrOriginal=yr):\n" +
++        "  double yrl = yr - yrFudge;\n" +
++        "  int x0 = P(p, xf);\n" +
++        "  int x1 = P(p, xf + 1);\n" +
++        "  int xy00 = P(p, x0 + yf);\n" +
++        "  int xy01 = P(p, x0 + yf + 1);\n" +
++        "  int xy10 = P(p, x1 + yf);\n" +
++        "  int xy11 = P(p, x1 + yf + 1);\n" +
++        "  double d000 = grad_dot(P(p, xy00 + zf),     xr,       yrl,       zr);\n" +
++        "  double d100 = grad_dot(P(p, xy10 + zf),     xr - 1.0, yrl,       zr);\n" +
++        "  double d010 = grad_dot(P(p, xy01 + zf),     xr,       yrl - 1.0, zr);\n" +
++        "  double d110 = grad_dot(P(p, xy11 + zf),     xr - 1.0, yrl - 1.0, zr);\n" +
++        "  double d001 = grad_dot(P(p, xy00 + zf + 1), xr,       yrl,       zr - 1.0);\n" +
++        "  double d101 = grad_dot(P(p, xy10 + zf + 1), xr - 1.0, yrl,       zr - 1.0);\n" +
++        "  double d011 = grad_dot(P(p, xy01 + zf + 1), xr,       yrl - 1.0, zr - 1.0);\n" +
++        "  double d111 = grad_dot(P(p, xy11 + zf + 1), xr - 1.0, yrl - 1.0, zr - 1.0);\n" +
++        "  double xa = smoothstep(xr);\n" +
++        "  double ya = smoothstep(yr);\n" +   // yrOriginal, NOT yrl
++        "  double za = smoothstep(zr);\n" +
++        "  double l00 = lerpd(xa, d000, d100);\n" +
++        "  double l10 = lerpd(xa, d010, d110);\n" +
++        "  double l01 = lerpd(xa, d001, d101);\n" +
++        "  double l11 = lerpd(xa, d011, d111);\n" +
++        "  double l0 = lerpd(ya, l00, l10);\n" +
++        "  double l1 = lerpd(ya, l01, l11);\n" +
++        "  return lerpd(za, l0, l1);\n" +
++        "}\n" +
++        "\n" +
++        "static inline double clampedLerp(double t, double a, double b) {\n" +
++        "  if (t < 0.0) return a;\n" +
++        "  if (t > 1.0) return b;\n" +
++        "  return lerpd(t, a, b);\n" +
++        "}\n" +
++        "\n" +
++        "__kernel void blended_noise(\n" +
++        "    __global const int*    mainPerm,    __global const double* mainXo,\n" +
++        "    __global const double* mainYo,      __global const double* mainZo,\n" +
++        "    __global const int*    mainPresent,\n" +
++        "    __global const int*    minPerm,     __global const double* minXo,\n" +
++        "    __global const double* minYo,       __global const double* minZo,\n" +
++        "    __global const int*    minPresent,\n" +
++        "    __global const int*    maxPerm,     __global const double* maxXo,\n" +
++        "    __global const double* maxYo,       __global const double* maxZo,\n" +
++        "    __global const int*    maxPresent,\n" +
++        "    const double           xzMultiplier,\n" +
++        "    const double           yMultiplier,\n" +
++        "    const double           xzFactor,\n" +
++        "    const double           yFactor,\n" +
++        "    const double           smearScaleMultiplier,\n" +
++        "    __global const int*    bx,\n" +
++        "    __global const int*    by,\n" +
++        "    __global const int*    bz,\n" +
++        "    __global double*       out,\n" +
++        "    const int              count)\n" +
++        "{\n" +
++        "  int gid = get_global_id(0);\n" +
++        "  if (gid >= count) return;\n" +
++        "  double limitX = (double)bx[gid] * xzMultiplier;\n" +
++        "  double limitY = (double)by[gid] * yMultiplier;\n" +
++        "  double limitZ = (double)bz[gid] * xzMultiplier;\n" +
++        "  double mainX = limitX / xzFactor;\n" +
++        "  double mainY = limitY / yFactor;\n" +
++        "  double mainZ = limitZ / xzFactor;\n" +
++        "  double limitSmear = yMultiplier * smearScaleMultiplier;\n" +
++        "  double mainSmear = limitSmear / yFactor;\n" +
++        "  double mainNoiseValue = 0.0;\n" +
++        "  double pow = 1.0;\n" +
++        "  for (int i = 0; i < 8; i++) {\n" +
++        "    if (mainPresent[i] != 0) {\n" +
++        "      mainNoiseValue += improved_y(mainPerm, i*256, mainXo[i], mainYo[i], mainZo[i],\n" +
++        "                                   pwrap(mainX*pow), pwrap(mainY*pow), pwrap(mainZ*pow),\n" +
++        "                                   mainSmear*pow, mainY*pow) / pow;\n" +
++        "    }\n" +
++        "    pow /= 2.0;\n" +
++        "  }\n" +
++        "  double factor = (mainNoiseValue / 10.0 + 1.0) / 2.0;\n" +
++        "  bool isMax = factor >= 1.0;\n" +
++        "  bool isMin = factor <= 0.0;\n" +
++        "  double blendMin = 0.0;\n" +
++        "  double blendMax = 0.0;\n" +
++        "  pow = 1.0;\n" +
++        "  for (int i = 0; i < 16; i++) {\n" +
++        "    double wx = pwrap(limitX*pow);\n" +
++        "    double wy = pwrap(limitY*pow);\n" +
++        "    double wz = pwrap(limitZ*pow);\n" +
++        "    double yScalePow = limitSmear*pow;\n" +
++        "    if (!isMax && minPresent[i] != 0) {\n" +
++        "      blendMin += improved_y(minPerm, i*256, minXo[i], minYo[i], minZo[i],\n" +
++        "                             wx, wy, wz, yScalePow, limitY*pow) / pow;\n" +
++        "    }\n" +
++        "    if (!isMin && maxPresent[i] != 0) {\n" +
++        "      blendMax += improved_y(maxPerm, i*256, maxXo[i], maxYo[i], maxZo[i],\n" +
++        "                             wx, wy, wz, yScalePow, limitY*pow) / pow;\n" +
++        "    }\n" +
++        "    pow /= 2.0;\n" +
++        "  }\n" +
++        "  out[gid] = clampedLerp(factor, blendMin / 512.0, blendMax / 512.0) / 128.0;\n" +
++        "}\n";
++}
+diff --git a/com/coderyo/compute/opencl/OpenClComputeBackend.java b/com/coderyo/compute/opencl/OpenClComputeBackend.java
+index 731cb0d3049bc0bd6da1865978ae6302821a8d56..e9836876ec406ecbceb28ad1c5161af6170fc4d2 100644
+--- a/com/coderyo/compute/opencl/OpenClComputeBackend.java
++++ b/com/coderyo/compute/opencl/OpenClComputeBackend.java
+@@ -4,6 +4,7 @@
+  */
+ package com.coderyo.compute.opencl;
+ 
++import com.coderyo.compute.BlendedNoiseSpec;
+ import com.coderyo.compute.ComputeBackend;
+ import com.coderyo.compute.ComputeException;
+ import com.coderyo.compute.NoiseJob;
+@@ -75,8 +76,12 @@ public final class OpenClComputeBackend implements ComputeBackend {
+     private final long kernel;
+     private final long normalProgram;
+     private final long normalKernel;
++    private final long blendedProgram;
++    private final long blendedKernel;
+     private final boolean available;
+     private volatile boolean closed;
++    /** Serializes GPU dispatches: one command queue + stateful clSetKernelArg (issue #19). */
++    private final Object dispatchLock = new Object();
+ 
+     public OpenClComputeBackend() {
+         long platform = 0L;
+@@ -87,6 +92,8 @@ public final class OpenClComputeBackend implements ComputeBackend {
+         long kernel = 0L;
+         long normalProgram = 0L;
+         long normalKernel = 0L;
++        long blendedProgram = 0L;
++        long blendedKernel = 0L;
+         boolean ok = false;
+         try (MemoryStack stack = MemoryStack.stackPush()) {
+             // 1) platform
+@@ -150,11 +157,24 @@ public final class OpenClComputeBackend implements ComputeBackend {
+             }
+             normalKernel = clCreateKernel(normalProgram, "normal_noise", err);
+             checkCl(err.get(0), "clCreateKernel(normal)");
++
++            // issue #19: third kernel — stock 3D terrain BlendedNoise offload.
++            blendedProgram = clCreateProgramWithSource(context, BlendedNoiseKernel.SOURCE, err);
++            checkCl(err.get(0), "clCreateProgramWithSource(blended)");
++            final int blendedBuildRc = clBuildProgram(blendedProgram, device, "", null, 0L);
++            if (blendedBuildRc != CL_SUCCESS) {
++                throw new ComputeException("clBuildProgram(blended) failed: "
++                    + buildLog(blendedProgram, device, stack));
++            }
++            blendedKernel = clCreateKernel(blendedProgram, "blended_noise", err);
++            checkCl(err.get(0), "clCreateKernel(blended)");
+             ok = true;
+         } catch (final Throwable t) {
+             // Roll back partially-acquired resources; mark unavailable.
++            releaseQuietly(blendedKernel, blendedProgram, 0L, 0L);
+             releaseQuietly(normalKernel, normalProgram, 0L, 0L);
+             releaseQuietly(kernel, program, queue, context);
++            blendedKernel = blendedProgram = 0L;
+             normalKernel = normalProgram = 0L;
+             kernel = program = queue = context = 0L;
+             if (com.coderyo.compute.ComputeConfig.isDebug()) {
+@@ -170,6 +190,8 @@ public final class OpenClComputeBackend implements ComputeBackend {
+         this.kernel = kernel;
+         this.normalProgram = normalProgram;
+         this.normalKernel = normalKernel;
++        this.blendedProgram = blendedProgram;
++        this.blendedKernel = blendedKernel;
+         this.available = ok;
+     }
+ 
+@@ -188,6 +210,21 @@ public final class OpenClComputeBackend implements ComputeBackend {
+         if (!isAvailable()) {
+             throw new ComputeException("OpenCL backend not available");
+         }
++        // coderyoMC (issue #19): chunk-gen runs on many worker threads concurrently, but
++        // this backend has ONE command queue and uses stateful clSetKernelArg per kernel.
++        // Concurrent dispatches would race and corrupt each other's args/buffers (caught
++        // by the runtime parity audit as a sporadic whole-batch mismatch). Serialize all
++        // GPU dispatches on a single device lock — the GPU is one device, so this is the
++        // correct granularity and keeps every dispatch bit-exact.
++        synchronized (this.dispatchLock) {
++            return sampleNoiseLocked(job);
++        }
++    }
++
++    private NoiseResult sampleNoiseLocked(final NoiseJob job) {
++        if (job.hasBlendedNoise()) {
++            return sampleBlendedNoise(job);
++        }
+         if (job.hasNormalNoise()) {
+             return sampleNormalNoise(job);
+         }
+@@ -398,12 +435,159 @@ public final class OpenClComputeBackend implements ComputeBackend {
+         }
+     }
+ 
++    /**
++     * issue #19: evaluate a whole interpolator cell-corner lattice through the full
++     * stock {@code BlendedNoise.compute()} (three multi-octave PerlinNoise stacks +
++     * the y-smear fudge + the clampedLerp blend + final /128) in one GPU dispatch.
++     * Bit-exact to the CPU twin / vanilla object (parity-gated).
++     */
++    private NoiseResult sampleBlendedNoise(final NoiseJob job) {
++        final BlendedNoiseSpec spec = job.blendedNoise();
++        final int count = job.count();
++        if (count == 0) {
++            return new NoiseResult(new double[0], 0, NAME);
++        }
++        final int mainOct = spec.mainOctaveCount();
++        final int limitOct = spec.limitOctaveCount();
++
++        // Host buffers (off-heap, freed in finally).
++        final IntBuffer mainPermBuf = MemoryUtil.memAllocInt(mainOct * 256);
++        final DoubleBuffer mainXoBuf = MemoryUtil.memAllocDouble(mainOct);
++        final DoubleBuffer mainYoBuf = MemoryUtil.memAllocDouble(mainOct);
++        final DoubleBuffer mainZoBuf = MemoryUtil.memAllocDouble(mainOct);
++        final IntBuffer mainPresentBuf = MemoryUtil.memAllocInt(mainOct);
++        final IntBuffer minPermBuf = MemoryUtil.memAllocInt(limitOct * 256);
++        final DoubleBuffer minXoBuf = MemoryUtil.memAllocDouble(limitOct);
++        final DoubleBuffer minYoBuf = MemoryUtil.memAllocDouble(limitOct);
++        final DoubleBuffer minZoBuf = MemoryUtil.memAllocDouble(limitOct);
++        final IntBuffer minPresentBuf = MemoryUtil.memAllocInt(limitOct);
++        final IntBuffer maxPermBuf = MemoryUtil.memAllocInt(limitOct * 256);
++        final DoubleBuffer maxXoBuf = MemoryUtil.memAllocDouble(limitOct);
++        final DoubleBuffer maxYoBuf = MemoryUtil.memAllocDouble(limitOct);
++        final DoubleBuffer maxZoBuf = MemoryUtil.memAllocDouble(limitOct);
++        final IntBuffer maxPresentBuf = MemoryUtil.memAllocInt(limitOct);
++        final IntBuffer bxBuf = MemoryUtil.memAllocInt(count);
++        final IntBuffer byBuf = MemoryUtil.memAllocInt(count);
++        final IntBuffer bzBuf = MemoryUtil.memAllocInt(count);
++
++        long mainPermMem = 0L, mainXoMem = 0L, mainYoMem = 0L, mainZoMem = 0L, mainPresentMem = 0L;
++        long minPermMem = 0L, minXoMem = 0L, minYoMem = 0L, minZoMem = 0L, minPresentMem = 0L;
++        long maxPermMem = 0L, maxXoMem = 0L, maxYoMem = 0L, maxZoMem = 0L, maxPresentMem = 0L;
++        long bxMem = 0L, byMem = 0L, bzMem = 0L, outMem = 0L;
++
++        try (MemoryStack stack = MemoryStack.stackPush()) {
++            final IntBuffer err = stack.mallocInt(1);
++
++            mainPermBuf.put(spec.mainPerm(), 0, mainOct * 256).flip();
++            mainXoBuf.put(spec.mainXo(), 0, mainOct).flip();
++            mainYoBuf.put(spec.mainYo(), 0, mainOct).flip();
++            mainZoBuf.put(spec.mainZo(), 0, mainOct).flip();
++            mainPresentBuf.put(spec.mainPresent(), 0, mainOct).flip();
++            minPermBuf.put(spec.minPerm(), 0, limitOct * 256).flip();
++            minXoBuf.put(spec.minXo(), 0, limitOct).flip();
++            minYoBuf.put(spec.minYo(), 0, limitOct).flip();
++            minZoBuf.put(spec.minZo(), 0, limitOct).flip();
++            minPresentBuf.put(spec.minPresent(), 0, limitOct).flip();
++            maxPermBuf.put(spec.maxPerm(), 0, limitOct * 256).flip();
++            maxXoBuf.put(spec.maxXo(), 0, limitOct).flip();
++            maxYoBuf.put(spec.maxYo(), 0, limitOct).flip();
++            maxZoBuf.put(spec.maxZo(), 0, limitOct).flip();
++            maxPresentBuf.put(spec.maxPresent(), 0, limitOct).flip();
++            bxBuf.put(job.blockXArray(), 0, count).flip();
++            byBuf.put(job.blockYArray(), 0, count).flip();
++            bzBuf.put(job.blockZArray(), 0, count).flip();
++
++            final int ro = CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR;
++            mainPermMem = clCreateBuffer(this.context, ro, mainPermBuf, err); checkCl(err.get(0), "b(mainPerm)");
++            mainXoMem = clCreateBuffer(this.context, ro, mainXoBuf, err); checkCl(err.get(0), "b(mainXo)");
++            mainYoMem = clCreateBuffer(this.context, ro, mainYoBuf, err); checkCl(err.get(0), "b(mainYo)");
++            mainZoMem = clCreateBuffer(this.context, ro, mainZoBuf, err); checkCl(err.get(0), "b(mainZo)");
++            mainPresentMem = clCreateBuffer(this.context, ro, mainPresentBuf, err); checkCl(err.get(0), "b(mainPresent)");
++            minPermMem = clCreateBuffer(this.context, ro, minPermBuf, err); checkCl(err.get(0), "b(minPerm)");
++            minXoMem = clCreateBuffer(this.context, ro, minXoBuf, err); checkCl(err.get(0), "b(minXo)");
++            minYoMem = clCreateBuffer(this.context, ro, minYoBuf, err); checkCl(err.get(0), "b(minYo)");
++            minZoMem = clCreateBuffer(this.context, ro, minZoBuf, err); checkCl(err.get(0), "b(minZo)");
++            minPresentMem = clCreateBuffer(this.context, ro, minPresentBuf, err); checkCl(err.get(0), "b(minPresent)");
++            maxPermMem = clCreateBuffer(this.context, ro, maxPermBuf, err); checkCl(err.get(0), "b(maxPerm)");
++            maxXoMem = clCreateBuffer(this.context, ro, maxXoBuf, err); checkCl(err.get(0), "b(maxXo)");
++            maxYoMem = clCreateBuffer(this.context, ro, maxYoBuf, err); checkCl(err.get(0), "b(maxYo)");
++            maxZoMem = clCreateBuffer(this.context, ro, maxZoBuf, err); checkCl(err.get(0), "b(maxZo)");
++            maxPresentMem = clCreateBuffer(this.context, ro, maxPresentBuf, err); checkCl(err.get(0), "b(maxPresent)");
++            bxMem = clCreateBuffer(this.context, ro, bxBuf, err); checkCl(err.get(0), "b(bx)");
++            byMem = clCreateBuffer(this.context, ro, byBuf, err); checkCl(err.get(0), "b(by)");
++            bzMem = clCreateBuffer(this.context, ro, bzBuf, err); checkCl(err.get(0), "b(bz)");
++            outMem = clCreateBuffer(this.context, CL_MEM_WRITE_ONLY, (long) count * Double.BYTES, err);
++            checkCl(err.get(0), "b(out)");
++
++            int a = 0;
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, mainPermMem), "a mainPerm");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, mainXoMem), "a mainXo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, mainYoMem), "a mainYo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, mainZoMem), "a mainZo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, mainPresentMem), "a mainPresent");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, minPermMem), "a minPerm");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, minXoMem), "a minXo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, minYoMem), "a minYo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, minZoMem), "a minZo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, minPresentMem), "a minPresent");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, maxPermMem), "a maxPerm");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, maxXoMem), "a maxXo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, maxYoMem), "a maxYo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, maxZoMem), "a maxZo");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, maxPresentMem), "a maxPresent");
++            checkCl(clSetKernelArg1d(this.blendedKernel, a++, spec.xzMultiplier()), "a xzMult");
++            checkCl(clSetKernelArg1d(this.blendedKernel, a++, spec.yMultiplier()), "a yMult");
++            checkCl(clSetKernelArg1d(this.blendedKernel, a++, spec.xzFactor()), "a xzFactor");
++            checkCl(clSetKernelArg1d(this.blendedKernel, a++, spec.yFactor()), "a yFactor");
++            checkCl(clSetKernelArg1d(this.blendedKernel, a++, spec.smearScaleMultiplier()), "a smear");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, bxMem), "a bx");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, byMem), "a by");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, bzMem), "a bz");
++            checkCl(clSetKernelArg1p(this.blendedKernel, a++, outMem), "a out");
++            checkCl(clSetKernelArg1i(this.blendedKernel, a++, count), "a count");
++
++            final PointerBuffer globalWork = stack.mallocPointer(1);
++            globalWork.put(0, count);
++            checkCl(clEnqueueNDRangeKernel(this.queue, this.blendedKernel, 1, null, globalWork, null, null, null),
++                "clEnqueueNDRangeKernel(blended)");
++            checkCl(clFinish(this.queue), "clFinish(blended)");
++
++            final double[] result = new double[count];
++            final DoubleBuffer resultBuf = MemoryUtil.memAllocDouble(count);
++            try {
++                checkCl(clEnqueueReadBuffer(this.queue, outMem, true, 0L, resultBuf, null, null),
++                    "clEnqueueReadBuffer(blended)");
++                resultBuf.get(result, 0, count);
++            } finally {
++                MemoryUtil.memFree(resultBuf);
++            }
++            return new NoiseResult(result, count, NAME);
++        } catch (final ComputeException ce) {
++            throw ce;
++        } catch (final Throwable t) {
++            throw new ComputeException("OpenCL sampleBlendedNoise failed: " + t, t);
++        } finally {
++            MemoryUtil.memFree(mainPermBuf); MemoryUtil.memFree(mainXoBuf); MemoryUtil.memFree(mainYoBuf);
++            MemoryUtil.memFree(mainZoBuf); MemoryUtil.memFree(mainPresentBuf);
++            MemoryUtil.memFree(minPermBuf); MemoryUtil.memFree(minXoBuf); MemoryUtil.memFree(minYoBuf);
++            MemoryUtil.memFree(minZoBuf); MemoryUtil.memFree(minPresentBuf);
++            MemoryUtil.memFree(maxPermBuf); MemoryUtil.memFree(maxXoBuf); MemoryUtil.memFree(maxYoBuf);
++            MemoryUtil.memFree(maxZoBuf); MemoryUtil.memFree(maxPresentBuf);
++            MemoryUtil.memFree(bxBuf); MemoryUtil.memFree(byBuf); MemoryUtil.memFree(bzBuf);
++            releaseMemQuietly(mainPermMem, mainXoMem, mainYoMem, mainZoMem, mainPresentMem,
++                minPermMem, minXoMem, minYoMem, minZoMem, minPresentMem,
++                maxPermMem, maxXoMem, maxYoMem, maxZoMem, maxPresentMem,
++                bxMem, byMem, bzMem, outMem);
++        }
++    }
++
+     @Override
+     public void close() {
+         if (this.closed) {
+             return;
+         }
+         this.closed = true;
++        releaseQuietly(this.blendedKernel, this.blendedProgram, 0L, 0L);
+         releaseQuietly(this.normalKernel, this.normalProgram, 0L, 0L);
+         releaseQuietly(this.kernel, this.program, this.queue, this.context);
+     }
+diff --git a/net/minecraft/world/level/levelgen/DensityFunctions.java b/net/minecraft/world/level/levelgen/DensityFunctions.java
+index 82f4d154b6a7d34e0dd22fdd2a89761c5cc14421..42b5b766f9741586b738d94e6d96226a879ef3a2 100644
+--- a/net/minecraft/world/level/levelgen/DensityFunctions.java
++++ b/net/minecraft/world/level/levelgen/DensityFunctions.java
+@@ -299,38 +299,15 @@ public final class DensityFunctions {
+ 
+         @Override
+         public void fillArray(final double[] output, final DensityFunction.ContextProvider contextProvider) {
+-            this.argument1.fillArray(output, contextProvider);
+-            switch (this.type) {
+-                case ADD:
+-                    double[] v2 = new double[output.length];
+-                    this.argument2.fillArray(v2, contextProvider);
+-
+-                    for (int i = 0; i < output.length; i++) {
+-                        output[i] += v2[i];
+-                    }
+-                    break;
+-                case MUL:
+-                    for (int i = 0; i < output.length; i++) {
+-                        double v = output[i];
+-                        output[i] = v == 0.0 ? 0.0 : v * this.argument2.compute(contextProvider.forIndex(i));
+-                    }
+-                    break;
+-                case MIN:
+-                    double min = this.argument2.minValue();
+-
+-                    for (int i = 0; i < output.length; i++) {
+-                        double v = output[i];
+-                        output[i] = v < min ? v : Math.min(v, this.argument2.compute(contextProvider.forIndex(i)));
+-                    }
+-                    break;
+-                case MAX:
+-                    double max = this.argument2.maxValue();
+-
+-                    for (int i = 0; i < output.length; i++) {
+-                        double v = output[i];
+-                        output[i] = v > max ? v : Math.max(v, this.argument2.compute(contextProvider.forIndex(i)));
+-                    }
+-            }
++            // coderyoMC (issue #19): on stock overworld the heavy BlendedNoise terrain
++            // leaf is reached only as the MUL/MIN/MAX argument2 of the terrain slide
++            // (lerp -> mul(factor, add(noise, const))), which vanilla evaluates per cell
++            // corner via compute() — so the batched BlendedNoise.fillArray GPU hook never
++            // fires. Route through the bridge: with gpu.worldgen.enabled=false (default)
++            // it does the EXACT upstream per-point combine (byte-for-byte vanilla); with
++            // GPU on it batch-fills argument2 over the whole cell-corner lattice (reaching
++            // BlendedNoise.fillArray -> one GPU dispatch) then combines identically.
++            com.coderyo.compute.Ap2GpuBridge.fillArray(output, contextProvider, this.type, this.argument1, this.argument2);
+         }
+ 
+         @Override
+diff --git a/net/minecraft/world/level/levelgen/synth/BlendedNoise.java b/net/minecraft/world/level/levelgen/synth/BlendedNoise.java
+index d586f52614c946d1931a2759b08537a92c300094..39d1a7fcfd671863ed662680a7c6be5596d2d541 100644
+--- a/net/minecraft/world/level/levelgen/synth/BlendedNoise.java
++++ b/net/minecraft/world/level/levelgen/synth/BlendedNoise.java
+@@ -144,6 +144,52 @@ public class BlendedNoise implements DensityFunction.SimpleFunction {
+         return Mth.clampedLerp(factor, blendMin / 512.0, blendMax / 512.0) / 128.0;
+     }
+ 
++    // coderyoMC (issue #19 / design-spec §6.2): batched GPU offload of the stock 3D
++    // terrain density at the NoiseChunk interpolator cell-corner lattice. BlendedNoise
++    // is a SimpleFunction whose default fillArray loops compute() per cell corner; the
++    // interpolator's tree-walk reaches it on stock overworld gen. We override fillArray
++    // to route the cell-corner batch through the ComputeBackend SPI. With
++    // gpu.worldgen.enabled=false (default) this delegates to the EXACT upstream per-point
++    // fill below (contextProvider.fillAllDirectly) — byte-for-byte vanilla.
++    @Override
++    public void fillArray(final double[] output, final DensityFunction.ContextProvider contextProvider) {
++        com.coderyo.compute.BlendedNoiseGpuBridge.fillArray(this, output, contextProvider);
++    }
++
++    // Read-only accessors exporting private state so the GPU kernel can reproduce
++    // compute() bit-exactly (parity-gated). No CPU behavior change.
++    public PerlinNoise coderyoMinLimitNoise() {
++        return this.minLimitNoise;
++    }
++
++    public PerlinNoise coderyoMaxLimitNoise() {
++        return this.maxLimitNoise;
++    }
++
++    public PerlinNoise coderyoMainNoise() {
++        return this.mainNoise;
++    }
++
++    public double coderyoXzMultiplier() {
++        return this.xzMultiplier;
++    }
++
++    public double coderyoYMultiplier() {
++        return this.yMultiplier;
++    }
++
++    public double coderyoXzFactor() {
++        return this.xzFactor;
++    }
++
++    public double coderyoYFactor() {
++        return this.yFactor;
++    }
++
++    public double coderyoSmearScaleMultiplier() {
++        return this.smearScaleMultiplier;
++    }
++
+     @Override
+     public double minValue() {
+         return -this.maxValue();
