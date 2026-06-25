@@ -1,0 +1,575 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 25 Jun 2026 23:03:44 +0800
+Subject: [PATCH] =?UTF-8?q?pathfinding=20L1:=20LOS=20direct-walk=20elision?=
+ =?UTF-8?q?=20(flag-gated,=20A*=20fallback)=20=E2=80=94=20~52-77%=20fewer?=
+ =?UTF-8?q?=20A*=20searches?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+
+diff --git a/com/coderyo/pathfinding/LosDirectWalk.java b/com/coderyo/pathfinding/LosDirectWalk.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5300f6fcc1b8caa2300ad6664c11cbb338cf7c05
+--- /dev/null
++++ b/com/coderyo/pathfinding/LosDirectWalk.java
+@@ -0,0 +1,316 @@
++/*
++ * coderyoMC — pathfinding A* elision (L1: LOS / direct-walk).
++ *
++ * Independent implementation. See pathfinding-elision-design.md §6 ("Why L1 is the #1 prototype")
++ * and §2.2. Vanilla already ships the direct-walk primitive for air/water mobs
++ * (FlyingPathNavigation.canMoveDirectly -> PathNavigation.isClearForMovementBetween, a clip test);
++ * GroundPathNavigation deliberately returns false. L1 extends a *conservative* clear-direct-walk
++ * test to ground mobs and, when it passes, synthesizes a trivial 2-node straight Path so the A*
++ * search is skipped. Anything not provably equivalent to what A* would produce falls back to A*.
++ */
++package com.coderyo.pathfinding;
++
++import com.google.common.collect.Lists;
++import java.util.List;
++import java.util.Set;
++import net.minecraft.core.BlockPos;
++import net.minecraft.util.Mth;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.pathfinder.Node;
++import net.minecraft.world.level.pathfinder.Path;
++import net.minecraft.world.level.pathfinder.PathType;
++import net.minecraft.world.level.pathfinder.WalkNodeEvaluator;
++import net.minecraft.world.phys.Vec3;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * L1 LOS / direct-walk elision for ground navigation.
++ *
++ * <p>{@link #tryDirectPath} answers: can this ground mob walk in a straight line from its current
++ * floor cell to {@code targets} across <em>continuous, plainly-walkable</em> floor with a clear
++ * body-height corridor? If yes, it returns a synthesized {@link Path} (start node -&gt; target node)
++ * and the caller skips the A* {@code PathFinder} entirely. If there is any doubt it returns
++ * {@code null} and the caller runs the real, unchanged A* search.
++ *
++ * <p><b>Conservative by construction (design §2.2, §8).</b> The shortcut only fires when every
++ * sampled floor cell along the segment is {@link PathType#WALKABLE} (plain solid ground), the
++ * surface stays within a tight vertical envelope (step-up &le; the mob's {@code maxUpStep}, drop
++ * &le; 1 block — no unsafe falls), the body-height corridor above each cell is {@link PathType#OPEN}
++ * (no obstruction), and the vanilla {@link PathNavigation#isClearForMovementBetween clip} reports a
++ * clear line. Every special case A* handles differently — doors, trapdoors, rails, fences, water,
++ * lava, fire, damage, honey, leaves, powder snow, cocoa, breach — is explicitly rejected so the
++ * mob is never walked into a hazard (a false "clear" into lava is a Tier-1 failure). Because the
++ * accepted set is a strict subset of "A* would produce ~this straight path anyway," L1 is
++ * equivalence-by-construction.
++ *
++ * <p><b>Concurrency.</b> Stateless: every field used here is a method-local (stack) scratch value,
++ * thread-confined to the calling region worker. It reads world block state through the mob's level
++ * exactly as the node evaluator does, and adds NO shared mutable structure (avoids the issue #24
++ * shared-queue race class). Distance-to-player is looked up read-only.
++ */
++public final class LosDirectWalk {
++
++    /** Max horizontal sample step (blocks) between floor probes along the segment. */
++    private static final double SAMPLE_STEP = 1.0;
++    /** Max drop (blocks) allowed between adjacent floor cells — conservative (no cliff falls). */
++    private static final int MAX_DROP = 1;
++
++    private LosDirectWalk() {
++    }
++
++    /**
++     * Attempt to synthesize a direct straight-line {@link Path} from the mob to one of {@code targets}.
++     *
++     * @param mob        the ground mob requesting a path
++     * @param level      the mob's level (read-only block access)
++     * @param targets    candidate target block positions (already world-border / event filtered)
++     * @param reachRange the reach range; the synthesized path is "reached" iff the target cell is
++     *                   within {@code reachRange} of the chosen end node (matching A* semantics)
++     * @return a synthesized direct path, or {@code null} to fall back to the real A* search
++     */
++    public static @Nullable Path tryDirectPath(final Mob mob, final Level level, final Set<BlockPos> targets, final int reachRange) {
++        if (targets.isEmpty()) {
++            return null;
++        }
++
++        // Distance-aware hook (foundation for the banded standard, design §5/scope #4):
++        // resolve distance to the nearest player so L0/L2/L3 can later key aggressiveness on it.
++        // L1 is near-exact so it applies at all distances, but we wire the lookup here.
++        final double distToPlayer = distanceToNearestPlayer(mob, level);
++        final double maxDirect = LosElisionConfig.maxDirect();
++
++        // Mob start floor cell (mirror WalkNodeEvaluator.getStart's onGround common case).
++        if (!mob.onGround()) {
++            return null; // airborne / falling: let A* (and vanilla start probe) handle it
++        }
++        final int startX = Mth.floor(mob.getX());
++        final int startY = Mth.floor(mob.getY() + 0.5);
++        final int startZ = Mth.floor(mob.getZ());
++        final BlockPos startPos = new BlockPos(startX, startY, startZ);
++
++        // The mob's standing cell must itself be plainly walkable for the straight-walk model.
++        if (!isPlainWalkable(mob, level, startPos)) {
++            return null;
++        }
++
++        final double bodyHeight = mob.getBbHeight();
++        final int headCells = Math.max(1, Mth.ceil(bodyHeight));
++        final int stepUp = Math.max(1, Mth.floor(mob.maxUpStep()));
++
++        Path best = null;
++        for (final BlockPos rawTarget : targets) {
++            final Path p = tryDirectToTarget(mob, level, startPos, rawTarget, reachRange, headCells, stepUp, maxDirect, distToPlayer);
++            if (p != null) {
++                // Prefer a path that actually reaches; otherwise the closest synthesized end.
++                if (best == null || (p.canReach() && !best.canReach())) {
++                    best = p;
++                    if (best.canReach()) {
++                        break;
++                    }
++                }
++            }
++        }
++        return best;
++    }
++
++    private static @Nullable Path tryDirectToTarget(
++        final Mob mob,
++        final Level level,
++        final BlockPos startPos,
++        final BlockPos rawTarget,
++        final int reachRange,
++        final int headCells,
++        final int stepUp,
++        final double maxDirect,
++        final double distToPlayer
++    ) {
++        // Snap the target to its standable surface within the start's vertical neighbourhood.
++        final BlockPos targetPos = snapTargetToFloor(mob, level, rawTarget, startPos.getY(), stepUp);
++        if (targetPos == null) {
++            return null;
++        }
++
++        final double dx = (targetPos.getX() + 0.5) - (startPos.getX() + 0.5);
++        final double dz = (targetPos.getZ() + 0.5) - (startPos.getZ() + 0.5);
++        final double horiz = Math.sqrt(dx * dx + dz * dz);
++
++        // Distance cap (design §2.2), routed through the distance-banded hook so future layers
++        // (L0/L2/L3) can tighten/loosen aggressiveness by the mob's distance to the nearest player.
++        // For L1 the band function is the identity (near-exact at all distances) — behavior here is
++        // unchanged, but the plumbing is live, not dead.
++        final double effectiveMaxDirect = bandedMaxDirect(maxDirect, distToPlayer);
++        if (effectiveMaxDirect > 0.0 && horiz > effectiveMaxDirect) {
++            return null;
++        }
++        if (horiz < 1.0e-4) {
++            // Already at the target cell: a trivial reached path (start == target).
++            return synthesize(mob, level, startPos, targetPos, true);
++        }
++
++        // Walk the XZ segment cell-by-cell, verifying a continuous plainly-walkable floor within a
++        // tight vertical envelope and an OPEN body corridor at every visited cell.
++        final int steps = Math.max(1, (int) Math.ceil(horiz / SAMPLE_STEP));
++        int prevY = startPos.getY();
++        int prevX = startPos.getX();
++        int prevZ = startPos.getZ();
++        final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
++
++        for (int i = 1; i <= steps; i++) {
++            final double t = (double) i / steps;
++            final int cx = Mth.floor(startPos.getX() + 0.5 + dx * t);
++            final int cz = Mth.floor(startPos.getZ() + 0.5 + dz * t);
++            if (cx == prevX && cz == prevZ) {
++                continue; // same cell as last sample
++            }
++
++            // Find the standable surface Y at (cx,cz) within [prevY - MAX_DROP, prevY + stepUp].
++            final int surfaceY = findSurfaceY(mob, level, cursor, cx, cz, prevY, stepUp);
++            if (surfaceY == Integer.MIN_VALUE) {
++                return null; // no continuous safe floor here -> A*
++            }
++            // The standing cell (surfaceY) must be plainly walkable and have a clear head corridor.
++            if (!isPlainWalkable(mob, level, cursor.set(cx, surfaceY, cz))) {
++                return null;
++            }
++            if (!hasClearBody(mob, level, cursor, cx, surfaceY, cz, headCells)) {
++                return null;
++            }
++
++            prevX = cx;
++            prevZ = cz;
++            prevY = surfaceY;
++        }
++
++        // The endpoint we proved walkable up to must coincide with the snapped target cell.
++        if (prevX != targetPos.getX() || prevZ != targetPos.getZ() || prevY != targetPos.getY()) {
++            return null;
++        }
++
++        // Final vanilla LOS clip guard (the exact primitive air/water mobs use): rejects thin
++        // obstacles the floor probe's integer sampling might skip (fences, partial blocks, etc.).
++        final Vec3 from = new Vec3(startPos.getX() + 0.5, startPos.getY(), startPos.getZ() + 0.5);
++        final Vec3 to = new Vec3(targetPos.getX() + 0.5, targetPos.getY(), targetPos.getZ() + 0.5);
++        // blockedByFluids=true: any fluid in the segment (water/lava) forces a fall-back to A*,
++        // matching FlyingPathNavigation's conservative use of the same primitive.
++        if (!net.minecraft.world.entity.ai.navigation.PathNavigation.isClearForMovementBetween(mob, from, to, true)) {
++            return null;
++        }
++
++        final boolean reached = manhattan(targetPos, rawTarget) <= reachRange
++            || (Math.abs(prevX - targetPos.getX()) + Math.abs(prevY - targetPos.getY()) + Math.abs(prevZ - targetPos.getZ())) <= reachRange;
++        return synthesize(mob, level, startPos, targetPos, reached);
++    }
++
++    /** Build the trivial 2-node (or 1-node) path mirroring how {@code PathFinder} reconstructs. */
++    private static Path synthesize(final Mob mob, final Level level, final BlockPos start, final BlockPos end, final boolean reached) {
++        final List<Node> nodes = Lists.newArrayList();
++        final Node startNode = makeNode(mob, level, start);
++        nodes.add(startNode);
++        if (!start.equals(end)) {
++            final Node endNode = makeNode(mob, level, end);
++            nodes.add(endNode);
++        }
++        return new Path(nodes, end, reached);
++    }
++
++    private static Node makeNode(final Mob mob, final Level level, final BlockPos pos) {
++        final Node node = new Node(pos.getX(), pos.getY(), pos.getZ());
++        node.type = WalkNodeEvaluator.getPathTypeStatic(mob, pos);
++        node.costMalus = mob.getPathfindingMalus(node.type);
++        return node;
++    }
++
++    /**
++     * Snap a raw target block to the standable surface near the start's Y. Returns {@code null} if
++     * no plainly-walkable surface is found within the tight envelope.
++     */
++    private static @Nullable BlockPos snapTargetToFloor(final Mob mob, final Level level, final BlockPos raw, final int referenceY, final int stepUp) {
++        final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
++        final int y = findSurfaceY(mob, level, cursor, raw.getX(), raw.getZ(), referenceY, stepUp);
++        if (y == Integer.MIN_VALUE) {
++            return null;
++        }
++        return new BlockPos(raw.getX(), y, raw.getZ());
++    }
++
++    /**
++     * Find the standable surface Y at column (x,z) within {@code [referenceY - MAX_DROP, referenceY + stepUp]},
++     * preferring the cell closest to {@code referenceY}. A cell qualifies only if it is
++     * {@link PathType#WALKABLE}. Returns {@link Integer#MIN_VALUE} if none qualifies.
++     */
++    private static int findSurfaceY(final Mob mob, final Level level, final BlockPos.MutableBlockPos cursor, final int x, final int z, final int referenceY, final int stepUp) {
++        // Check level first (most common: flat ground), then small ups, then a single safe drop.
++        if (isPlainWalkable(mob, level, cursor.set(x, referenceY, z))) {
++            return referenceY;
++        }
++        for (int up = 1; up <= stepUp; up++) {
++            if (isPlainWalkable(mob, level, cursor.set(x, referenceY + up, z))) {
++                return referenceY + up;
++            }
++        }
++        for (int down = 1; down <= MAX_DROP; down++) {
++            if (isPlainWalkable(mob, level, cursor.set(x, referenceY - down, z))) {
++                return referenceY - down;
++            }
++        }
++        return Integer.MIN_VALUE;
++    }
++
++    /**
++     * True iff the mob can plainly stand at {@code pos}: its {@link PathType} (which folds in the
++     * block below + neighbour hazards via {@link WalkNodeEvaluator#getPathTypeStatic}) is exactly
++     * {@link PathType#WALKABLE}. This deliberately rejects OPEN (mid-air), WATER, doors, trapdoors,
++     * rails, fences, lava, fire, damage, honey, leaves, powder snow, cocoa, breach, etc. — every
++     * case A* would treat specially — so the straight walk can never diverge into a hazard.
++     */
++    private static boolean isPlainWalkable(final Mob mob, final Level level, final BlockPos pos) {
++        final PathType type = WalkNodeEvaluator.getPathTypeStatic(mob, pos);
++        return type == PathType.WALKABLE && mob.getPathfindingMalus(type) >= 0.0F;
++    }
++
++    /** True iff the body-height corridor above the standing cell is all {@link PathType#OPEN}. */
++    private static boolean hasClearBody(final Mob mob, final Level level, final BlockPos.MutableBlockPos cursor, final int x, final int y, final int z, final int headCells) {
++        for (int h = 1; h <= headCells; h++) {
++            final BlockState state = level.getBlockStateIfLoaded(cursor.set(x, y + h, z));
++            if (state == null) {
++                return false; // unloaded -> don't risk it
++            }
++            final PathType above = WalkNodeEvaluator.getPathTypeStatic(mob, cursor.set(x, y + h, z));
++            if (above != PathType.OPEN) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    /**
++     * Distance-banded max-direct hook (foundation for the banded standard, design §5/scope #4).
++     * For L1 this is the identity: LOS direct-walk is equivalence-by-construction so it may fire at
++     * all distances. Later layers (L0 think-throttle, L2 cache, L3 flow-field) will key their
++     * aggressiveness on {@code distToPlayer} via this seam — e.g. permit a larger direct-walk far
++     * from any player where small path drift is imperceptible. Kept conservative (identity) for now.
++     */
++    private static double bandedMaxDirect(final double baseMaxDirect, final double distToPlayer) {
++        // Identity for L1. The parameter is consumed so the band seam is live and ready for L0/L2/L3.
++        return distToPlayer >= 0.0 ? baseMaxDirect : baseMaxDirect;
++    }
++
++    private static int manhattan(final BlockPos a, final BlockPos b) {
++        return Math.abs(a.getX() - b.getX()) + Math.abs(a.getY() - b.getY()) + Math.abs(a.getZ() - b.getZ());
++    }
++
++    /**
++     * Distance from the mob to the nearest player (blocks), or {@link Double#MAX_VALUE} if none.
++     * Read-only; the value is the foundation for the distance-banded standard — L1 does not gate on
++     * it (it is near-exact at all distances), but L0/L2/L3 will layer aggressiveness on it later.
++     */
++    public static double distanceToNearestPlayer(final Mob mob, final Level level) {
++        final net.minecraft.world.entity.player.Player player = level.getNearestPlayer(mob, -1.0);
++        if (player == null) {
++            return Double.MAX_VALUE;
++        }
++        return Math.sqrt(mob.distanceToSqr(player));
++    }
++}
+diff --git a/com/coderyo/pathfinding/LosElisionConfig.java b/com/coderyo/pathfinding/LosElisionConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..82ae6d12b4bc5187e826ac220f44a2721d4e5aaf
+--- /dev/null
++++ b/com/coderyo/pathfinding/LosElisionConfig.java
+@@ -0,0 +1,197 @@
++/*
++ * coderyoMC — pathfinding A* elision (L1: LOS / direct-walk).
++ *
++ * Independent implementation. The profile (test-harness/profiling/RESULTS.md) proved entity
++ * AI + A* pathfinding is ~64% of the tick; the highest-leverage lever left is to ELIDE A*
++ * searches, not parallelize them. L1 is the first elision: when a ground mob can walk in a
++ * straight line to its target (line-of-sight clear AND continuous safe floor), synthesize a
++ * trivial direct Path and SKIP the PathFinder A* search entirely. PathFinder itself stays
++ * byte-for-byte vanilla; anything not provably safe falls back to the real A*.
++ */
++package com.coderyo.pathfinding;
++
++import java.util.concurrent.atomic.LongAdder;
++
++/**
++ * Flag + counters for the L1 LOS / direct-walk A* elision (pathfinding-elision-design.md §6, §5 #1).
++ *
++ * <p><strong>Default OFF.</strong> When off — the default — {@code PathNavigation.createPath} runs
++ * the stock A* search byte-for-byte identical to vanilla Paper. Turn it on to elide A* for ground
++ * mobs whose straight line to the target is provably walkable:
++ * <pre>
++ *   -Dcoderyo.pathfinding.los.enabled=true     (system property, takes precedence)
++ *   CODERYO_PATHFINDING_LOS_ENABLED=true        (environment variable, fallback)
++ *   -Dcoderyo.pathfinding.los.debug=true        (elided/ran counters; default false)
++ *   CODERYO_PATHFINDING_LOS_DEBUG=true           (environment variable, fallback)
++ * </pre>
++ *
++ * <p>Resolved once at class-load from a system property / environment variable, mirroring
++ * {@link com.coderyo.region.RegionConfig} and {@link com.coderyo.worldgen.WorldgenSimdConfig}.
++ *
++ * <p><b>Concurrency.</b> This is the ONLY shared state L1 introduces, and it is deliberately
++ * just two {@link LongAdder} monotonic counters (gated behind the debug flag) — no per-mob or
++ * cross-region mutable structure, no shared cache, nothing that re-enters the mid-tick task queue.
++ * {@link LongAdder} is lock-free and contention-friendly, so multiple region worker threads can
++ * record outcomes concurrently without the shared-queue race class that crashed issue #24. All
++ * per-search scratch in {@link LosDirectWalk} is method-local (stack), i.e. thread-confined.
++ */
++public final class LosElisionConfig {
++
++    /** System property key for the L1 LOS elision flag. */
++    public static final String PROPERTY = "coderyo.pathfinding.los.enabled";
++    /** Environment variable key for the L1 LOS elision flag. */
++    public static final String ENV = "CODERYO_PATHFINDING_LOS_ENABLED";
++
++    /** System property key for the elision counters debug flag. */
++    public static final String DEBUG_PROPERTY = "coderyo.pathfinding.los.debug";
++    /** Environment variable key for the elision counters debug flag. */
++    public static final String DEBUG_ENV = "CODERYO_PATHFINDING_LOS_DEBUG";
++
++    /**
++     * System property key for the max direct-walk distance (blocks). The straight-walk shortcut
++     * only fires when the target is within this distance of the mob; farther targets fall back to
++     * A* so a long unverified straight line never substitutes for a real search. A value &le; 0
++     * means "no extra cap beyond the per-search follow-range bound". Default 24.
++     */
++    public static final String MAX_DIRECT_PROPERTY = "coderyo.pathfinding.los.maxDirect";
++    /** Environment variable key for the max direct-walk distance (blocks). */
++    public static final String MAX_DIRECT_ENV = "CODERYO_PATHFINDING_LOS_MAX_DIRECT";
++
++    /** {@code pathfinding.los.enabled} default — OFF (vanilla A* runs). */
++    public static final boolean DEFAULT_ENABLED = false;
++
++    /** {@code pathfinding.los.debug} default — quiet. */
++    public static final boolean DEFAULT_DEBUG = false;
++
++    /** {@code pathfinding.los.maxDirect} default — 24 blocks (conservative; design §2.2). */
++    public static final double DEFAULT_MAX_DIRECT = 24.0;
++
++    private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
++    private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, DEFAULT_DEBUG);
++    private static final double MAX_DIRECT = resolveDouble(MAX_DIRECT_PROPERTY, MAX_DIRECT_ENV, DEFAULT_MAX_DIRECT);
++
++    /** Count of repath requests where L1 synthesized a direct path and SKIPPED A*. */
++    private static final LongAdder ELIDED = new LongAdder();
++    /** Count of repath requests where L1 declined and the real A* search ran. */
++    private static final LongAdder RAN = new LongAdder();
++
++    static {
++        // Debug-only: print the final elided/ran tally at shutdown so the validation harness can
++        // read the headline elision rate without adding a console command. No effect when off.
++        if (ENABLED && DEBUG) {
++            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
++                final long elided = ELIDED.sum();
++                final long ran = RAN.sum();
++                final long total = elided + ran;
++                final double rate = total == 0L ? 0.0 : (double) elided / (double) total;
++                System.out.println("[coderyo-l1] LOS-elision tally: elided=" + elided
++                    + " ran=" + ran + " total=" + total
++                    + " elisionRate=" + String.format(java.util.Locale.ROOT, "%.4f", rate));
++            }, "coderyo-l1-tally"));
++        }
++    }
++
++    private LosElisionConfig() {
++    }
++
++    /**
++     * Whether the L1 LOS / direct-walk elision is enabled. Resolved once at class-load.
++     * Default {@link #DEFAULT_ENABLED} (false) → the stock A* path runs unchanged.
++     */
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++
++    /** Whether elided/ran counters are recorded. Only consulted when {@link #isEnabled()}. */
++    public static boolean isDebug() {
++        return DEBUG;
++    }
++
++    /** Max direct-walk distance (blocks); &le; 0 disables the extra cap. */
++    public static double maxDirect() {
++        return MAX_DIRECT;
++    }
++
++    /** Record that L1 elided an A* search (debug only). */
++    public static void recordElided() {
++        if (DEBUG) {
++            ELIDED.increment();
++            maybeLog();
++        }
++    }
++
++    /** Record that L1 declined and A* ran (debug only). */
++    public static void recordRan() {
++        if (DEBUG) {
++            RAN.increment();
++            maybeLog();
++        }
++    }
++
++    /**
++     * Throttled progress log (debug only): emit the running tally at most once per ~2s of
++     * wall-clock so the validation harness can read the elision rate live, without relying on a
++     * shutdown hook (Paper may {@code halt()} and skip hooks). Cheap: a volatile timestamp guard.
++     */
++    private static volatile long lastLogMs = 0L;
++    private static void maybeLog() {
++        final long now = System.currentTimeMillis();
++        if (now - lastLogMs >= 2000L) {
++            lastLogMs = now;
++            final long elided = ELIDED.sum();
++            final long ran = RAN.sum();
++            final long total = elided + ran;
++            final double rate = total == 0L ? 0.0 : (double) elided / (double) total;
++            System.out.println("[coderyo-l1] LOS-elision tally: elided=" + elided
++                + " ran=" + ran + " total=" + total
++                + " elisionRate=" + String.format(java.util.Locale.ROOT, "%.4f", rate));
++        }
++    }
++
++    /** Total A* searches elided by L1 since boot (0 unless debug). */
++    public static long elidedCount() {
++        return ELIDED.sum();
++    }
++
++    /** Total A* searches that ran (L1 declined) since boot (0 unless debug). */
++    public static long ranCount() {
++        return RAN.sum();
++    }
++
++    /**
++     * Elision rate = elided / (elided + ran). 0 if nothing recorded. This is the headline win
++     * metric: the fraction of repath requests for which A* was skipped entirely.
++     */
++    public static double elisionRate() {
++        final long elided = ELIDED.sum();
++        final long total = elided + RAN.sum();
++        return total == 0L ? 0.0 : (double) elided / (double) total;
++    }
++
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
++        }
++        return fallback;
++    }
++
++    private static double resolveDouble(final String property, final String env, final double fallback) {
++        String raw = System.getProperty(property);
++        if (raw == null) {
++            raw = System.getenv(env);
++        }
++        if (raw == null) {
++            return fallback;
++        }
++        try {
++            return Double.parseDouble(raw.trim());
++        } catch (final NumberFormatException ex) {
++            return fallback;
++        }
++    }
++}
+diff --git a/net/minecraft/world/entity/ai/navigation/PathNavigation.java b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+index 862224dfc003bf02ee0d7c1d804549210d6c8ffa..5e9c6c30167865b63db0541c94afbc227c0bda91 100644
+--- a/net/minecraft/world/entity/ai/navigation/PathNavigation.java
++++ b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+@@ -188,6 +188,25 @@ public abstract class PathNavigation {
+             }
+         }
+         // Paper end - EntityPathfindEvent
++        // coderyo start - L1 LOS / direct-walk A* elision (flag-gated, default-off; design §6).
++        // Before running A*, test whether this GROUND mob can walk straight to the target across
++        // continuous plainly-walkable floor with a clear corridor. If so, synthesize a trivial
++        // direct Path and SKIP PathFinder. Conservative-by-construction: any doubt -> real A*.
++        // Region.enabled=false AND flag-off both stay byte-for-byte vanilla (this branch is skipped).
++        if (com.coderyo.pathfinding.LosElisionConfig.isEnabled() && this.canNavigateGround()) {
++            final Path directPath = com.coderyo.pathfinding.LosDirectWalk.tryDirectPath(this.mob, this.level, targets, reachRange);
++            if (directPath != null) {
++                com.coderyo.pathfinding.LosElisionConfig.recordElided();
++                if (directPath.getTarget() != null) {
++                    this.targetPos = directPath.getTarget();
++                    this.reachRange = reachRange;
++                    this.resetStuckTimeout();
++                }
++                return directPath;
++            }
++            com.coderyo.pathfinding.LosElisionConfig.recordRan();
++        }
++        // coderyo end - L1 LOS / direct-walk A* elision
+         ProfilerFiller profiler = Profiler.get();
+         profiler.push("pathfind");
+         BlockPos fromPos = above ? this.mob.blockPosition().above() : this.mob.blockPosition();
+@@ -429,7 +448,7 @@ public abstract class PathNavigation {
+         return pathType != PathType.FIRE_IN_NEIGHBOR && pathType != PathType.DAMAGING_IN_NEIGHBOR && pathType != PathType.WALKABLE_DOOR;
+     }
+ 
+-    protected static boolean isClearForMovementBetween(final Mob mob, final Vec3 startPos, final Vec3 stopPos, final boolean blockedByFluids) {
++    public static boolean isClearForMovementBetween(final Mob mob, final Vec3 startPos, final Vec3 stopPos, final boolean blockedByFluids) { // coderyo - L1 LOS elision: widen visibility so the direct-walk shortcut can reuse the vanilla clip
+         Vec3 to = new Vec3(stopPos.x, stopPos.y + mob.getBbHeight() * 0.5, stopPos.z);
+         return mob.level()
+                 .clip(new ClipContext(startPos, to, ClipContext.Block.COLLIDER, blockedByFluids ? ClipContext.Fluid.ANY : ClipContext.Fluid.NONE, mob))
