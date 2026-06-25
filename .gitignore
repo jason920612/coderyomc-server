@@ -24,6 +24,10 @@ build/
 .DS_Store
 Thumbs.db
 
+# Patch rejects
+*.rej
+*.orig
+
 # Java
 *.class
 hs_err_pid*
