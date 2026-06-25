@@ -1,0 +1,974 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Fri, 26 Jun 2026 05:09:04 +0800
+Subject: [PATCH] async pathfinding: snapshot-based off-thread A* (flag-gated)
+
+
+diff --git a/com/coderyo/pathfinding/AsyncPathConfig.java b/com/coderyo/pathfinding/AsyncPathConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..37b2b413f0c0e2c5f88ab3e4d9783ee4680c7de2
+--- /dev/null
++++ b/com/coderyo/pathfinding/AsyncPathConfig.java
+@@ -0,0 +1,187 @@
++/*
++ * coderyoMC — async pathfinding (snapshot-based off-thread A*).
++ *
++ * The LOD engine (L1 elide + L0 throttle + per-type policy) already cut the FAR-mob A*
++ * load. But NEAR a player, mobs run FULL A* at full fidelity, and a dense horde next to a
++ * player sits in ONE region (one tick thread) — that residual A* blocks the region's tick.
++ * This subsystem moves that residual A* OFF the region tick thread onto a shared worker
++ * pool, against an IMMUTABLE per-search block SNAPSHOT taken on the tick thread, so the
++ * region tick never blocks on it and never races live chunk data. Bounded 1-tick staleness
++ * (vanilla already has path latency). Flag-gated, default OFF.
++ */
++package com.coderyo.pathfinding;
++
++import java.util.concurrent.atomic.LongAdder;
++
++/**
++ * Flag + tunables + counters for async (off-thread) pathfinding.
++ *
++ * <p><strong>Default OFF.</strong> When off — the default — {@code PathNavigation.createPath}
++ * runs the stock SYNC A* search byte-for-byte identical to vanilla Paper. Async only engages
++ * when BOTH {@code region.enabled} (the parallel-tick core is live) and this flag are on:
++ * <pre>
++ *   -Dcoderyo.pathfinding.async.enabled=true   (system property, takes precedence)
++ *   CODERYO_PATHFINDING_ASYNC_ENABLED=true      (environment variable, fallback)
++ *   -Dcoderyo.pathfinding.async.debug=true      (dispatch/complete/fallback counters)
++ *   -Dcoderyo.pathfinding.async.maxBox=64       (block snapshot box cap per axis; default 64)
++ *   -Dcoderyo.pathfinding.async.threads=N       (worker pool size; default availProc/2, min 2)
++ * </pre>
++ *
++ * <p>Resolved once at class-load from a system property / environment variable, mirroring
++ * {@link com.coderyo.region.RegionConfig} and {@link LosElisionConfig}.
++ *
++ * <p><b>Concurrency.</b> The only shared state here is lock-free {@link LongAdder} counters
++ * (gated behind the debug flag). The worker pool and per-search snapshot live in
++ * {@link AsyncPathfindingService}; each task is self-contained (its own immutable snapshot),
++ * so no worker ever touches another region's live data — single-writer-per-region preserved.
++ */
++public final class AsyncPathConfig {
++
++    public static final String PROPERTY = "coderyo.pathfinding.async.enabled";
++    public static final String ENV = "CODERYO_PATHFINDING_ASYNC_ENABLED";
++    public static final String DEBUG_PROPERTY = "coderyo.pathfinding.async.debug";
++    public static final String DEBUG_ENV = "CODERYO_PATHFINDING_ASYNC_DEBUG";
++    /** Max snapshot box half-extent per axis (blocks) around the start→goal span. */
++    public static final String MAX_BOX_PROPERTY = "coderyo.pathfinding.async.maxBox";
++    public static final String MAX_BOX_ENV = "CODERYO_PATHFINDING_ASYNC_MAX_BOX";
++    /** Worker pool thread count. */
++    public static final String THREADS_PROPERTY = "coderyo.pathfinding.async.threads";
++    public static final String THREADS_ENV = "CODERYO_PATHFINDING_ASYNC_THREADS";
++
++    public static final boolean DEFAULT_ENABLED = false;
++    public static final boolean DEFAULT_DEBUG = false;
++    /** 64-block box cap (search box capped to ~followRange; beyond it → SYNC fallback). */
++    public static final int DEFAULT_MAX_BOX = 64;
++    public static final int DEFAULT_THREADS = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
++
++    private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
++    private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, DEFAULT_DEBUG);
++    private static final int MAX_BOX = clampInt(resolveInt(MAX_BOX_PROPERTY, MAX_BOX_ENV, DEFAULT_MAX_BOX), 16, 256);
++    private static final int THREADS = clampInt(resolveInt(THREADS_PROPERTY, THREADS_ENV, DEFAULT_THREADS), 1, 64);
++
++    /** Searches dispatched to the worker pool. */
++    private static final LongAdder DISPATCHED = new LongAdder();
++    /** Searches that completed off-thread and whose Path was applied. */
++    private static final LongAdder COMPLETED = new LongAdder();
++    /** Requests that fell back to SYNC A* (box over cap, snapshot failed, or pool saturated). */
++    private static final LongAdder SYNC_FALLBACK = new LongAdder();
++    /** Ticks a mob idled/coasted waiting for an in-flight async result. */
++    private static final LongAdder COASTED = new LongAdder();
++
++    static {
++        if (ENABLED && DEBUG) {
++            Runtime.getRuntime().addShutdownHook(new Thread(AsyncPathConfig::printTally, "coderyo-async-path-tally"));
++        }
++    }
++
++    private AsyncPathConfig() {
++    }
++
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++
++    public static boolean isDebug() {
++        return DEBUG;
++    }
++
++    /** Snapshot box cap per axis (blocks). A request needing a larger box → SYNC fallback. */
++    public static int maxBox() {
++        return MAX_BOX;
++    }
++
++    public static int threads() {
++        return THREADS;
++    }
++
++    public static void recordDispatched() {
++        if (DEBUG) {
++            DISPATCHED.increment();
++            maybeLog();
++        }
++    }
++
++    public static void recordCompleted() {
++        if (DEBUG) {
++            COMPLETED.increment();
++        }
++    }
++
++    public static void recordSyncFallback() {
++        if (DEBUG) {
++            SYNC_FALLBACK.increment();
++            maybeLog();
++        }
++    }
++
++    public static void recordCoasted() {
++        if (DEBUG) {
++            COASTED.increment();
++        }
++    }
++
++    private static volatile long lastLogMs = 0L;
++
++    private static void maybeLog() {
++        final long now = System.currentTimeMillis();
++        if (now - lastLogMs >= 2000L) {
++            lastLogMs = now;
++            printTally();
++        }
++    }
++
++    private static void printTally() {
++        final long dispatched = DISPATCHED.sum();
++        final long completed = COMPLETED.sum();
++        final long sync = SYNC_FALLBACK.sum();
++        final long coasted = COASTED.sum();
++        final long total = dispatched + sync;
++        final double asyncRate = total == 0L ? 0.0 : (double) dispatched / (double) total;
++        System.out.println("[coderyo-async-path] tally: dispatched=" + dispatched
++            + " completed=" + completed + " syncFallback=" + sync + " coastedTicks=" + coasted
++            + " total=" + total + " asyncRate=" + String.format(java.util.Locale.ROOT, "%.4f", asyncRate));
++    }
++
++    public static long dispatchedCount() {
++        return DISPATCHED.sum();
++    }
++
++    public static long completedCount() {
++        return COMPLETED.sum();
++    }
++
++    public static long syncFallbackCount() {
++        return SYNC_FALLBACK.sum();
++    }
++
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
++        }
++        return fallback;
++    }
++
++    private static int resolveInt(final String property, final String env, final int fallback) {
++        String raw = System.getProperty(property);
++        if (raw == null) {
++            raw = System.getenv(env);
++        }
++        if (raw == null) {
++            return fallback;
++        }
++        try {
++            return Integer.parseInt(raw.trim());
++        } catch (final NumberFormatException ex) {
++            return fallback;
++        }
++    }
++
++    private static int clampInt(final int v, final int lo, final int hi) {
++        return Math.max(lo, Math.min(hi, v));
++    }
++}
+diff --git a/com/coderyo/pathfinding/AsyncPathDispatch.java b/com/coderyo/pathfinding/AsyncPathDispatch.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9cefb0b4008939cc13b81c2dc5527e6efc44533
+--- /dev/null
++++ b/com/coderyo/pathfinding/AsyncPathDispatch.java
+@@ -0,0 +1,209 @@
++/*
++ * coderyoMC — async pathfinding: tick-thread orchestration (snapshot + dispatch + apply).
++ */
++package com.coderyo.pathfinding;
++
++import java.util.Set;
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.pathfinder.NodeEvaluator;
++import net.minecraft.world.level.pathfinder.Path;
++import net.minecraft.world.level.pathfinder.PathFinder;
++import net.minecraft.world.level.pathfinder.WalkNodeEvaluator;
++import com.coderyo.pathfinding.AsyncPathfindingService.Pending;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * Tick-thread side of async pathfinding. All methods here run ON the owning region's tick thread
++ * (the single-writer window for that mob), so they may freely read the live world to build the
++ * immutable {@link SnapshotPathRegion}. Once the snapshot is built, the search is handed to the
++ * worker pool ({@link AsyncPathfindingService}) and this thread returns immediately.
++ *
++ * <p>The contract returned to {@code PathNavigation.createPath}:
++ * <ul>
++ *   <li>{@link Outcome#APPLY} — an in-flight search for the SAME request finished; its {@code path}
++ *       is ready to apply (vanilla path-then-follow, one tick late).</li>
++ *   <li>{@link Outcome#COAST} — a search is in flight (or was just dispatched); the mob should keep
++ *       its current path this tick (idle/coast — vanilla-equivalent latency).</li>
++ *   <li>{@link Outcome#SYNC} — async could not be used (box over cap, snapshot failed, pool
++ *       saturated, or disabled); the caller must run the SYNC A* exactly as vanilla.</li>
++ * </ul>
++ */
++public final class AsyncPathDispatch {
++
++    /** What the caller should do with the result of {@link #request}. */
++    public enum Mode { APPLY, COAST, SYNC }
++
++    /** Result of an async request decision. */
++    public static final class Outcome {
++        public final Mode mode;
++        public final @Nullable Path path;
++        public final int reachRange;
++
++        private Outcome(final Mode mode, final @Nullable Path path, final int reachRange) {
++            this.mode = mode;
++            this.path = path;
++            this.reachRange = reachRange;
++        }
++
++        static final Outcome SYNC_OUTCOME = new Outcome(Mode.SYNC, null, 0);
++        static final Outcome COAST_OUTCOME = new Outcome(Mode.COAST, null, 0);
++
++        static Outcome apply(final @Nullable Path path, final int reachRange) {
++            return new Outcome(Mode.APPLY, path, reachRange);
++        }
++    }
++
++    /**
++     * Blocks of routing margin added around the {start, targets} bounding box when snapshotting.
++     * Gives the off-thread A* room to route around small obstacles without snapshotting the full
++     * symmetric follow-range box. Large enough for vanilla-equivalent near-target paths; small
++     * enough that a near-horde snapshot stays cheap.
++     */
++    private static final int SNAPSHOT_MARGIN = 12;
++
++    private AsyncPathDispatch() {
++    }
++
++    /**
++     * Decide and (if needed) dispatch an off-thread search for a ground mob's repath. Called on the
++     * mob's region tick thread from {@code PathNavigation.createPath}.
++     *
++     * @param pendingRef the navigation's single pending-search slot (read+written on this thread)
++     * @return an {@link Outcome} telling the caller to APPLY a ready path, COAST, or run SYNC A*
++     */
++    public static Outcome request(
++        final Mob mob,
++        final Level level,
++        final PathFinder navPathFinder,
++        final NodeEvaluator navEvaluator,
++        final Set<BlockPos> targets,
++        final BlockPos fromPos,
++        final int radius,
++        final float maxPathLength,
++        final int reachRange,
++        final float maxVisitedNodesMultiplier,
++        final PendingSlot pendingRef
++    ) {
++        final long key = requestKey(fromPos, targets);
++
++        // 1) If a finished search for THIS request is ready, apply it.
++        final AsyncPathfindingService.Pending current = pendingRef.get();
++        if (current != null && current.key == key) {
++            if (current.isDone()) {
++                pendingRef.set(null);
++                AsyncPathConfig.recordCompleted();
++                return Outcome.apply(current.take(), current.reachRange);
++            }
++            // Same request still in flight → coast on the current path one more tick.
++            AsyncPathConfig.recordCoasted();
++            return Outcome.COAST_OUTCOME;
++        }
++
++        // 2) A different (stale) request is pending — drop it (the goal moved); dispatch the new one.
++        //    (The stale worker still completes harmlessly into its own slot; we just ignore it.)
++
++        // 3) Build the immutable snapshot on this (tick) thread, capped to the box.
++        //
++        // PERF: the vanilla region snapshots the full symmetric fromPos ± radius box (radius can be
++        // ~32 → a 65³ ≈ 275k-block copy). Copying that whole volume per dispatch on the tick thread
++        // is MORE expensive than the inline A* itself (which hits the shared PathTypeCache). So we
++        // snapshot only the BOUNDING BOX of {start, all targets} expanded by a margin — for a NEAR
++        // horde (mob beside the player) that is a tiny ~(span+2·margin)³ volume, a fraction of the
++        // full box. The A* stays within this corridor for a reachable near goal; if it needs to
++        // detour beyond the snapshot edge it returns a valid partial path (bounded, vanilla already
++        // caps paths) — never reading outside the immutable array. The margin gives routing room
++        // around small obstacles; the whole box is still capped to maxBox per axis.
++        final int maxBox = AsyncPathConfig.maxBox();
++        final int margin = SNAPSHOT_MARGIN;
++
++        int minX = fromPos.getX();
++        int minY = fromPos.getY();
++        int minZ = fromPos.getZ();
++        int maxX = fromPos.getX();
++        int maxY = fromPos.getY();
++        int maxZ = fromPos.getZ();
++        for (final BlockPos t : targets) {
++            minX = Math.min(minX, t.getX()); maxX = Math.max(maxX, t.getX());
++            minY = Math.min(minY, t.getY()); maxY = Math.max(maxY, t.getY());
++            minZ = Math.min(minZ, t.getZ()); maxZ = Math.max(maxZ, t.getZ());
++        }
++        minX -= margin; minY -= margin; minZ -= margin;
++        maxX += margin; maxY += margin; maxZ += margin;
++
++        // If the start→target span itself exceeds the cap, the corridor is too big to snapshot
++        // cheaply → SYNC (the box-cap fallback). Near hordes never hit this; long-range repaths do.
++        if ((maxX - minX + 1) > maxBox || (maxY - minY + 1) > maxBox || (maxZ - minZ + 1) > maxBox) {
++            AsyncPathConfig.recordSyncFallback();
++            return Outcome.SYNC_OUTCOME;
++        }
++
++        final BlockPos start = new BlockPos(minX, minY, minZ);
++        final BlockPos end = new BlockPos(maxX, maxY, maxZ);
++
++        final SnapshotPathRegion snapshot = SnapshotPathRegion.capture(level, start, end, maxBox);
++        if (snapshot == null) {
++            AsyncPathConfig.recordSyncFallback();
++            return Outcome.SYNC_OUTCOME;
++        }
++
++        // 4) Build a FRESH, thread-confined PathFinder for the worker (the nav's own evaluator is
++        //    used on the tick thread; we must not share it). Mirror the nav evaluator's flags.
++        final PathFinder asyncFinder = buildAsyncFinder(navPathFinder, navEvaluator);
++        if (asyncFinder == null) {
++            AsyncPathConfig.recordSyncFallback();
++            return Outcome.SYNC_OUTCOME;
++        }
++
++        final AsyncPathfindingService.Pending pending = AsyncPathfindingService.submit(
++            mob, snapshot, asyncFinder, Set.copyOf(targets), maxPathLength, reachRange, maxVisitedNodesMultiplier, key);
++        if (pending == null) {
++            // Pool saturated → SYNC fallback (no drop).
++            AsyncPathConfig.recordSyncFallback();
++            return Outcome.SYNC_OUTCOME;
++        }
++        pendingRef.set(pending);
++        // Dispatched this tick → coast on the current path until the result lands next tick.
++        return Outcome.COAST_OUTCOME;
++    }
++
++    /**
++     * Build a fresh {@link PathFinder} for the worker, mirroring the nav evaluator's flags. Returns
++     * {@code null} for non-{@link WalkNodeEvaluator} navs (we only async ground mobs) → SYNC.
++     */
++    private static @Nullable PathFinder buildAsyncFinder(final PathFinder navPathFinder, final NodeEvaluator navEvaluator) {
++        if (!(navEvaluator instanceof WalkNodeEvaluator)) {
++            return null;
++        }
++        final WalkNodeEvaluator eval = new WalkNodeEvaluator();
++        eval.setCanFloat(navEvaluator.canFloat());
++        eval.setCanOpenDoors(navEvaluator.canOpenDoors());
++        eval.setCanPassDoors(navEvaluator.canPassDoors());
++        eval.setCanWalkOverFences(navEvaluator.canWalkOverFences());
++        return new PathFinder(eval, navPathFinder.coderyoMaxVisitedNodes());
++    }
++
++    private static long requestKey(final BlockPos from, final Set<BlockPos> targets) {
++        long h = from.asLong();
++        // Order-independent target mix (targets is a small set; XOR is order-free).
++        long t = 0L;
++        for (final BlockPos p : targets) {
++            t ^= mix(p.asLong());
++        }
++        return mix(h) ^ t;
++    }
++
++    private static long mix(long z) {
++        z = (z ^ (z >>> 33)) * 0xff51afd7ed558ccdL;
++        z = (z ^ (z >>> 33)) * 0xc4ceb9fe1a85ec53L;
++        return z ^ (z >>> 33);
++    }
++
++    /** A tiny holder so {@code PathNavigation} can pass its pending slot by reference. */
++    public interface PendingSlot {
++        @Nullable Pending get();
++
++        void set(@Nullable Pending pending);
++    }
++}
+diff --git a/com/coderyo/pathfinding/AsyncPathfindingService.java b/com/coderyo/pathfinding/AsyncPathfindingService.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..67a467fd0df9583669c4be733fc7aa42a3677fb2
+--- /dev/null
++++ b/com/coderyo/pathfinding/AsyncPathfindingService.java
+@@ -0,0 +1,188 @@
++/*
++ * coderyoMC — async pathfinding: the off-thread A* worker pool + per-request handoff.
++ */
++package com.coderyo.pathfinding;
++
++import java.util.Set;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicReference;
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.level.pathfinder.Path;
++import net.minecraft.world.level.pathfinder.PathFinder;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * The shared pathfinding worker pool. Runs the vanilla {@link PathFinder} against an IMMUTABLE
++ * {@link SnapshotPathRegion} produced on the region tick thread, so the region tick never blocks
++ * on A* and the search never touches live world / chunk data.
++ *
++ * <p><b>Self-contained tasks (single-writer preserved).</b> Each {@link Request} carries its own
++ * snapshot + its own thread-confined {@link PathFinder} (a fresh evaluator). A worker reads only
++ * the snapshot and writes only the {@link AtomicReference} result slot — it never touches the mob,
++ * its navigation, the region's live chunks, or any other region's state. The completed {@link Path}
++ * is applied back on the owning region's tick thread next tick (vanilla path-then-follow latency).
++ *
++ * <p><b>Thread identity.</b> Worker threads are marked via {@link #ASYNC_SEARCH}; the patched
++ * {@code PathfindingContext} consults {@link #isAsyncSearchThread()} to bypass the shared
++ * per-level {@code PathTypeCache} (which is not thread-safe). Workers are NOT
++ * {@code RegionWorkerThread}s and never tick a region.
++ *
++ * <p><b>Saturation policy.</b> A bounded queue with a caller-runs-fallback shape: if the pool's
++ * queue is full the request is rejected and the caller runs SYNC A* on the tick thread (correct,
++ * just not offloaded). No request is ever dropped.
++ */
++public final class AsyncPathfindingService {
++
++    private static final ThreadLocal<Boolean> ASYNC_SEARCH = ThreadLocal.withInitial(() -> Boolean.FALSE);
++
++    private static volatile @Nullable ThreadPoolExecutor POOL;
++    private static final Object POOL_LOCK = new Object();
++
++    private AsyncPathfindingService() {
++    }
++
++    /** True iff the calling thread is an async pathfinding worker (bypass the shared cache). */
++    public static boolean isAsyncSearchThread() {
++        return ASYNC_SEARCH.get();
++    }
++
++    private static ThreadPoolExecutor pool() {
++        ThreadPoolExecutor p = POOL;
++        if (p != null) {
++            return p;
++        }
++        synchronized (POOL_LOCK) {
++            if (POOL == null) {
++                final int n = AsyncPathConfig.threads();
++                final ThreadFactory factory = new ThreadFactory() {
++                    private final AtomicInteger idx = new AtomicInteger();
++
++                    @Override
++                    public Thread newThread(final Runnable r) {
++                        // Mark for the whole worker lifetime: every search on it bypasses the cache.
++                        return new AsyncWorkerThread(r, "coderyo-pathfinder-" + idx.incrementAndGet());
++                    }
++                };
++                // Bounded queue: when full, RejectedExecutionException → caller runs SYNC (no drop).
++                final ThreadPoolExecutor exec = new ThreadPoolExecutor(
++                    n, n, 30L, TimeUnit.SECONDS,
++                    new LinkedBlockingQueue<>(Math.max(256, n * 64)), factory);
++                exec.allowCoreThreadTimeOut(true);
++                POOL = exec;
++                if (AsyncPathConfig.isDebug()) {
++                    System.out.println("[coderyo-async-path] worker pool started (threads=" + n + ")");
++                }
++            }
++            return POOL;
++        }
++    }
++
++    /** A worker thread that is permanently flagged as an async-search thread. */
++    private static final class AsyncWorkerThread extends Thread {
++        AsyncWorkerThread(final Runnable r, final String name) {
++            super(r, name);
++            setDaemon(true);
++        }
++
++        @Override
++        public void run() {
++            ASYNC_SEARCH.set(Boolean.TRUE);
++            super.run();
++        }
++    }
++
++    /**
++     * A per-navigation pending async search. Owned (created/read) only on the mob's region tick
++     * thread; the worker writes only {@link #result} (an {@link AtomicReference}). The fields below
++     * (key + flags) are read on the tick thread and never mutated by the worker, so no race.
++     */
++    public static final class Pending {
++        /** Quantized request key (start cell + sorted target cells) the result is FOR. */
++        final long key;
++        /** The result slot the worker writes; {@code null} until done, then the (possibly null) Path. */
++        final AtomicReference<Object> result = new AtomicReference<>(null);
++        /** Sentinel meaning "search finished, produced no path" (distinct from "still running"). */
++        static final Object NO_PATH = new Object();
++        /** The reachRange this search was requested with (applied with the result). */
++        final int reachRange;
++
++        Pending(final long key, final int reachRange) {
++            this.key = key;
++            this.reachRange = reachRange;
++        }
++
++        boolean isDone() {
++            return this.result.get() != null;
++        }
++
++        @Nullable Path take() {
++            final Object r = this.result.get();
++            if (r == null || r == NO_PATH) {
++                return null;
++            }
++            return (Path) r;
++        }
++    }
++
++    /**
++     * Submit an off-thread search. Builds nothing itself — the caller has already captured the
++     * immutable {@code snapshot} on the tick thread. Returns the {@link Pending} handle to poll, or
++     * {@code null} if the pool is saturated (→ caller runs SYNC A*).
++     */
++    public static @Nullable Pending submit(
++        final Mob mob,
++        final SnapshotPathRegion snapshot,
++        final PathFinder pathFinder,
++        final Set<BlockPos> targets,
++        final float maxPathLength,
++        final int reachRange,
++        final float maxVisitedNodesMultiplier,
++        final long key
++    ) {
++        final Pending pending = new Pending(key, reachRange);
++        final ThreadPoolExecutor exec = pool();
++        try {
++            exec.execute(() -> {
++                Path path = null;
++                try {
++                    // The PathFinder runs entirely against the immutable snapshot. The evaluator
++                    // reads block/fluid/collision only through the snapshot getter (thread-confined).
++                    path = pathFinder.findPath(snapshot, mob, targets, maxPathLength, reachRange, maxVisitedNodesMultiplier);
++                } catch (final Throwable t) {
++                    // A failed off-thread search must NOT crash the server; it degrades to "no path"
++                    // and the mob retries next tick (or coasts). Logged once under debug.
++                    if (AsyncPathConfig.isDebug()) {
++                        System.out.println("[coderyo-async-path] search threw, treating as no-path: " + t);
++                    }
++                    path = null;
++                } finally {
++                    pending.result.set(path != null ? path : Pending.NO_PATH);
++                }
++            });
++        } catch (final java.util.concurrent.RejectedExecutionException rejected) {
++            return null; // saturated -> SYNC fallback
++        }
++        AsyncPathConfig.recordDispatched();
++        return pending;
++    }
++
++    /** Shut the pool down cleanly (called from the region scheduler shutdown path). */
++    public static void shutdown() {
++        final ThreadPoolExecutor p;
++        synchronized (POOL_LOCK) {
++            p = POOL;
++            POOL = null;
++        }
++        if (p != null) {
++            p.shutdownNow();
++            if (AsyncPathConfig.isDebug()) {
++                System.out.println("[coderyo-async-path] worker pool shut down");
++            }
++        }
++    }
++}
+diff --git a/com/coderyo/pathfinding/SnapshotPathRegion.java b/com/coderyo/pathfinding/SnapshotPathRegion.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0b0d43c6307b24d14a9cf59c8e53b3f89275564
+--- /dev/null
++++ b/com/coderyo/pathfinding/SnapshotPathRegion.java
+@@ -0,0 +1,214 @@
++/*
++ * coderyoMC — async pathfinding: the immutable, thread-confined block SNAPSHOT.
++ */
++package com.coderyo.pathfinding;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.BlockGetter;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.PathNavigationRegion;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.entity.BlockEntity;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.material.FluidState;
++import net.minecraft.world.level.material.Fluids;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * An IMMUTABLE block snapshot of a bounded box, built ON the region tick thread, that a
++ * {@link net.minecraft.world.level.pathfinder.PathFinder} can search entirely off-thread
++ * without ever touching live world / chunk data.
++ *
++ * <p><b>Why a {@link PathNavigationRegion} subclass.</b> {@code PathFinder.findPath} takes a
++ * concrete {@code PathNavigationRegion}; the {@code WalkNodeEvaluator} reads everything (block
++ * states, fluid states, collision shapes) through that getter. The vanilla region holds LIVE
++ * {@code ChunkAccess} references — reading them off the tick thread would race the region's
++ * tick (exactly the issue-#24 class of bug). This subclass instead deep-copies every
++ * {@link BlockState} in the box into a flat array at construction (on the owning tick thread),
++ * and every read method consults only that array. {@code BlockState} objects are interned,
++ * immutable singletons; copying references is safe. {@link FluidState} is derived purely from
++ * the captured block state ({@code BlockState.getFluidState()} is a pure function). So once
++ * built, the snapshot is fully self-contained and thread-confined to the worker that searches it.
++ *
++ * <p><b>Block entities.</b> Pathfinding collision/path-type classification is block-STATE based;
++ * {@code getBlockEntity} returns {@code null} (the rare BE-dependent collision shape is not a
++ * pathfinding consideration and a null BE is the safe, conservative answer). This deliberately
++ * does NOT snapshot live block entities (which are mutable and would reintroduce a race).
++ *
++ * <p><b>Box cap.</b> The caller caps the box to {@link AsyncPathConfig#maxBox()} per axis; a
++ * request whose box would exceed the cap falls back to SYNC A* rather than snapshotting a huge
++ * volume. Air outside the captured span reads as {@link Blocks#AIR} (matching the vanilla
++ * region's {@code EmptyLevelChunk} behavior for unloaded cells).
++ */
++public final class SnapshotPathRegion extends PathNavigationRegion {
++
++    private final int minX;
++    private final int minY;
++    private final int minZ;
++    private final int sizeX;
++    private final int sizeY;
++    private final int sizeZ;
++    private final int snapMinY;
++    private final int snapHeight;
++    private final BlockState[] states;
++    private final BlockState air = Blocks.AIR.defaultBlockState();
++    private final PerChunkView chunkView = new PerChunkView();
++
++    private SnapshotPathRegion(final Level level, final BlockPos start, final BlockPos end,
++                              final int minX, final int minY, final int minZ,
++                              final int sizeX, final int sizeY, final int sizeZ,
++                              final BlockState[] states) {
++        super(level, start, end);
++        this.minX = minX;
++        this.minY = minY;
++        this.minZ = minZ;
++        this.sizeX = sizeX;
++        this.sizeY = sizeY;
++        this.sizeZ = sizeZ;
++        this.states = states;
++        this.snapMinY = level.getMinY();
++        this.snapHeight = level.getHeight();
++    }
++
++    /**
++     * Build an immutable snapshot of the box {@code [start, end]} (inclusive) from {@code level}.
++     * MUST be called on the level's tick thread (single-writer window). Reads live block states
++     * once into the flat array; thereafter the returned region is detached from the live world.
++     *
++     * @return the snapshot, or {@code null} if the box exceeds the per-axis cap (→ SYNC fallback)
++     */
++    public static @Nullable SnapshotPathRegion capture(final Level level, final BlockPos start, final BlockPos end, final int maxBox) {
++        final int minX = Math.min(start.getX(), end.getX());
++        final int minY = Math.max(level.getMinY(), Math.min(start.getY(), end.getY()));
++        final int minZ = Math.min(start.getZ(), end.getZ());
++        final int maxX = Math.max(start.getX(), end.getX());
++        final int maxY = Math.min(level.getMaxY(), Math.max(start.getY(), end.getY()));
++        final int maxZ = Math.max(start.getZ(), end.getZ());
++
++        final int sizeX = maxX - minX + 1;
++        final int sizeY = maxY - minY + 1;
++        final int sizeZ = maxZ - minZ + 1;
++        if (sizeX > maxBox || sizeZ > maxBox || sizeY > maxBox || sizeX <= 0 || sizeY <= 0 || sizeZ <= 0) {
++            return null; // box over cap -> caller runs SYNC A*
++        }
++
++        final long cells = (long) sizeX * sizeY * sizeZ;
++        if (cells > (long) maxBox * maxBox * maxBox) {
++            return null;
++        }
++
++        final BlockState[] states = new BlockState[(int) cells];
++        final BlockState air = Blocks.AIR.defaultBlockState();
++        final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
++        int i = 0;
++        for (int x = minX; x <= maxX; x++) {
++            for (int y = minY; y <= maxY; y++) {
++                for (int z = minZ; z <= maxZ; z++) {
++                    // getBlockStateIfLoaded reads the live chunk once on the tick thread; an
++                    // unloaded cell snapshots as AIR (same as the vanilla region's empty chunk).
++                    final BlockState s = level.getBlockStateIfLoaded(cursor.set(x, y, z));
++                    states[i++] = s != null ? s : air;
++                }
++            }
++        }
++        return new SnapshotPathRegion(level, start, end, minX, minY, minZ, sizeX, sizeY, sizeZ, states);
++    }
++
++    private @Nullable BlockState snapshotAt(final int x, final int y, final int z) {
++        final int lx = x - this.minX;
++        final int ly = y - this.minY;
++        final int lz = z - this.minZ;
++        if (lx < 0 || lx >= this.sizeX || ly < 0 || ly >= this.sizeY || lz < 0 || lz >= this.sizeZ) {
++            return null; // outside the captured span
++        }
++        return this.states[(lx * this.sizeY + ly) * this.sizeZ + lz];
++    }
++
++    @Override
++    public BlockState getBlockState(final BlockPos pos) {
++        final BlockState s = this.snapshotAt(pos.getX(), pos.getY(), pos.getZ());
++        return s != null ? s : this.air;
++    }
++
++    @Override
++    public @Nullable BlockState getBlockStateIfLoaded(final BlockPos pos) {
++        return this.snapshotAt(pos.getX(), pos.getY(), pos.getZ());
++    }
++
++    @Override
++    public FluidState getFluidState(final BlockPos pos) {
++        final BlockState s = this.snapshotAt(pos.getX(), pos.getY(), pos.getZ());
++        return s != null ? s.getFluidState() : Fluids.EMPTY.defaultFluidState();
++    }
++
++    @Override
++    public @Nullable FluidState getFluidIfLoaded(final BlockPos pos) {
++        final BlockState s = this.snapshotAt(pos.getX(), pos.getY(), pos.getZ());
++        return s != null ? s.getFluidState() : null;
++    }
++
++    @Override
++    public @Nullable BlockEntity getBlockEntity(final BlockPos pos) {
++        return null; // pathfinding is block-state based; null BE is the safe conservative answer
++    }
++
++    @Override
++    public BlockGetter getChunkForCollisions(final int chunkX, final int chunkZ) {
++        // The collision scan (BlockCollisions) asks for a per-chunk BlockGetter and then calls
++        // getBlockState on it. Our snapshot is flat, so one shared stateless view backed by the
++        // array serves every chunk (it bounds-checks per position). Returning non-null keeps the
++        // collision path live but reading only snapshot data.
++        return this.chunkView;
++    }
++
++    @Override
++    public int getMinY() {
++        return this.snapMinY;
++    }
++
++    @Override
++    public int getHeight() {
++        return this.snapHeight;
++    }
++
++    /** A stateless {@link BlockGetter} over the snapshot array, returned for collision scans. */
++    private final class PerChunkView implements BlockGetter {
++        @Override
++        public @Nullable BlockEntity getBlockEntity(final BlockPos pos) {
++            return null;
++        }
++
++        @Override
++        public BlockState getBlockState(final BlockPos pos) {
++            final BlockState s = SnapshotPathRegion.this.snapshotAt(pos.getX(), pos.getY(), pos.getZ());
++            return s != null ? s : SnapshotPathRegion.this.air;
++        }
++
++        @Override
++        public @Nullable BlockState getBlockStateIfLoaded(final BlockPos pos) {
++            return SnapshotPathRegion.this.snapshotAt(pos.getX(), pos.getY(), pos.getZ());
++        }
++
++        @Override
++        public FluidState getFluidState(final BlockPos pos) {
++            final BlockState s = SnapshotPathRegion.this.snapshotAt(pos.getX(), pos.getY(), pos.getZ());
++            return s != null ? s.getFluidState() : Fluids.EMPTY.defaultFluidState();
++        }
++
++        @Override
++        public @Nullable FluidState getFluidIfLoaded(final BlockPos pos) {
++            final BlockState s = SnapshotPathRegion.this.snapshotAt(pos.getX(), pos.getY(), pos.getZ());
++            return s != null ? s.getFluidState() : null;
++        }
++
++        @Override
++        public int getMinY() {
++            return SnapshotPathRegion.this.snapMinY;
++        }
++
++        @Override
++        public int getHeight() {
++            return SnapshotPathRegion.this.snapHeight;
++        }
++    }
++}
+diff --git a/com/coderyo/region/WorkStealingRegionScheduler.java b/com/coderyo/region/WorkStealingRegionScheduler.java
+index d9aeb49b327f5078ccb7f7348deb8a89161ddc7b..15fd3a13e58589cc9ceff5968748a8d3bceb7161 100644
+--- a/com/coderyo/region/WorkStealingRegionScheduler.java
++++ b/com/coderyo/region/WorkStealingRegionScheduler.java
+@@ -181,6 +181,9 @@ public final class WorkStealingRegionScheduler implements RegionScheduler {
+                 Thread.currentThread().interrupt();
+             }
+         }
++        // coderyo - async pathfinding: also drain the off-thread A* worker pool on stop so it does
++        // not leak across a /reload or restart. No-op if async pathfinding was never engaged.
++        com.coderyo.pathfinding.AsyncPathfindingService.shutdown();
+         LOGGER.info("WorkStealingRegionScheduler shut down (clean={})", clean);
+     }
+ }
+diff --git a/net/minecraft/world/entity/ai/navigation/PathNavigation.java b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+index 0670fe893c0248589367d568ada2372ead480389..bc72869223352e4e5ebc185b90587098b5df2f50 100644
+--- a/net/minecraft/world/entity/ai/navigation/PathNavigation.java
++++ b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+@@ -55,6 +55,23 @@ public abstract class PathNavigation {
+     public final PathFinder pathFinder;
+     private boolean isStuck;
+     private float requiredPathLength = 16.0F;
++    // coderyo start - async pathfinding: per-navigation pending off-thread search slot. Read+written
++    // ONLY on the owning region's tick thread (single-writer for this mob); the worker writes only
++    // the Pending.result AtomicReference. No cross-region shared mutable state.
++    private com.coderyo.pathfinding.AsyncPathfindingService.@org.jspecify.annotations.Nullable Pending coderyoPending;
++    private final com.coderyo.pathfinding.AsyncPathDispatch.PendingSlot coderyoPendingSlot =
++        new com.coderyo.pathfinding.AsyncPathDispatch.PendingSlot() {
++            @Override
++            public com.coderyo.pathfinding.AsyncPathfindingService.@org.jspecify.annotations.Nullable Pending get() {
++                return PathNavigation.this.coderyoPending;
++            }
++
++            @Override
++            public void set(final com.coderyo.pathfinding.AsyncPathfindingService.@org.jspecify.annotations.Nullable Pending pending) {
++                PathNavigation.this.coderyoPending = pending;
++            }
++        };
++    // coderyo end - async pathfinding
+ 
+     public PathNavigation(final Mob mob, final Level level) {
+         this.mob = mob;
+@@ -211,6 +228,44 @@ public abstract class PathNavigation {
+         profiler.push("pathfind");
+         BlockPos fromPos = above ? this.mob.blockPosition().above() : this.mob.blockPosition();
+         int radius = (int)(maxPathLength + radiusOffset);
++        // coderyo start - async pathfinding: snapshot-based OFF-THREAD A* (flag-gated, default OFF).
++        // When region.enabled (parallel-tick core live) AND the async flag are on, and this is a
++        // ground mob, move the residual A* (the searches L1 couldn't elide — especially the dense
++        // NEAR-player horde that L0/L1 keep at full fidelity) OFF this region's tick thread onto a
++        // shared worker pool, against an IMMUTABLE block snapshot taken HERE on the tick thread. The
++        // region tick continues; the completed Path is applied next tick (vanilla path-then-follow
++        // latency). Falls back to SYNC A* (the exact vanilla path below) on box-over-cap / saturation.
++        if (com.coderyo.pathfinding.AsyncPathConfig.isEnabled()
++            && com.coderyo.region.RegionConfig.isEnabled()
++            && this.canNavigateGround()) {
++            final com.coderyo.pathfinding.AsyncPathDispatch.Outcome outcome =
++                com.coderyo.pathfinding.AsyncPathDispatch.request(
++                    this.mob, this.level, this.pathFinder, this.nodeEvaluator, targets,
++                    fromPos, radius, maxPathLength, reachRange, this.maxVisitedNodesMultiplier,
++                    this.coderyoPendingSlot);
++            switch (outcome.mode) {
++                case APPLY -> {
++                    profiler.pop();
++                    final Path applied = outcome.path;
++                    if (applied != null && applied.getTarget() != null) {
++                        this.targetPos = applied.getTarget();
++                        this.reachRange = outcome.reachRange;
++                        this.resetStuckTimeout();
++                    }
++                    return applied;
++                }
++                case COAST -> {
++                    // A search is in flight; keep the current path this tick (idle/coast = vanilla
++                    // path latency). Returning the existing path means moveTo() does not disturb it.
++                    profiler.pop();
++                    return this.path;
++                }
++                case SYNC -> {
++                    // fall through to the exact vanilla SYNC A* below
++                }
++            }
++        }
++        // coderyo end - async pathfinding
+         PathNavigationRegion region = new PathNavigationRegion(this.level, fromPos.offset(-radius, -radius, -radius), fromPos.offset(radius, radius, radius));
+         Path path = this.pathFinder.findPath(region, this.mob, targets, maxPathLength, reachRange, this.maxVisitedNodesMultiplier);
+         profiler.pop();
+diff --git a/net/minecraft/world/level/PathNavigationRegion.java b/net/minecraft/world/level/PathNavigationRegion.java
+index 24e82cff2bc2908852bcd4f1367b54690a65e2da..e78d45cec6dafac7bb688d3f4484a2f005ea0fce 100644
+--- a/net/minecraft/world/level/PathNavigationRegion.java
++++ b/net/minecraft/world/level/PathNavigationRegion.java
+@@ -89,14 +89,14 @@ public class PathNavigationRegion implements CollisionGetter {
+ 
+     @Nullable
+     @Override
+-    public final FluidState getFluidIfLoaded(BlockPos pos) {
++    public FluidState getFluidIfLoaded(BlockPos pos) { // coderyo - async pathfinding: de-final so the immutable SnapshotPathRegion can override (never read live chunks off-thread)
+         ChunkAccess chunk = getChunkIfLoaded(pos.getX() >> 4, pos.getZ() >> 4);
+         return chunk == null ? null : chunk.getFluidState(pos);
+     }
+ 
+     @Nullable
+     @Override
+-    public final BlockState getBlockStateIfLoaded(BlockPos pos) {
++    public BlockState getBlockStateIfLoaded(BlockPos pos) { // coderyo - async pathfinding: de-final so SnapshotPathRegion can override
+         ChunkAccess chunk = getChunkIfLoaded(pos.getX() >> 4, pos.getZ() >> 4);
+         return chunk == null ? null : chunk.getBlockState(pos);
+     }
+diff --git a/net/minecraft/world/level/pathfinder/PathFinder.java b/net/minecraft/world/level/pathfinder/PathFinder.java
+index 253074a0a14115cd3d18aaae6fa5822cf32346c9..30a267b059fad3401a4a5691875dfb9dc8b63886 100644
+--- a/net/minecraft/world/level/pathfinder/PathFinder.java
++++ b/net/minecraft/world/level/pathfinder/PathFinder.java
+@@ -40,6 +40,12 @@ public class PathFinder {
+         this.maxVisitedNodes = maxVisitedNodes;
+     }
+ 
++    // coderyo - async pathfinding: expose the configured node budget so a fresh, thread-confined
++    // PathFinder built for an off-thread search matches the navigation's budget exactly.
++    public int coderyoMaxVisitedNodes() {
++        return this.maxVisitedNodes;
++    }
++
+     public @Nullable Path findPath(
+         final PathNavigationRegion level,
+         final Mob entity,
+diff --git a/net/minecraft/world/level/pathfinder/PathfindingContext.java b/net/minecraft/world/level/pathfinder/PathfindingContext.java
+index 64e1a34de133beccb90486f247e7e74d6535941f..9f65dbf9283bacb24ceb7c51f1499068b3bc0f50 100644
+--- a/net/minecraft/world/level/pathfinder/PathfindingContext.java
++++ b/net/minecraft/world/level/pathfinder/PathfindingContext.java
+@@ -15,6 +15,16 @@ public class PathfindingContext {
+ 
+     public PathfindingContext(final CollisionGetter level, final Mob mob) {
+         this.level = level;
++        // coderyo start - async pathfinding: bypass the SHARED per-level PathTypeCache off-thread.
++        // The cache (ServerLevel.pathTypesByPosCache) is a mutable shared array written by compute()
++        // and invalidate(). During an OFF-THREAD async A* search it would race the region tick (the
++        // issue #24 hazard class). When the async-search thread-local is set, use a null cache so the
++        // search computes path types directly from the (thread-confined, immutable) snapshot level.
++        // On-tick searches (the default) keep the exact vanilla shared cache → byte-for-byte vanilla.
++        if (com.coderyo.pathfinding.AsyncPathfindingService.isAsyncSearchThread()) {
++            this.cache = null;
++        } else
++        // coderyo end - async pathfinding
+         if (mob.level() instanceof ServerLevel serverLevel) {
+             this.cache = serverLevel.getPathTypeCache();
+         } else {
