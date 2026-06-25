@@ -65,8 +65,12 @@ What it does, in order:
 4. Waits up to `--boot-timeout` (default 300s) for `Done (`.
 5. Pipes each `--cmd` / `--cmds-file` line to the server stdin, with a
    `--cmd-delay` (default 2s) pause between them.
-6. Sends `stop`, waits up to `--stop-timeout` (default 120s) for the process to
-   exit, and checks for a clean-shutdown marker.
+6. Sends `stop` and waits for the JVM to **release the listening port** (the
+   authoritative "the server really exited" signal on Windows, where the JVM is
+   a grandchild of the shell pipeline). If the JVM hangs *after* saving the
+   world (a known alpha-build Moonrise pool-termination quirk), the harness
+   force-kills it by port so no orphan is left bound to the test port, and
+   reports the run honestly (clean save + WARN about the hang).
 7. Runs all `--assert-present` / `--assert-absent` patterns against the captured
    log and prints a PASS/FAIL line per assertion.
 8. Exits non-zero if any assertion fails or shutdown hangs.
@@ -87,11 +91,16 @@ Run `test-harness/e2e-harness.sh --help` for the full list. Highlights:
 
 | code | meaning |
 |---|---|
-| 0 | all assertions passed, clean shutdown |
+| 0 | all assertions passed; server stopped + saved (a post-save pool-termination hang that is force-killed still counts as pass, with a WARN) |
 | 1 | an assertion failed |
 | 2 | server never printed `Done (` within `--boot-timeout` |
-| 3 | server did not shut down within `--stop-timeout` |
+| 3 | server never reached `stop`/save (genuine no-shutdown) |
 | 4 | usage / config error (incl. attempt to bind 25565) |
+
+The JVM is tracked by its **listening TCP port**, not the shell PID, because on
+Windows/Git Bash the JVM is a grandchild of the backgrounded pipeline and the
+pipeline PID exiting does not prove the JVM exited. "Clean shutdown" means the
+server reached `stop`, saved all worlds, and released the port.
 
 ## Use in region / GPU / compat e2e tests
 
