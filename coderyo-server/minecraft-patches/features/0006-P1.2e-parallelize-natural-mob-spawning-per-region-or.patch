@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyo <coderyo@local>
+Date: Thu, 25 Jun 2026 13:19:30 +0800
+Subject: [PATCH] P1.2e: parallelize natural mob spawning per region
+ (orchestrator-coordinated caps)
+
+
+diff --git a/com/coderyo/region/RegionTickOrchestrator.java b/com/coderyo/region/RegionTickOrchestrator.java
+index 0ea6fa5683fc9cb107f4dd7f99f3e3ae73c86b7f..fea752c0f69993160495332dcf7dbab1b727ba25 100644
+--- a/com/coderyo/region/RegionTickOrchestrator.java
++++ b/com/coderyo/region/RegionTickOrchestrator.java
+@@ -131,7 +131,12 @@ public final class RegionTickOrchestrator {
+             // them over every loaded chunk on the orchestrator with the level's own RNG path.
+             if (level.coderyoScheduledTicksRun()) {
+                 level.coderyoTickScheduledAndRandomFallbackAll();
++                // P1.2e: no region formed yet — spawn over ALL stashed spawning chunks on the
++                // orchestrator (single-threaded, so the shared cookie + Level.random are safe).
++                final it.unimi.dsi.fastutil.longs.LongSet loaded = RegionLifecycle.loadedChunkKeysOf(level);
++                level.coderyoSpawnForRegion(loaded, level.getRandom());
+             }
++            level.coderyoClearSpawnStash();
+             tickUnownedFallback(level, level.coderyoTickingEntitiesSnapshot(),
+                 snapshotBlockEntities(level));
+             return;
+@@ -207,6 +212,12 @@ public final class RegionTickOrchestrator {
+                 final it.unimi.dsi.fastutil.longs.LongSet owned = region.chunkKeysSnapshot();
+                 w.scheduledTicks = level.coderyoTickRegionScheduledTicks(owned, region.random());
+                 level.coderyoTickRegionRandomTicks(owned, region.randomTickRandom());
++                // P1.2e: natural mob spawning for this region's owned chunks, sharing the single
++                // stashed global SpawnState cookie (mutators serialized => global cap respected),
++                // using the region's own RNG. Runs BEFORE entity ticking, matching vanilla order
++                // (spawning happens in chunkSource.tick, before the entity loop). Thunder +
++                // inhabited-time already ran on the orchestrator.
++                w.spawnedChunks = level.coderyoSpawnForRegion(owned, region.random());
+                 w.ranScheduledRandom = true;
+             }
+ 
+@@ -242,8 +253,13 @@ public final class RegionTickOrchestrator {
+             if (!unowned.isEmpty()) {
+                 level.coderyoTickRegionScheduledTicks(unowned, level.getRandom());
+                 level.coderyoTickRegionRandomTicks(unowned, level.coderyoSimpleRandom());
++                // P1.2e: spawn over any unowned loaded spawning chunks on the orchestrator
++                // (single-threaded here, after the region barrier, so the cookie is uncontended).
++                level.coderyoSpawnForRegion(unowned, level.getRandom());
+             }
+         }
++        // P1.2e: drop the per-tick spawn stash (chunk refs) now the spawn phase is complete.
++        level.coderyoClearSpawnStash();
+         tickUnownedFallback(level, unownedEntities, tickBEs ? unownedBEs : List.of());
+         level.coderyoPruneBlockEntityTickers(removedBEs);
+ 
+@@ -293,10 +309,11 @@ public final class RegionTickOrchestrator {
+             final double ms = r.lastTickNanos() / 1_000_000.0d;
+             final double tps = ms > 0.0 ? Math.min(20.0, 1000.0 / Math.max(ms, 0.05) / 1.0) : 20.0;
+             LOGGER.info(
+-                "tick#{} region R{} [{}] ticked on thread '{}' (id={}) -- {} entit(y/ies), {} block-entit(y/ies), {} scheduled-tick(s){}, {} ms, ~{} TPS-budget",
++                "tick#{} region R{} [{}] ticked on thread '{}' (id={}) -- {} entit(y/ies), {} block-entit(y/ies), {} scheduled-tick(s){}, {} spawn-chunk(s), {} ms, ~{} TPS-budget",
+                 serverTick, r.id().value(), dim, w.workerThreadName, w.workerThreadId,
+                 w.entities.size(), w.blockEntities.size(),
+                 w.scheduledTicks, w.ranScheduledRandom ? "+random" : "",
++                w.spawnedChunks,
+                 String.format(java.util.Locale.ROOT, "%.3f", ms),
+                 String.format(java.util.Locale.ROOT, "%.1f", tps));
+         }
+@@ -317,6 +334,7 @@ public final class RegionTickOrchestrator {
+         volatile String workerThreadName = "?";
+         volatile long workerThreadId = -1L;
+         volatile int scheduledTicks = 0;
++        volatile int spawnedChunks = 0;
+         volatile boolean ranScheduledRandom = false;
+ 
+         RegionWork(final Region region) {
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index ef7045a6e5025827fdb2b9ad14a4d3f233f21cc7..80212d7b73fefae7525431beb89a0673147555e8 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -189,6 +189,54 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         this.iterateTickingChunksFaster();
+     }
+ 
++    // coderyoMC start - P1.2e: per-region natural mob spawning.
++    /**
++     * Orchestrator-side slice of {@code tickSpawningChunk}: thunder strike + inhabited-time
++     * accounting only (NO mob spawning). Thunder creates entities and reads the shared
++     * {@code Level.randValue}, so it stays on the orchestrator; the spawning slice is deferred
++     * to the region phase.
++     */
++    private void coderyoTickThunderAndInhabited(final LevelChunk chunk, final long timeDiff) {
++        chunk.incrementInhabitedTime(timeDiff);
++        this.level.tickThunder(chunk);
++    }
++
++    /**
++     * Per-region natural mob spawning: run {@code NaturalSpawner.spawnForChunk} for the given
++     * (already-collected, world-border-checked) chunk on the calling region worker thread, using
++     * {@code regionRandom} instead of the shared {@code Level.random}, sharing the single global
++     * {@code spawnCookie} (its mutators serialized via {@code synchronized(spawnCookie)} in the
++     * spawn body so the GLOBAL mob cap and per-player caps stay exact across regions).
++     *
++     * @return number of spawning-eligible chunks processed (diagnostic count).
++     */
++    public int coderyoSpawnForRegion(final LongSet ownedChunkKeys,
++                                     final net.minecraft.util.RandomSource regionRandom) {
++        final ServerLevel level = this.level;
++        final java.util.List<LevelChunk> chunks = level.coderyoStashedSpawningChunks();
++        if (chunks == null || chunks.isEmpty()) {
++            return 0;
++        }
++        final java.util.List<net.minecraft.world.entity.MobCategory> categories = level.coderyoStashedSpawningCategories();
++        final NaturalSpawner.SpawnState cookie = level.coderyoStashedSpawnCookie();
++        if (categories == null || categories.isEmpty() || cookie == null) {
++            return 0;
++        }
++        int processed = 0;
++        for (final LevelChunk chunk : chunks) {
++            final ChunkPos cp = chunk.getPos();
++            if (!ownedChunkKeys.contains(cp.longKey())) {
++                continue;
++            }
++            if (level.getWorldBorder().isWithinBounds(cp)) {
++                NaturalSpawner.coderyoSpawnForChunk(level, chunk, cookie, categories, regionRandom);
++                processed++;
++            }
++        }
++        return processed;
++    }
++    // coderyoMC end - P1.2e
++
+     public ServerChunkCache(
+         final ServerLevel level,
+         final LevelStorageSource.LevelStorageAccess levelStorage,
+@@ -595,9 +643,26 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+             // Paper end - chunk tick iteration optimisation
+             profiler.popPush("tickSpawningChunks");
+ 
++            // coderyoMC start - P1.2e: when region.enabled, natural mob spawning is run PER-REGION
++            // on worker threads (partitioned by owned chunk, region RNG), sharing the single global
++            // SpawnState cookie (its mutators serialized) so the GLOBAL mob cap is respected.
++            // Thunder + inhabited-time still run here on the orchestrator per chunk (thunder creates
++            // entities and reads the shared Level.randValue). Mob spawning is DEFERRED to the region
++            // phase: the orchestrator stashes the cookie/categories/chunks for the regions to drain.
++            // region.enabled=false => coderyoIsParallelTickActive() is false => vanilla path runs.
++            if (this.level.coderyoIsParallelTickActive()) {
++                for (LevelChunk chunk : spawningChunks) {
++                    // orchestrator: thunder + inhabited-time only (NO spawning).
++                    this.coderyoTickThunderAndInhabited(chunk, timeDiff);
++                }
++                // Stash the spawn budget + spawning chunks for the per-region spawn phase. The
++                // regions share this ONE cookie (mutators serialized => exact global cap).
++                this.level.coderyoStashSpawnPhase(spawnCookie, spawningCategories, new ObjectArrayList<>(spawningChunks));
++            } else {
+             for (LevelChunk chunk : spawningChunks) {
+                 this.tickSpawningChunk(chunk, timeDiff, spawningCategories, spawnCookie);
+             }
++            } // coderyoMC end - P1.2e
+         } finally {
+             spawningChunks.clear();
+         }
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index c078be792f1d52b82dacd03d232bb16118bc48ae..3f271bf3f94b636e7782458b6cfd41927c453115 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -1205,6 +1205,59 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     }
+     // coderyoMC end - P1.2d
+ 
++    // coderyoMC start - P1.2e: per-region natural mob spawning stash.
++    // The orchestrator (inside the suppressed chunkSource.tick) computes the single global spawn
++    // budget (SpawnState cookie + filtered categories) and the collected spawning-chunk list once
++    // per tick, then stashes them here for the region phase. Each region drains the chunks IT owns
++    // on its worker thread, sharing the ONE cookie (mutators serialized) so the global cap holds.
++    private volatile NaturalSpawner.SpawnState coderyoSpawnCookie;
++    private volatile java.util.List<net.minecraft.world.entity.MobCategory> coderyoSpawningCategories;
++    private volatile java.util.List<net.minecraft.world.level.chunk.LevelChunk> coderyoSpawningChunks;
++
++    /** Orchestrator: stash this tick's spawn budget for the per-region spawn phase. */
++    public void coderyoStashSpawnPhase(final NaturalSpawner.SpawnState cookie,
++                                       final java.util.List<net.minecraft.world.entity.MobCategory> categories,
++                                       final java.util.List<net.minecraft.world.level.chunk.LevelChunk> chunks) {
++        this.coderyoSpawnCookie = cookie;
++        this.coderyoSpawningCategories = categories;
++        this.coderyoSpawningChunks = chunks;
++    }
++
++    /** Region phase: the stashed global spawn cookie (shared by all regions; mutators serialized). */
++    public NaturalSpawner.SpawnState coderyoStashedSpawnCookie() {
++        return this.coderyoSpawnCookie;
++    }
++
++    /** Region phase: the stashed filtered spawning categories for this tick. */
++    public java.util.List<net.minecraft.world.entity.MobCategory> coderyoStashedSpawningCategories() {
++        return this.coderyoSpawningCategories;
++    }
++
++    /** Region phase: the stashed collected spawning chunks for this tick. */
++    public java.util.List<net.minecraft.world.level.chunk.LevelChunk> coderyoStashedSpawningChunks() {
++        return this.coderyoSpawningChunks;
++    }
++
++    /** Orchestrator: clear the stash after the region phase (avoid holding stale chunk refs). */
++    public void coderyoClearSpawnStash() {
++        this.coderyoSpawnCookie = null;
++        this.coderyoSpawningCategories = null;
++        this.coderyoSpawningChunks = null;
++    }
++
++    /**
++     * Run per-region natural mob spawning for this region's owned chunks on the calling worker
++     * thread, using {@code regionRandom} (never the shared {@code Level.random}). Returns the
++     * number of spawning-eligible chunks processed. Delegates to
++     * {@link ServerChunkCache#coderyoSpawnForRegion}. The global mob cap is respected because all
++     * regions share the single stashed {@code SpawnState} cookie whose mutators are serialized.
++     */
++    public int coderyoSpawnForRegion(final it.unimi.dsi.fastutil.longs.LongSet ownedChunkKeys,
++                                     final net.minecraft.util.RandomSource regionRandom) {
++        return this.getChunkSource().coderyoSpawnForRegion(ownedChunkKeys, regionRandom);
++    }
++    // coderyoMC end - P1.2e
++
+     @Override
+     public boolean shouldTickBlocksAt(final long chunkPos) {
+         // Paper start - rewrite chunk system
+diff --git a/net/minecraft/world/level/NaturalSpawner.java b/net/minecraft/world/level/NaturalSpawner.java
+index e193cbed115663e9ca7a611837d5b8540dda03db..f08027f030d3e3395e9384e82eeb18653528f766 100644
+--- a/net/minecraft/world/level/NaturalSpawner.java
++++ b/net/minecraft/world/level/NaturalSpawner.java
+@@ -200,6 +200,89 @@ public final class NaturalSpawner {
+         profiler.pop();
+     }
+ 
++    // coderyoMC start - P1.2e: per-region natural mob spawning.
++    /**
++     * Region-thread variant of {@link #spawnForChunk}. Identical spawn rules, but:
++     * <ul>
++     *   <li>uses {@code regionRandom} (the region's own RNG) everywhere {@code level.random}
++     *       would be used — the shared {@code Level.random} is a thread-unsafe RNG and MUST NOT
++     *       be touched off the orchestrator (design-spec §4.5);</li>
++     *   <li>the single shared {@code state} (SpawnState cookie) carries the GLOBAL mob cap +
++     *       per-player counts. Its mutating critical section ({@code canSpawn}/{@code afterSpawn},
++     *       the {@code PotentialCalculator}, the {@code LocalMobCapCalculator}, and the per-player
++     *       {@code mobCounts}/{@code mobBackoffCounts} maps reached via the spawn callbacks) is
++     *       serialized across regions by holding {@code synchronized(state)} for the whole
++     *       per-chunk spawn attempt. So multiple regions spawning in parallel collectively never
++     *       exceed the world's mob cap, and never race the cookie's non-thread-safe internals.</li>
++     * </ul>
++     * The actual mob {@code finalizeSpawn}/{@code addFreshEntity} runs inside that critical
++     * section; the lock is leaf-level (region workers only, never nested with another region's
++     * cookie) so it cannot deadlock. Spawning is a small fraction of the tick, so serializing it
++     * keeps the global cap exact while entity/block/scheduled/random ticking stays fully parallel.
++     */
++    public static void coderyoSpawnForChunk(
++        final ServerLevel level, final LevelChunk chunk, final NaturalSpawner.SpawnState state,
++        final List<MobCategory> spawningCategories, final net.minecraft.util.RandomSource regionRandom
++    ) {
++        // Serialize the whole per-chunk spawn attempt on the shared cookie so the global cap, the
++        // potential calculator, and the per-player counters are mutated atomically across regions.
++        synchronized (state) {
++            for (MobCategory mobCategory : spawningCategories) {
++                final boolean canSpawn;
++                int maxSpawns = Integer.MAX_VALUE;
++                if (level.paperConfig().entities.spawning.perPlayerMobSpawns) {
++                    int limit = mobCategory.getMaxInstancesPerChunk();
++                    org.bukkit.entity.SpawnCategory spawnCategory = org.bukkit.craftbukkit.util.CraftSpawnCategory.toBukkit(mobCategory);
++                    if (org.bukkit.craftbukkit.util.CraftSpawnCategory.isValidForLimits(spawnCategory)) {
++                        limit = level.getWorld().getSpawnLimit(spawnCategory);
++                    }
++                    int minDiff = Integer.MAX_VALUE;
++                    final ca.spottedleaf.moonrise.common.list.ReferenceList<net.minecraft.server.level.ServerPlayer> inRange =
++                        level.moonrise$getNearbyPlayers().getPlayers(chunk.getPos(), ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.TICK_VIEW_DISTANCE);
++                    if (inRange != null) {
++                        final net.minecraft.server.level.ServerPlayer[] backingSet = inRange.getRawDataUnchecked();
++                        for (int k = 0, len = inRange.size(); k < len; k++) {
++                            minDiff = Math.min(limit - level.getChunkSource().chunkMap.getMobCountNear(backingSet[k], mobCategory), minDiff);
++                        }
++                    }
++                    maxSpawns = (minDiff == Integer.MAX_VALUE) ? 0 : minDiff;
++                    canSpawn = maxSpawns > 0;
++                } else {
++                    canSpawn = state.canSpawnForCategoryLocal(mobCategory, chunk.getPos());
++                }
++                if (canSpawn) {
++                    coderyoSpawnCategoryForChunk(mobCategory, level, chunk, state::canSpawn, state::afterSpawn,
++                        maxSpawns, level.paperConfig().entities.spawning.perPlayerMobSpawns ? level.getChunkSource().chunkMap::updatePlayerMobTypeMap : null,
++                        regionRandom);
++                }
++            }
++        }
++    }
++
++    /** Region-RNG variant of {@link #spawnCategoryForChunk} (the maxSpawns/trackEntity overload). */
++    private static void coderyoSpawnCategoryForChunk(
++        final MobCategory mobCategory, final ServerLevel level, final LevelChunk chunk,
++        final NaturalSpawner.SpawnPredicate extraTest, final NaturalSpawner.AfterSpawnCallback spawnCallback,
++        final int maxSpawns, final @Nullable Consumer<Entity> trackEntity,
++        final net.minecraft.util.RandomSource regionRandom
++    ) {
++        BlockPos start = coderyoGetRandomPosWithin(level, chunk, regionRandom);
++        if (start.getY() >= level.getMinY() + 1) {
++            spawnCategoryForPosition(mobCategory, level, chunk, start, extraTest, spawnCallback, maxSpawns, trackEntity, regionRandom);
++        }
++    }
++
++    /** Region-RNG variant of {@link #getRandomPosWithin}. */
++    private static BlockPos coderyoGetRandomPosWithin(final Level level, final LevelChunk chunk, final net.minecraft.util.RandomSource regionRandom) {
++        ChunkPos pos = chunk.getPos();
++        int x = pos.getMinBlockX() + regionRandom.nextInt(16);
++        int z = pos.getMinBlockZ() + regionRandom.nextInt(16);
++        int topEmptyY = chunk.getHeight(Heightmap.Types.WORLD_SURFACE, x, z) + 1;
++        int y = Mth.randomBetweenInclusive(regionRandom, level.getMinY(), topEmptyY);
++        return new BlockPos(x, y, z);
++    }
++    // coderyoMC end - P1.2e
++
+     // Paper start - Add mobcaps commands
+     public static int globalLimitForCategory(final ServerLevel level, final MobCategory category, final int spawnableChunkCount) {
+         final int categoryLimit = level.getWorld().getSpawnLimitUnsafe(org.bukkit.craftbukkit.util.CraftSpawnCategory.toBukkit(category));
+@@ -261,6 +344,24 @@ public final class NaturalSpawner {
+         final NaturalSpawner.AfterSpawnCallback spawnCallback,
+         final int maxSpawns,
+         final @Nullable Consumer<Entity> trackEntity
++    ) {
++        // coderyoMC - P1.2e: vanilla overload delegates with the shared Level.random (orchestrator path).
++        spawnCategoryForPosition(mobCategory, level, chunk, start, extraTest, spawnCallback, maxSpawns, trackEntity, level.random);
++    }
++
++    // coderyoMC - P1.2e: RandomSource-parameterized variant so region workers spawn with the
++    // region's own RNG instead of the shared, thread-unsafe Level.random. All `level.random`
++    // uses below are replaced by `spawnRandom`; otherwise identical to vanilla.
++    public static void spawnCategoryForPosition(
++        final MobCategory mobCategory,
++        final ServerLevel level,
++        final ChunkAccess chunk,
++        final BlockPos start,
++        final NaturalSpawner.SpawnPredicate extraTest,
++        final NaturalSpawner.AfterSpawnCallback spawnCallback,
++        final int maxSpawns,
++        final @Nullable Consumer<Entity> trackEntity,
++        final net.minecraft.util.RandomSource spawnRandom
+     ) {
+         // Paper end - Optional per player mob spawns
+         StructureManager structureManager = level.structureManager();
+@@ -277,12 +378,12 @@ public final class NaturalSpawner {
+                 int ss = 6;
+                 MobSpawnSettings.SpawnerData currentSpawnData = null;
+                 SpawnGroupData groupData = null;
+-                int max = Mth.ceil(level.random.nextFloat() * 4.0F);
++                int max = Mth.ceil(spawnRandom.nextFloat() * 4.0F);
+                 int groupSize = 0;
+ 
+                 for (int ll = 0; ll < max; ll++) {
+-                    x += level.random.nextInt(6) - level.random.nextInt(6);
+-                    z += level.random.nextInt(6) - level.random.nextInt(6);
++                    x += spawnRandom.nextInt(6) - spawnRandom.nextInt(6);
++                    z += spawnRandom.nextInt(6) - spawnRandom.nextInt(6);
+                     pos.set(x, yStart, z);
+                     double xx = x + 0.5;
+                     double zz = z + 0.5;
+@@ -292,14 +393,14 @@ public final class NaturalSpawner {
+                         if (level.isLoadedAndInBounds(pos) && isRightDistanceToPlayerAndSpawnPoint(level, chunk, pos, nearestPlayerDistanceSqr)) { // Paper - don't load chunks for mob spawn
+                             if (currentSpawnData == null) {
+                                 Optional<MobSpawnSettings.SpawnerData> nextSpawnData = getRandomSpawnMobAt(
+-                                    level, structureManager, generator, mobCategory, level.random, pos
++                                    level, structureManager, generator, mobCategory, spawnRandom, pos
+                                 );
+                                 if (nextSpawnData.isEmpty()) {
+                                     break;
+                                 }
+ 
+                                 currentSpawnData = nextSpawnData.get();
+-                                max = currentSpawnData.minCount() + level.random.nextInt(1 + currentSpawnData.maxCount() - currentSpawnData.minCount());
++                                max = currentSpawnData.minCount() + spawnRandom.nextInt(1 + currentSpawnData.maxCount() - currentSpawnData.minCount());
+                             }
+ 
+                             // Paper start - PreCreatureSpawnEvent
+@@ -320,7 +421,7 @@ public final class NaturalSpawner {
+                                     return;
+                                 }
+ 
+-                                mob.snapTo(xx, yStart, zz, level.random.nextFloat() * 360.0F, 0.0F);
++                                mob.snapTo(xx, yStart, zz, spawnRandom.nextFloat() * 360.0F, 0.0F);
+                                 if (isValidPositionForMob(level, mob, nearestPlayerDistanceSqr)) {
+                                     groupData = mob.finalizeSpawn(
+                                         level, level.getCurrentDifficultyAt(mob.blockPosition()), EntitySpawnReason.NATURAL, groupData
+diff --git a/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java b/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
+index 1c7862ae4eaeb4d83e0fb423c86489f534e92be5..06b663b597a06364d947d3fc9865b437d4c52ee5 100644
+--- a/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
++++ b/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
+@@ -18,10 +18,22 @@ public class CollectingNeighborUpdater implements NeighborUpdater {
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private final Level level;
+     private final int maxChainedNeighborUpdates;
+-    private final ArrayDeque<CollectingNeighborUpdater.NeighborUpdates> stack = new ArrayDeque<>();
+-    private final List<CollectingNeighborUpdater.NeighborUpdates> addedThisLayer = new ArrayList<>();
+-    private int count = 0;
+-    private @Nullable Consumer<BlockPos> debugListener;
++    // coderyoMC start - P1.2e: the neighbor-update work-stack (stack/addedThisLayer/count) is
++    // per-invocation transient state. Under parallel region ticking, multiple region worker
++    // threads run setBlock -> neighbor updates concurrently on this SHARED per-level updater,
++    // corrupting the ArrayDeque (NoSuchElementException). Neighbor updates are chunk-local and a
++    // region owns disjoint chunks, so giving each ticking thread its OWN work-stack is correct
++    // (and identical to vanilla when single-threaded: one thread => one Frame). Replaces the three
++    // shared mutable fields with a ThreadLocal frame. region.enabled=false => only the orchestrator
++    // thread ever touches it => behaviour is byte-for-byte vanilla (single reused Frame).
++    private static final class Frame {
++        final ArrayDeque<CollectingNeighborUpdater.NeighborUpdates> stack = new ArrayDeque<>();
++        final List<CollectingNeighborUpdater.NeighborUpdates> addedThisLayer = new ArrayList<>();
++        int count = 0;
++    }
++
++    private final ThreadLocal<Frame> frame = ThreadLocal.withInitial(Frame::new);
++    private volatile @Nullable Consumer<BlockPos> debugListener;
+ 
+     public CollectingNeighborUpdater(final Level level, final int maxChainedNeighborUpdates) {
+         this.level = level;
+@@ -31,6 +43,7 @@ public class CollectingNeighborUpdater implements NeighborUpdater {
+     public void setDebugListener(final @Nullable Consumer<BlockPos> debugListener) {
+         this.debugListener = debugListener;
+     }
++    // coderyoMC end - P1.2e
+ 
+     @Override
+     public void shapeUpdate(
+@@ -66,48 +79,49 @@ public class CollectingNeighborUpdater implements NeighborUpdater {
+     }
+ 
+     private void addAndRun(final BlockPos pos, final CollectingNeighborUpdater.NeighborUpdates update) {
+-        boolean runningAlready = this.count > 0;
+-        boolean tooManyUpdates = this.maxChainedNeighborUpdates >= 0 && this.count >= this.maxChainedNeighborUpdates;
+-        this.count++;
++        final Frame f = this.frame.get(); // coderyoMC - P1.2e: per-thread neighbor-update stack
++        boolean runningAlready = f.count > 0;
++        boolean tooManyUpdates = this.maxChainedNeighborUpdates >= 0 && f.count >= this.maxChainedNeighborUpdates;
++        f.count++;
+         if (!tooManyUpdates) {
+             if (runningAlready) {
+-                this.addedThisLayer.add(update);
++                f.addedThisLayer.add(update);
+             } else {
+-                this.stack.push(update);
++                f.stack.push(update);
+             }
+-        } else if (this.count - 1 == this.maxChainedNeighborUpdates) {
++        } else if (f.count - 1 == this.maxChainedNeighborUpdates) {
+             LOGGER.error("Too many chained neighbor updates. Skipping the rest. First skipped position: {}", pos.toShortString());
+         }
+ 
+         if (!runningAlready) {
+-            this.runUpdates();
++            this.runUpdates(f);
+         }
+     }
+ 
+-    private void runUpdates() {
++    private void runUpdates(final Frame f) { // coderyoMC - P1.2e: per-thread neighbor-update stack
+         try {
+-            while (!this.stack.isEmpty() || !this.addedThisLayer.isEmpty()) {
+-                for (int i = this.addedThisLayer.size() - 1; i >= 0; i--) {
+-                    this.stack.push(this.addedThisLayer.get(i));
++            while (!f.stack.isEmpty() || !f.addedThisLayer.isEmpty()) {
++                for (int i = f.addedThisLayer.size() - 1; i >= 0; i--) {
++                    f.stack.push(f.addedThisLayer.get(i));
+                 }
+ 
+-                this.addedThisLayer.clear();
+-                CollectingNeighborUpdater.NeighborUpdates nextUpdates = this.stack.peek();
++                f.addedThisLayer.clear();
++                CollectingNeighborUpdater.NeighborUpdates nextUpdates = f.stack.peek();
+                 if (this.debugListener != null) {
+                     nextUpdates.forEachUpdatedPos(this.debugListener);
+                 }
+ 
+-                while (this.addedThisLayer.isEmpty()) {
++                while (f.addedThisLayer.isEmpty()) {
+                     if (!nextUpdates.runNext(this.level)) {
+-                        this.stack.pop();
++                        f.stack.pop();
+                         break;
+                     }
+                 }
+             }
+         } finally {
+-            this.stack.clear();
+-            this.addedThisLayer.clear();
+-            this.count = 0;
++            f.stack.clear();
++            f.addedThisLayer.clear();
++            f.count = 0;
+         }
+     }
+ 
