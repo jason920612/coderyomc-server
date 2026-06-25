@@ -49,26 +49,6 @@
      implementation("ca.spottedleaf:leafpile:1.0.0")
      implementation("org.jline:jline-terminal-ffm:3.27.1") // use ffm on java 22+
      implementation("org.jline:jline-terminal-jni:3.27.1") // fall back to jni on java 21
-@@ -157,6 +_,19 @@
-     // Spark
-     implementation("me.lucko:spark-api:0.1-20240720.200737-2")
-     implementation("me.lucko:spark-paper:1.10.152")
-+
-+    // coderyoMC P2: GPU worldgen-noise offload backend (design-spec §6).
-+    // LWJGL-OpenCL 3.3.6 — provides org.lwjgl.* (core: PointerBuffer, MemoryStack,
-+    // MemoryUtil) and org.lwjgl.opencl.* (CL10) used by
-+    // com.coderyo.compute.opencl.OpenClComputeBackend. The OpenCL bindings dispatch
-+    // to the system OpenCL ICD (no natives jar of their own), but the lwjgl core
-+    // module needs its platform-native runtime library. We ship the windows native
-+    // for the local/dev box; the GPU path is feature-flagged off by default and
-+    // falls back transparently to the CPU backend when no native/driver is present.
-+    val lwjglVersion = "3.3.6"
-+    implementation("org.lwjgl:lwjgl:$lwjglVersion")
-+    implementation("org.lwjgl:lwjgl-opencl:$lwjglVersion")
-+    runtimeOnly("org.lwjgl:lwjgl:$lwjglVersion:natives-windows")
- }
- 
- tasks.jar {
 @@ -237,7 +_,7 @@
      jvmArgumentProviders.add(provider)
  }
