@@ -1,0 +1,723 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 25 Jun 2026 11:07:34 +0800
+Subject: [PATCH] P1.2b: parallel region ticking first cut (flag-gated,
+ single-writer + orchestrator fallback)
+
+
+diff --git a/com/coderyo/region/Region.java b/com/coderyo/region/Region.java
+index 4db7cc1b969aa27bb6502a699498c07db7afecfa..0e8e60227bf905861ad1d4db1713bcf31a109c8a 100644
+--- a/com/coderyo/region/Region.java
++++ b/com/coderyo/region/Region.java
+@@ -10,6 +10,7 @@ import it.unimi.dsi.fastutil.longs.LongSets;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.atomic.AtomicReference;
+ import net.minecraft.resources.ResourceKey;
++import net.minecraft.util.RandomSource;
+ import net.minecraft.world.level.ChunkPos;
+ import net.minecraft.world.level.Level;
+ 
+@@ -44,9 +45,28 @@ public final class Region {
+ 
+     private final AtomicLong lastTickNanos = new AtomicLong(0L);
+ 
++    /**
++     * Per-region RNG (hazard mitigation, design-spec §4.5). The vanilla per-level
++     * {@code Level.random} is a {@code ThreadUnsafeRandom} and MUST NOT be touched
++     * concurrently by region worker threads. Region-local work that needs randomness
++     * uses THIS instance instead, so two regions ticking in parallel never share an
++     * RNG. Seeded from the region id for reproducibility within a run.
++     */
++    private final RandomSource random;
++
+     public Region(final RegionId id, final ResourceKey<Level> dimension) {
+         this.id = id;
+         this.dimension = dimension;
++        // Distinct, deterministic seed per region; never the shared level RNG.
++        this.random = RandomSource.create(id.value() * 0x9E3779B97F4A7C15L + 0x1234567L);
++    }
++
++    /**
++     * This region's own RNG. Safe to use from the single owning tick thread without
++     * contending the shared, thread-unsafe {@code Level.random}.
++     */
++    public RandomSource random() {
++        return this.random;
+     }
+ 
+     public RegionId id() {
+diff --git a/com/coderyo/region/RegionLifecycle.java b/com/coderyo/region/RegionLifecycle.java
+index 31aab02cf63b3be41733dbbc46ed8f2bd136ac74..ad86f2d6ef2514bb42806268097c4c9577b7d0e4 100644
+--- a/com/coderyo/region/RegionLifecycle.java
++++ b/com/coderyo/region/RegionLifecycle.java
+@@ -6,6 +6,7 @@ package com.coderyo.region;
+ 
+ import com.coderyo.region.merge.RegionDelta;
+ import com.coderyo.region.merge.RegionMerger;
++import java.util.List;
+ import java.util.Map;
+ import java.util.StringJoiner;
+ import java.util.concurrent.ConcurrentHashMap;
+@@ -61,6 +62,18 @@ public final class RegionLifecycle {
+             dim -> new RegionMerger(dim, INDEX, RegionConfig.mergeRadius()));
+     }
+ 
++    /**
++     * Snapshot of the live regions in {@code level}'s dimension (P1.2b). Returns an empty
++     * list when the subsystem is disabled or no chunks have formed yet. The list is a
++     * defensive copy; each {@link Region} is the live single-writer unit. Called by the
++     * orchestrator on the main thread between chunk lifecycle events (regions are quiescent
++     * then), so the per-merger access is single-threaded.
++     */
++    public static List<Region> regionsOf(final ServerLevel level) {
++        final RegionMerger merger = MERGERS.get(level.dimension());
++        return merger == null ? List.of() : merger.regions();
++    }
++
+     /**
+      * A chunk reached FULL status (border-loaded / ticking): add it to its dimension's
+      * region model and merge with adjacent loaded chunks. No-op unless the subsystem is
+diff --git a/com/coderyo/region/RegionTickOrchestrator.java b/com/coderyo/region/RegionTickOrchestrator.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fcf23e5ff5997e29b2c291b7d2bde66485e0c16
+--- /dev/null
++++ b/com/coderyo/region/RegionTickOrchestrator.java
+@@ -0,0 +1,271 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.function.BooleanSupplier;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.block.entity.TickingBlockEntity;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * The P1.2b orchestrator: the single entry point the upstream tick loop calls (from
++ * {@code MinecraftServer.tickChildren}, replacing the sequential per-level loop) when
++ * {@code region.enabled=true}.
++ *
++ * <p><b>What is parallelized (per region, on worker threads):</b>
++ * <ul>
++ *   <li>the region's inbound task queue (drained by {@link Region#tick});</li>
++ *   <li><b>entity ticking</b> for entities whose chunk is owned by the region;</li>
++ *   <li><b>block-entity ticking</b> for tickers whose chunk is owned by the region.</li>
++ * </ul>
++ * Independent regions (disjoint owned-chunk sets, possibly in the SAME level) run these
++ * concurrently on distinct {@code TickThread} workers — the demonstrable parallelism.
++ *
++ * <p><b>What stays on the orchestrator (main thread) for this first cut — documented
++ * fallback for P1.2c:</b>
++ * <ul>
++ *   <li>ALL per-level global work in {@code ServerLevel.tick}: world border, weather,
++ *       sleep/time-skip, raids, dragon fight, {@code chunkSource.tick} (natural spawning +
++ *       random ticks), block events, scoreboard, debug synchronizers;</li>
++ *   <li><b>scheduled block/fluid ticks</b> ({@code LevelTicks} are level-global priority
++ *       queues; partitioning their internal ordering safely is deferred);</li>
++ *   <li>entities / block-entities in <b>unowned</b> chunks (no region) — ticked on the
++ *       orchestrator as a correctness fallback so nothing is dropped.</li>
++ * </ul>
++ *
++ * <p><b>Ordering.</b> Per level we first run {@code level.tick(haveTime)} with the parallel
++ * phases suppressed (so all global work + spawning runs first, exactly as vanilla orders it),
++ * then snapshot the now-current entity / block-entity sets, partition them by region, fan out
++ * to the pool, and barrier-join before the next level. This preserves intra-tick ordering and
++ * picks up freshly spawned entities.
++ *
++ * <p><b>Safety.</b> Region worker threads write only to disjoint chunks (different entities /
++ * block positions), so concurrent region ticks never touch the same game state. Shared
++ * mutable containers ({@code entityTickList}, {@code blockEntityTickers}) are only mutated on
++ * the orchestrator thread (snapshot before, prune after). The single-writer-per-region CAS in
++ * {@link Region#tick} fails loud if a region were ever scheduled twice.
++ */
++public final class RegionTickOrchestrator {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/region");
++
++    private static volatile RegionScheduler scheduler;
++
++    /** Aggregate diagnostics. */
++    private static final AtomicLong tickCounter = new AtomicLong();
++
++    private RegionTickOrchestrator() {
++    }
++
++    private static RegionScheduler scheduler() {
++        RegionScheduler s = scheduler;
++        if (s == null) {
++            synchronized (RegionTickOrchestrator.class) {
++                s = scheduler;
++                if (s == null) {
++                    s = new WorkStealingRegionScheduler();
++                    scheduler = s;
++                }
++            }
++        }
++        return s;
++    }
++
++    /**
++     * Drive one server tick over all levels using the region scheduler. Called from
++     * {@code tickChildren} in place of the sequential {@code for (level) level.tick(haveTime)}
++     * loop, ONLY when {@link RegionConfig#isEnabled()}.
++     *
++     * @return {@code true} if the region path handled ticking (caller skips the vanilla loop);
++     *         {@code false} if it declined (caller must run the vanilla loop) — never happens
++     *         while enabled, but keeps the call site defensive.
++     */
++    public static boolean tickAllLevels(final Iterable<ServerLevel> levels, final BooleanSupplier haveTime) {
++        if (!RegionConfig.isEnabled()) {
++            return false;
++        }
++        final boolean debug = RegionConfig.isDebug();
++        final long serverTick = tickCounter.incrementAndGet();
++        for (final ServerLevel level : levels) {
++            tickLevel(level, haveTime, debug, serverTick);
++        }
++        return true;
++    }
++
++    private static void tickLevel(final ServerLevel level, final BooleanSupplier haveTime,
++                                  final boolean debug, final long serverTick) {
++        // 1) Run the level's global work on the orchestrator with the parallel phases
++        //    suppressed (entity + block-entity loops skipped — regions run them).
++        level.coderyoSetParallelTickActive(true);
++        try {
++            level.tick(haveTime);
++        } finally {
++            level.coderyoSetParallelTickActive(false);
++        }
++
++        // The entity phase only runs in vanilla when emptyTime < 300; honour that gate.
++        if (!level.coderyoEntityPhaseRuns()) {
++            return;
++        }
++
++        // 2) Partition the now-current entity / block-entity sets by owning region.
++        final List<Region> regions = RegionLifecycle.regionsOf(level);
++        if (regions.isEmpty()) {
++            // No regions formed yet for this level: fall back to ticking everything on the
++            // orchestrator so nothing is dropped (correctness over parallelism).
++            tickUnownedFallback(level, level.coderyoTickingEntitiesSnapshot(),
++                snapshotBlockEntities(level));
++            return;
++        }
++
++        final RegionIndex index = RegionLifecycle.index();
++
++        // region id -> work bucket
++        final Long2ObjectOpenHashMap<RegionWork> work = new Long2ObjectOpenHashMap<>();
++        for (final Region r : regions) {
++            work.put(r.id().value(), new RegionWork(r));
++        }
++
++        // Entities: route each to its owning region by chunk; unowned -> orchestrator fallback.
++        final List<Entity> unownedEntities = new ArrayList<>();
++        for (final Entity e : level.coderyoTickingEntitiesSnapshot()) {
++            final ChunkPos cp = e.chunkPosition();
++            final RegionId owner = index.regionOf(level.dimension(), cp.longKey());
++            final RegionWork w = owner == null ? null : work.get(owner.value());
++            if (w == null) {
++                unownedEntities.add(e);
++            } else {
++                w.entities.add(e);
++            }
++        }
++
++        // Block entities: same routing.
++        final List<TickingBlockEntity> unownedBEs = new ArrayList<>();
++        final boolean tickBEs = level.coderyoBlockEntitiesEnabled();
++        if (tickBEs) {
++            for (final TickingBlockEntity be : snapshotBlockEntities(level)) {
++                final long ck = ChunkPos.pack(be.getPos());
++                final RegionId owner = index.regionOf(level.dimension(), ck);
++                final RegionWork w = owner == null ? null : work.get(owner.value());
++                if (w == null) {
++                    unownedBEs.add(be);
++                } else {
++                    w.blockEntities.add(be);
++                }
++            }
++        }
++
++        // 3) Fan out: each region ticks its own disjoint buckets in parallel; barrier-join.
++        final List<TickingBlockEntity> removedBEs = java.util.Collections.synchronizedList(new ArrayList<>());
++        final List<Region> activeWork = new ArrayList<>();
++        for (final Region r : regions) {
++            final RegionWork w = work.get(r.id().value());
++            if (w != null && (!w.entities.isEmpty() || !w.blockEntities.isEmpty())) {
++                activeWork.add(r);
++            }
++        }
++
++        scheduler().submitTick(activeWork, region -> {
++            final RegionWork w = work.get(region.id().value());
++            // Record the owning worker thread (single-writer); two regions => two threads.
++            final Thread self = Thread.currentThread();
++            w.workerThreadName = self.getName();
++            w.workerThreadId = self.threadId();
++            // Ticks only this region's chunks.
++            for (final Entity e : w.entities) {
++                level.coderyoTickOneEntity(e);
++            }
++            for (final TickingBlockEntity be : w.blockEntities) {
++                if (level.coderyoTickOneBlockEntity(be)) {
++                    removedBEs.add(be);
++                }
++            }
++        });
++
++        // 4) Orchestrator-thread fallback for unowned entities / block-entities + pruning.
++        tickUnownedFallback(level, unownedEntities, tickBEs ? unownedBEs : List.of());
++        level.coderyoPruneBlockEntityTickers(removedBEs);
++
++        if (debug) {
++            logParallelEvidence(level, serverTick, activeWork, work);
++        }
++    }
++
++    private static List<TickingBlockEntity> snapshotBlockEntities(final ServerLevel level) {
++        return level.coderyoBlockEntitiesEnabled()
++            ? level.coderyoBlockEntityTickersSnapshot()
++            : List.of();
++    }
++
++    /** Tick entities / block-entities with no owning region on the orchestrator thread. */
++    private static void tickUnownedFallback(final ServerLevel level, final List<Entity> entities,
++                                            final List<TickingBlockEntity> blockEntities) {
++        for (final Entity e : entities) {
++            level.coderyoTickOneEntity(e);
++        }
++        if (!blockEntities.isEmpty()) {
++            final List<TickingBlockEntity> removed = new ArrayList<>();
++            for (final TickingBlockEntity be : blockEntities) {
++                if (level.coderyoTickOneBlockEntity(be)) {
++                    removed.add(be);
++                }
++            }
++            level.coderyoPruneBlockEntityTickers(removed);
++        }
++    }
++
++    /**
++     * Emit the per-region parallelism evidence required by the P1.2b e2e: for each region that
++     * ticked this server tick, the worker thread name/id that owned it, its entity / block-entity
++     * counts, and its per-region tick time (TPS accounting). Two regions reporting DISTINCT
++     * worker thread names is the proof of real parallelism.
++     */
++    private static void logParallelEvidence(final ServerLevel level, final long serverTick,
++                                            final List<Region> ticked,
++                                            final Long2ObjectOpenHashMap<RegionWork> work) {
++        if (ticked.isEmpty()) {
++            return;
++        }
++        final String dim = level.dimension().identifier().toString();
++        for (final Region r : ticked) {
++            final RegionWork w = work.get(r.id().value());
++            final double ms = r.lastTickNanos() / 1_000_000.0d;
++            final double tps = ms > 0.0 ? Math.min(20.0, 1000.0 / Math.max(ms, 0.05) / 1.0) : 20.0;
++            LOGGER.info(
++                "tick#{} region R{} [{}] ticked on thread '{}' (id={}) -- {} entit(y/ies), {} block-entit(y/ies), {} ms, ~{} TPS-budget",
++                serverTick, r.id().value(), dim, w.workerThreadName, w.workerThreadId,
++                w.entities.size(), w.blockEntities.size(),
++                String.format(java.util.Locale.ROOT, "%.3f", ms),
++                String.format(java.util.Locale.ROOT, "%.1f", tps));
++        }
++    }
++
++    public static void shutdown() {
++        final RegionScheduler s = scheduler;
++        if (s != null) {
++            s.shutdown();
++        }
++    }
++
++    /** Mutable per-region work bucket for one tick, plus the worker that processed it. */
++    private static final class RegionWork {
++        final Region region;
++        final List<Entity> entities = new ArrayList<>();
++        final List<TickingBlockEntity> blockEntities = new ArrayList<>();
++        volatile String workerThreadName = "?";
++        volatile long workerThreadId = -1L;
++
++        RegionWork(final Region region) {
++            this.region = region;
++        }
++    }
++}
+diff --git a/com/coderyo/region/WorkStealingRegionScheduler.java b/com/coderyo/region/WorkStealingRegionScheduler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7029c40bdb2a5ff17c8cc7db7d29f0f1f6d78ed
+--- /dev/null
++++ b/com/coderyo/region/WorkStealingRegionScheduler.java
+@@ -0,0 +1,164 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import ca.spottedleaf.moonrise.common.util.TickThread;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.Future;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.Consumer;
++import java.util.function.Supplier;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Parallel {@link RegionScheduler} (design-spec §4.2): ticks all active regions
++ * concurrently on a worker pool sized {@code ~availableProcessors-1}, replacing the
++ * dormant {@link SequentialRegionScheduler} when {@code region.enabled=true}.
++ *
++ * <p><b>Why a custom pool, not a bare {@code ForkJoinPool}.</b> Moonrise's
++ * {@code TickThread.ensureTickThread(...)} assertions (fired throughout entity /
++ * block-entity ticking) require the running thread to be a
++ * {@link ca.spottedleaf.moonrise.common.util.TickThread}. A {@code ForkJoinPool} mandates
++ * {@code ForkJoinWorkerThread} workers, which cannot also extend {@code TickThread}
++ * (single inheritance — both extend {@code Thread}). So our workers are
++ * {@link RegionWorkerThread} {@code extends TickThread}, driven by a fixed
++ * {@link ThreadPoolExecutor}. The independent regions still tick truly in parallel
++ * (the property P1.2b requires); true work-stealing dequeues are a later optimisation
++ * (P1.2c). In non-Folia Paper the tick-thread check is simply
++ * {@code Thread.currentThread() instanceof TickThread} — we satisfy exactly that public
++ * check and reuse NONE of Folia's region threading.
++ *
++ * <p><b>Single-writer-per-region invariant.</b> Each region is submitted as exactly one
++ * task per tick pass; {@link Region#tick(Runnable)} claims single-writer ownership with a
++ * fail-loud CAS, so a mis-schedule throws rather than corrupts. The orchestrator
++ * barrier-joins all region tasks before its global post-processing, so no region tick
++ * straddles two server ticks.
++ *
++ * <p><b>Deadlock-freedom (design-spec §4.5).</b> A region tick never blocks on another
++ * region; cross-region work goes through one-directional inbound posts; {@link #postQuery}
++ * returns a future resolved later on the target region thread, never awaited inside a tick.
++ */
++public final class WorkStealingRegionScheduler implements RegionScheduler {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/region");
++
++    private final ThreadPoolExecutor pool;
++    private final int parallelism;
++
++    public WorkStealingRegionScheduler() {
++        this(defaultParallelism());
++    }
++
++    public WorkStealingRegionScheduler(final int parallelism) {
++        this.parallelism = Math.max(1, parallelism);
++        final ThreadFactory factory = new ThreadFactory() {
++            private final AtomicInteger counter = new AtomicInteger();
++            @Override
++            public Thread newThread(final Runnable r) {
++                final RegionWorkerThread t = new RegionWorkerThread(r, this.counter.incrementAndGet());
++                t.setDaemon(true);
++                return t;
++            }
++        };
++        this.pool = new ThreadPoolExecutor(
++            this.parallelism, this.parallelism,
++            0L, TimeUnit.MILLISECONDS,
++            new LinkedBlockingQueue<>(),
++            factory);
++        this.pool.prestartAllCoreThreads();
++        LOGGER.info("WorkStealingRegionScheduler started (parallelism={})", this.parallelism);
++    }
++
++    private static int defaultParallelism() {
++        return Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
++    }
++
++    public int parallelism() {
++        return this.parallelism;
++    }
++
++    /**
++     * Submit one tick pass: every active region is ticked concurrently on the pool;
++     * this method blocks on the calling orchestrator thread until ALL region ticks
++     * complete — the barrier separating the parallel region phase from the orchestrator's
++     * global post-processing.
++     */
++    @Override
++    public void submitTick(final Iterable<Region> activeRegions, final Consumer<Region> regionTickBody) {
++        final List<Future<?>> inFlight = new ArrayList<>();
++        for (final Region region : activeRegions) {
++            if (!region.isActive()) {
++                continue;
++            }
++            inFlight.add(this.pool.submit(() ->
++                // Region.tick claims single-writer ownership (fail-loud), drains inbound,
++                // then runs the body. A throw here surfaces via the Future below.
++                region.tick(() -> regionTickBody.accept(region))));
++        }
++        // Barrier: orchestrator waits for the whole parallel phase to finish.
++        RuntimeException firstFailure = null;
++        for (final Future<?> f : inFlight) {
++            try {
++                f.get();
++            } catch (final InterruptedException ie) {
++                Thread.currentThread().interrupt();
++                throw new RuntimeException("interrupted while awaiting region tick barrier", ie);
++            } catch (final Exception ee) {
++                final Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
++                // Fail loud: a region tick failure (incl. single-writer violation) must be
++                // visible to the orchestrator, never swallowed.
++                if (firstFailure == null) {
++                    firstFailure = new RuntimeException("region tick failed", cause);
++                } else {
++                    firstFailure.addSuppressed(cause);
++                }
++            }
++        }
++        if (firstFailure != null) {
++            throw firstFailure;
++        }
++    }
++
++    @Override
++    public void post(final RegionId target, final Region region, final Runnable task) {
++        region.inbound().post(task);
++    }
++
++    @Override
++    public <T> CompletableFuture<T> postQuery(final RegionId target, final Region region, final Supplier<T> query) {
++        final CompletableFuture<T> future = new CompletableFuture<>();
++        region.inbound().post(() -> {
++            try {
++                future.complete(query.get());
++            } catch (final Throwable t) {
++                future.completeExceptionally(t);
++            }
++        });
++        return future;
++    }
++
++    @Override
++    public void shutdown() {
++        this.pool.shutdownNow();
++    }
++
++    /**
++     * Pool worker that IS a {@link TickThread}, so Moonrise tick-thread assertions pass on
++     * region workers (the assertion reads {@code instanceof TickThread}). We reuse only that
++     * public, non-Folia identity check — no Folia region threading.
++     */
++    private static final class RegionWorkerThread extends TickThread {
++        RegionWorkerThread(final Runnable run, final int idx) {
++            super(run, "coderyo-region-worker-" + idx);
++        }
++    }
++}
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 1049f78b1300a584f87579ee5af83145f46dac18..d9ba08a978c8777abe16d688ee11a5cbf8b6378e 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1810,6 +1810,33 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         this.updateEffectiveRespawnData();
+ 
+         this.isIteratingOverLevels = true; // Paper - Throw exception on world create while being ticked
++        // coderyoMC start - P1.2b: when region.enabled, drive per-level ticking through the
++        // region scheduler (independent regions tick in parallel) instead of this sequential
++        // loop. The pre-tick global flags are still computed once per level on the orchestrator
++        // before fan-out. region.enabled=false => regionDriven stays false and the original
++        // sequential loop below runs byte-for-byte vanilla.
++        boolean regionDriven = false;
++        if (com.coderyo.region.RegionConfig.isEnabled()) {
++            for (ServerLevel level : this.getAllLevels()) {
++                level.hasPhysicsEvent = org.bukkit.event.block.BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length > 0; // Paper - BlockPhysicsEvent
++                level.hasEntityMoveEvent = io.papermc.paper.event.entity.EntityMoveEvent.getHandlerList().getRegisteredListeners().length > 0; // Paper - Add EntityMoveEvent
++                level.updateLagCompensationTick(); // Paper - lag compensation
++                net.minecraft.world.level.block.entity.HopperBlockEntity.skipHopperEvents = level.paperConfig().hopper.disableMoveEvent || org.bukkit.event.inventory.InventoryMoveItemEvent.getHandlerList().getRegisteredListeners().length == 0; // Paper - Perf: Optimize Hoppers
++            }
++            try {
++                regionDriven = com.coderyo.region.RegionTickOrchestrator.tickAllLevels(this.getAllLevels(), haveTime);
++            } catch (Throwable t) {
++                CrashReport report = CrashReport.forThrowable(t, "Exception ticking worlds (region scheduler)");
++                throw new ReportedException(report);
++            }
++            if (regionDriven) {
++                for (ServerLevel level : this.getAllLevels()) {
++                    level.explosionDensityCache.clear(); // Paper - Optimize explosions
++                }
++            }
++        }
++        if (!regionDriven) {
++        // coderyoMC end - P1.2b
+         for (ServerLevel level : this.getAllLevels()) {
+             level.hasPhysicsEvent = org.bukkit.event.block.BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length > 0; // Paper - BlockPhysicsEvent
+             level.hasEntityMoveEvent = io.papermc.paper.event.entity.EntityMoveEvent.getHandlerList().getRegisteredListeners().length > 0; // Paper - Add EntityMoveEvent
+@@ -1830,6 +1857,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             profiler.pop();
+             level.explosionDensityCache.clear(); // Paper - Optimize explosions
+         }
++        } // coderyoMC - P1.2b
+         this.isIteratingOverLevels = false; // Paper - Throw exception on world create while being ticked
+ 
+         profiler.popPush("connection");
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index ca1725b9ad40f41e241447e14948ee4116c3e4c9..bb7cb4a3ef6d5c13b9575c3de0b8c0dc008ac9b7 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -881,6 +881,12 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             }
+ 
+             io.papermc.paper.entity.activation.ActivationRange.activateEntities(this); // Paper - EAR
++            // coderyoMC start - P1.2b: when region.enabled, the entity + block-entity phases
++            // are run PER-REGION on worker threads by the orchestrator (com.coderyo.region),
++            // partitioned by owned chunk. Skip the sequential loop here so work runs exactly
++            // once. region.enabled=false → coderyoIsParallelTickActive() is always false →
++            // byte-for-byte vanilla path below.
++            if (!this.coderyoIsParallelTickActive()) {
+             this.entityTickList
+                 .forEach(
+                     entity -> {
+@@ -912,6 +918,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             this.tickBlockEntities();
+             profiler.pop();
+             } // Paper - option to disable ticking
++            } else {
++                // coderyoMC - P1.2b: parallel path skipped the entity/blockEntity loops above;
++                // close the "entities" profiler frame the skipped blockEntities pop() would have.
++                profiler.pop();
++            } // coderyoMC end - P1.2b
+             this.spigotConfig.currentPrimedTnt = 0; // Spigot
+         }
+ 
+@@ -930,6 +941,100 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         profiler.pop();
+     }
+ 
++    // coderyoMC start - P1.2b: per-region entity + block-entity ticking hooks.
++    // These let the region orchestrator (com.coderyo.region) run the per-entity and
++    // per-block-entity bodies on a region worker thread, restricted to chunks the region
++    // owns, while the exact vanilla per-item logic stays here (no semantic drift). They are
++    // ONLY invoked when region.enabled=true; with the flag false nothing calls them and the
++    // sequential path in tick() runs unchanged.
++
++    /** Set true by the orchestrator across the parallel region phase; makes tick() skip the
++     *  entity + block-entity loops because regions run them. Reset to false after the barrier. */
++    private volatile boolean coderyoParallelTickActive = false;
++
++    public boolean coderyoIsParallelTickActive() {
++        return this.coderyoParallelTickActive;
++    }
++
++    public void coderyoSetParallelTickActive(final boolean active) {
++        this.coderyoParallelTickActive = active;
++    }
++
++    /** True if the entity tick phase should run at all this tick (matches tick()'s emptyTime gate). */
++    public boolean coderyoEntityPhaseRuns() {
++        return this.emptyTime < 300;
++    }
++
++    /**
++     * Snapshot of currently-ticking entities (defensive copy) for partitioning by region on
++     * the orchestrator thread. Mirrors {@code entityTickList.forEach} membership.
++     */
++    public java.util.List<Entity> coderyoTickingEntitiesSnapshot() {
++        final java.util.List<Entity> out = new java.util.ArrayList<>();
++        this.entityTickList.forEach(out::add);
++        return out;
++    }
++
++    /** Snapshot of current block-entity tickers (defensive copy) for region partitioning. */
++    public java.util.List<net.minecraft.world.level.block.entity.TickingBlockEntity> coderyoBlockEntityTickersSnapshot() {
++        // Promote pending tickers first (mirrors tickBlockEntities()), on the orchestrator thread.
++        this.coderyoPromotePendingBlockEntityTickers();
++        return new java.util.ArrayList<>(this.blockEntityTickers);
++    }
++
++    /** Whether block-entity ticking is enabled at all (matches tick()'s paperConfig gate). */
++    public boolean coderyoBlockEntitiesEnabled() {
++        return this.paperConfig().unsupportedSettings.ticking.blockEntities;
++    }
++
++    /**
++     * Run the exact vanilla per-entity tick body for ONE entity (used by a region worker for
++     * an entity in a chunk it owns). Returns silently for removed/frozen/passenger entities,
++     * matching the sequential loop in tick().
++     */
++    public void coderyoTickOneEntity(final Entity entity) {
++        final TickRateManager tickRateManager = this.tickRateManager();
++        if (entity.isRemoved()) {
++            return;
++        }
++        if (tickRateManager.isEntityFrozen(entity)) {
++            return;
++        }
++        entity.checkDespawn();
++        Entity vehicle = entity.getVehicle();
++        if (vehicle != null) {
++            if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
++                return;
++            }
++            entity.stopRiding();
++        }
++        this.guardEntityTick(this::tickNonPassenger, entity);
++    }
++
++    /**
++     * Run the exact vanilla tick body for ONE block-entity ticker (used by a region worker
++     * for a ticker in a chunk it owns). Returns true if the ticker is removed and should be
++     * pruned by the orchestrator after the barrier. Mirrors the inner loop of
++     * {@link #tickBlockEntities()} minus the shared-list mutation (done on orchestrator).
++     */
++    public boolean coderyoTickOneBlockEntity(final net.minecraft.world.level.block.entity.TickingBlockEntity ticker) {
++        if (ticker.isRemoved()) {
++            return true;
++        }
++        if (this.tickRateManager().runsNormally() && this.shouldTickBlocksAt(ticker.getPos())) {
++            ticker.tick();
++        }
++        return false;
++    }
++
++    /** Prune removed block-entity tickers from the shared list (orchestrator, post-barrier). */
++    public void coderyoPruneBlockEntityTickers(final java.util.Collection<net.minecraft.world.level.block.entity.TickingBlockEntity> removed) {
++        if (!removed.isEmpty()) {
++            this.blockEntityTickers.removeAll(removed);
++        }
++    }
++    // coderyoMC end - P1.2b
++
+     @Override
+     public boolean shouldTickBlocksAt(final long chunkPos) {
+         // Paper start - rewrite chunk system
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index d12080e80e51916cefb37a3b7bcb1dd9c092304e..4d1e7cd93f6ee272017b704d3c820d3b1e6ee821 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -122,6 +122,16 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     public final List<TickingBlockEntity> blockEntityTickers = Lists.newArrayList();
+     protected final CollectingNeighborUpdater neighborUpdater;
+     private final List<TickingBlockEntity> pendingBlockEntityTickers = Lists.newArrayList();
++
++    // coderyoMC - P1.2b: promote pending block-entity tickers into the live list, mirroring the
++    // head of tickBlockEntities(). Called by the region orchestrator on the main thread before
++    // it snapshots blockEntityTickers for per-region partitioning. No-op unless region.enabled.
++    public void coderyoPromotePendingBlockEntityTickers() {
++        if (!this.pendingBlockEntityTickers.isEmpty()) {
++            this.blockEntityTickers.addAll(this.pendingBlockEntityTickers);
++            this.pendingBlockEntityTickers.clear();
++        }
++    }
+     private boolean tickingBlockEntities;
+     protected final Thread thread;
+     private final boolean isDebug;
