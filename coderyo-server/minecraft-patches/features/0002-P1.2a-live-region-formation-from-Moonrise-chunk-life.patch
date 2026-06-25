@@ -1,0 +1,568 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Thu, 25 Jun 2026 10:35:02 +0800
+Subject: [PATCH] P1.2a: live region formation from Moonrise chunk lifecycle
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+index 9a9a599ef178f851ee5c783631a724013a693586..08427275c4f1e435a068c61bb2f1b00f31974628 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+@@ -1253,6 +1253,10 @@ public final class NewChunkHolder {
+                         PlatformHooks.get().onChunkBorder(chunk, this.vanillaChunkHolder);
+                         this.onFullChunkLoadChange(true, changedFullStatus);
+                         this.completeFullStatusConsumers(FullChunkStatus.FULL, chunk);
++                        // coderyoMC: live region formation (flag-gated; vanilla no-op when disabled)
++                        if (com.coderyo.region.RegionConfig.isEnabled()) {
++                            com.coderyo.region.RegionLifecycle.onChunkFullLoad(this.world, this.chunkX, this.chunkZ);
++                        }
+                     }
+ 
+                     if (!current.isOrAfter(FullChunkStatus.BLOCK_TICKING) && pending.isOrAfter(FullChunkStatus.BLOCK_TICKING)) {
+@@ -1287,6 +1291,10 @@ public final class NewChunkHolder {
+                         PlatformHooks.get().onChunkNotBorder(chunk, this.vanillaChunkHolder);
+                         PlatformHooks.get().onChunkPostNotBorder(chunk, this.vanillaChunkHolder);
+                         this.updateCurrentState(FullChunkStatus.INACCESSIBLE);
++                        // coderyoMC: live region split-on-unload (flag-gated; vanilla no-op when disabled)
++                        if (com.coderyo.region.RegionConfig.isEnabled()) {
++                            com.coderyo.region.RegionLifecycle.onChunkFullUnload(this.world, this.chunkX, this.chunkZ);
++                        }
+                     }
+                 }
+             }
+diff --git a/com/coderyo/region/RegionConfig.java b/com/coderyo/region/RegionConfig.java
+index d80f5955febe71cbea3cc9af38d4fa9520f178b7..4e9e70d73b09aa94cb109731d333c73182350edb 100644
+--- a/com/coderyo/region/RegionConfig.java
++++ b/com/coderyo/region/RegionConfig.java
+@@ -19,6 +19,8 @@ package com.coderyo.region;
+  * <pre>
+  *   -Dcoderyo.region.enabled=true        (system property, takes precedence)
+  *   CODERYO_REGION_ENABLED=true          (environment variable, fallback)
++ *   -Dcoderyo.region.debug=true          (region lifecycle logging; default false)
++ *   CODERYO_REGION_DEBUG=true            (environment variable, fallback)
+  * </pre>
+  */
+ public final class RegionConfig {
+@@ -28,24 +30,43 @@ public final class RegionConfig {
+     /** Environment variable key. */
+     public static final String ENV = "CODERYO_REGION_ENABLED";
+ 
++    /** System property key for region lifecycle debug logging. */
++    public static final String DEBUG_PROPERTY = "coderyo.region.debug";
++    /** Environment variable key for region lifecycle debug logging. */
++    public static final String DEBUG_ENV = "CODERYO_REGION_DEBUG";
++
++    /** System property key for the Chebyshev merge radius (chunks). */
++    public static final String MERGE_RADIUS_PROPERTY = "coderyo.region.mergeRadius";
++    /** Environment variable key for the Chebyshev merge radius (chunks). */
++    public static final String MERGE_RADIUS_ENV = "CODERYO_REGION_MERGE_RADIUS";
++
+     /** {@code region.enabled} default — dormant. */
+     public static final boolean DEFAULT_ENABLED = false;
+ 
+-    private static final boolean ENABLED = resolveEnabled();
++    /** {@code region.debug} default — quiet. */
++    public static final boolean DEFAULT_DEBUG = false;
++
++    /** {@code region.mergeRadius} default — design-spec §7.2 (chunks). */
++    public static final int DEFAULT_MERGE_RADIUS = 8;
++
++    private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
++    private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, DEFAULT_DEBUG);
++    private static final int MERGE_RADIUS =
++        resolveInt(MERGE_RADIUS_PROPERTY, MERGE_RADIUS_ENV, DEFAULT_MERGE_RADIUS);
+ 
+     private RegionConfig() {
+     }
+ 
+-    private static boolean resolveEnabled() {
+-        final String prop = System.getProperty(PROPERTY);
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
+         if (prop != null) {
+             return Boolean.parseBoolean(prop.trim());
+         }
+-        final String env = System.getenv(ENV);
+-        if (env != null) {
+-            return Boolean.parseBoolean(env.trim());
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
+         }
+-        return DEFAULT_ENABLED;
++        return fallback;
+     }
+ 
+     /**
+@@ -55,4 +76,37 @@ public final class RegionConfig {
+     public static boolean isEnabled() {
+         return ENABLED;
+     }
++
++    /**
++     * Whether region lifecycle (form/merge/split) logging is enabled. Resolved once
++     * at class-load. Default {@link #DEFAULT_DEBUG} (false). Only consulted when the
++     * subsystem is also {@link #isEnabled() enabled}.
++     */
++    public static boolean isDebug() {
++        return DEBUG;
++    }
++
++    /**
++     * Chebyshev merge radius (chunks) used by the region merger. Resolved once at
++     * class-load. Default {@link #DEFAULT_MERGE_RADIUS}.
++     */
++    public static int mergeRadius() {
++        return MERGE_RADIUS;
++    }
++
++    private static int resolveInt(final String property, final String env, final int fallback) {
++        String raw = System.getProperty(property);
++        if (raw == null) {
++            raw = System.getenv(env);
++        }
++        if (raw == null) {
++            return fallback;
++        }
++        try {
++            final int parsed = Integer.parseInt(raw.trim());
++            return parsed >= 1 ? parsed : fallback;
++        } catch (final NumberFormatException ex) {
++            return fallback;
++        }
++    }
+ }
+diff --git a/com/coderyo/region/RegionLifecycle.java b/com/coderyo/region/RegionLifecycle.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..31aab02cf63b3be41733dbbc46ed8f2bd136ac74
+--- /dev/null
++++ b/com/coderyo/region/RegionLifecycle.java
+@@ -0,0 +1,126 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region;
++
++import com.coderyo.region.merge.RegionDelta;
++import com.coderyo.region.merge.RegionMerger;
++import java.util.Map;
++import java.util.StringJoiner;
++import java.util.concurrent.ConcurrentHashMap;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Live entry point that drives region formation from the real Moonrise chunk
++ * lifecycle (P1.2a). The single upstream patch point (a tiny delegation inside
++ * {@code NewChunkHolder}'s full-status transition) calls {@link #onChunkFullLoad}
++ * when a chunk reaches FULL status and {@link #onChunkFullUnload} when it drops
++ * below FULL.
++ *
++ * <p><b>Dormancy contract:</b> both entry points return immediately when
++ * {@link RegionConfig#isEnabled()} is false. The patch call sites are ALSO gated on
++ * that flag, so with {@code region.enabled=false} not even this class is touched and
++ * the chunk system runs byte-for-byte vanilla. When enabled, each load/unload feeds
++ * the per-dimension {@link RegionMerger} and the resulting {@link RegionDelta} is
++ * logged (gated on {@link RegionConfig#isDebug()}).
++ *
++ * <p>This is the P1.2a increment: it proves the {@link RegionIndex} forms correctly
++ * against the live chunk system. It does NOT yet change the tick loop — the
++ * {@link RegionScheduler} stays sequential/dormant (P1.2b).
++ *
++ * <p>Threading: Moonrise invokes the full-status transition on the level's tick
++ * thread (it asserts {@code TickThread.ensureTickThread}). Different dimensions may
++ * tick on different threads, but each {@link RegionMerger} is owned by exactly one
++ * dimension, so per-merger access is single-threaded. The merger map itself is a
++ * {@link ConcurrentHashMap} to make first-touch creation safe across dimensions.
++ */
++public final class RegionLifecycle {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/region");
++
++    private static final RegionIndex INDEX = new RegionIndex();
++
++    private static final Map<ResourceKey<Level>, RegionMerger> MERGERS = new ConcurrentHashMap<>();
++
++    private RegionLifecycle() {
++    }
++
++    /** The global chunk->region index. */
++    public static RegionIndex index() {
++        return INDEX;
++    }
++
++    private static RegionMerger mergerFor(final ServerLevel level) {
++        return MERGERS.computeIfAbsent(level.dimension(),
++            dim -> new RegionMerger(dim, INDEX, RegionConfig.mergeRadius()));
++    }
++
++    /**
++     * A chunk reached FULL status (border-loaded / ticking): add it to its dimension's
++     * region model and merge with adjacent loaded chunks. No-op unless the subsystem is
++     * enabled. Must be called on the owning level's tick thread.
++     */
++    public static void onChunkFullLoad(final ServerLevel level, final int chunkX, final int chunkZ) {
++        if (!RegionConfig.isEnabled()) {
++            return;
++        }
++        final RegionMerger merger = mergerFor(level);
++        final RegionDelta delta = merger.addLoadedChunk(ChunkPos.pack(chunkX, chunkZ));
++        logDelta(level, "load", chunkX, chunkZ, merger, delta);
++    }
++
++    /**
++     * A chunk dropped below FULL status (unloading): remove it from its dimension's
++     * region model, which may split a region if it disconnected a cluster. No-op unless
++     * the subsystem is enabled. Must be called on the owning level's tick thread.
++     */
++    public static void onChunkFullUnload(final ServerLevel level, final int chunkX, final int chunkZ) {
++        if (!RegionConfig.isEnabled()) {
++            return;
++        }
++        final RegionMerger merger = mergerFor(level);
++        final RegionDelta delta = merger.removeLoadedChunk(ChunkPos.pack(chunkX, chunkZ));
++        logDelta(level, "unload", chunkX, chunkZ, merger, delta);
++    }
++
++    private static void logDelta(final ServerLevel level, final String cause,
++                                 final int chunkX, final int chunkZ,
++                                 final RegionMerger merger, final RegionDelta delta) {
++        if (!RegionConfig.isDebug() || delta.isEmpty()) {
++            return;
++        }
++        final String dim = level.dimension().identifier().toString();
++        for (final RegionDelta.Formed f : delta.formed()) {
++            LOGGER.info("region R{} formed ({} chunks) [{}] (chunk {},{} {})",
++                f.id().value(), f.chunkCount(), dim, chunkX, chunkZ, cause);
++        }
++        for (final RegionDelta.Merged m : delta.merged()) {
++            final StringJoiner sources = new StringJoiner("+R", "R", "");
++            for (final RegionId src : m.sources()) {
++                sources.add(Long.toString(src.value()));
++            }
++            LOGGER.info("merged {} -> R{} ({} chunks) [{}] (chunk {},{} {})",
++                sources, m.result().value(), m.chunkCount(), dim, chunkX, chunkZ, cause);
++        }
++        for (final RegionDelta.Split s : delta.splits()) {
++            final StringJoiner parts = new StringJoiner(",", "", "");
++            for (final RegionDelta.RegionRef ref : s.parts()) {
++                parts.add("R" + ref.id().value() + "(" + ref.chunkCount() + ")");
++            }
++            LOGGER.info("split R{} -> {} [{}] (chunk {},{} {})",
++                s.source().value(), parts, dim, chunkX, chunkZ, cause);
++        }
++        for (final RegionId d : delta.dissolved()) {
++            LOGGER.info("region R{} dissolved (0 chunks) [{}] (chunk {},{} {})",
++                d.value(), dim, chunkX, chunkZ, cause);
++        }
++        LOGGER.info("[{}] now {} region(s), {} loaded chunk(s)",
++            dim, merger.regionCount(), merger.loadedChunkCount());
++    }
++}
+diff --git a/com/coderyo/region/merge/RegionDelta.java b/com/coderyo/region/merge/RegionDelta.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3b7097fc9358a18d45b0ce46a31e87bf1d7dd94
+--- /dev/null
++++ b/com/coderyo/region/merge/RegionDelta.java
+@@ -0,0 +1,55 @@
++/*
++ * coderyoMC — regionized multithreading core. Clean-room independent
++ * implementation; Folia (GPL-3.0) studied as concept only, never copied.
++ */
++package com.coderyo.region.merge;
++
++import com.coderyo.region.RegionId;
++import java.util.List;
++
++/**
++ * The structural change produced by one {@link RegionMerger#recompute()} — the set of
++ * region lifecycle events caused by a single chunk load or unload. This is the
++ * observability surface the live Moonrise hook turns into log lines (P1.2a §2).
++ *
++ * <p>An {@link #isEmpty() empty} delta means the recompute changed no region structure
++ * (e.g. a chunk simply joined an existing region without forming/merging/splitting it,
++ * which produces no lifecycle event but still reassigns index ownership).
++ *
++ * @param formed    regions that appeared with no predecessor (new disjoint clusters)
++ * @param merged    ≥2 predecessor regions that collapsed into one surviving region
++ * @param splits    a predecessor region that fragmented into ≥2 successor regions
++ * @param dissolved predecessor regions whose every chunk unloaded (now gone)
++ */
++public record RegionDelta(List<Formed> formed,
++                          List<Merged> merged,
++                          List<Split> splits,
++                          List<RegionId> dissolved) {
++
++    /** The no-change delta. */
++    public static final RegionDelta EMPTY =
++        new RegionDelta(List.of(), List.of(), List.of(), List.of());
++
++    public boolean isEmpty() {
++        return this.formed.isEmpty()
++            && this.merged.isEmpty()
++            && this.splits.isEmpty()
++            && this.dissolved.isEmpty();
++    }
++
++    /** A region that newly formed from previously-unowned chunks. */
++    public record Formed(RegionId id, int chunkCount) {
++    }
++
++    /** A reference to a region plus its post-change chunk count (for split parts). */
++    public record RegionRef(RegionId id, int chunkCount) {
++    }
++
++    /** ≥2 source regions collapsed into {@code result}. */
++    public record Merged(List<RegionId> sources, RegionId result, int chunkCount) {
++    }
++
++    /** A {@code source} region fragmented into {@code parts} (≥2). */
++    public record Split(RegionId source, List<RegionRef> parts) {
++    }
++}
+diff --git a/com/coderyo/region/merge/RegionMerger.java b/com/coderyo/region/merge/RegionMerger.java
+index f5017d5fb097f281805219d466b6ba61b88ed26a..3b27883a84892dd22d6ae3072782dda2221ecb18 100644
+--- a/com/coderyo/region/merge/RegionMerger.java
++++ b/com/coderyo/region/merge/RegionMerger.java
+@@ -12,9 +12,12 @@ import com.coderyo.region.RegionId;
+ import com.coderyo.region.RegionIndex;
+ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+ import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
++import it.unimi.dsi.fastutil.longs.LongIterator;
+ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+ import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import net.minecraft.resources.ResourceKey;
+ import net.minecraft.world.level.ChunkPos;
+ import net.minecraft.world.level.Level;
+@@ -73,26 +76,35 @@ public final class RegionMerger {
+         return this.mergeRadius;
+     }
+ 
+-    /** Add a loaded chunk to the model (merge-on-load). Triggers a recompute. */
+-    public void addLoadedChunk(final long packedChunkKey) {
++    /**
++     * Add a loaded chunk to the model (merge-on-load). Triggers a recompute and
++     * returns the structural delta (regions formed/merged/split/dissolved), or
++     * {@link RegionDelta#EMPTY} if the chunk was already present.
++     */
++    public RegionDelta addLoadedChunk(final long packedChunkKey) {
+         if (this.loadedChunks.add(packedChunkKey)) {
+-            this.recompute();
++            return this.recompute();
+         }
++        return RegionDelta.EMPTY;
+     }
+ 
+-    public void addLoadedChunk(final ChunkPos pos) {
+-        this.addLoadedChunk(pos.longKey());
++    public RegionDelta addLoadedChunk(final ChunkPos pos) {
++        return this.addLoadedChunk(pos.longKey());
+     }
+ 
+-    /** Remove a loaded chunk from the model (split-on-unload). Triggers a recompute. */
+-    public void removeLoadedChunk(final long packedChunkKey) {
++    /**
++     * Remove a loaded chunk from the model (split-on-unload). Triggers a recompute and
++     * returns the structural delta, or {@link RegionDelta#EMPTY} if it was not present.
++     */
++    public RegionDelta removeLoadedChunk(final long packedChunkKey) {
+         if (this.loadedChunks.remove(packedChunkKey)) {
+-            this.recompute();
++            return this.recompute();
+         }
++        return RegionDelta.EMPTY;
+     }
+ 
+-    public void removeLoadedChunk(final ChunkPos pos) {
+-        this.removeLoadedChunk(pos.longKey());
++    public RegionDelta removeLoadedChunk(final ChunkPos pos) {
++        return this.removeLoadedChunk(pos.longKey());
+     }
+ 
+     /** Live regions in this dimension (snapshot copy). */
+@@ -113,34 +125,166 @@ public final class RegionMerger {
+      * over the Chebyshev-{@code mergeRadius} adjacency relation, then rebuilds the
+      * {@link RegionIndex} for this dimension. Each maximal connected cluster → one region.
+      *
++     * <p><b>Identity-preserving:</b> each new cluster is matched to the previous region
++     * that contributed the most chunks to it (largest-overlap wins) and keeps that
++     * {@link RegionId}; only genuinely new clusters get a fresh id. This lets the caller
++     * report stable {@code formed / merged Ra+Rb→Rc / split Rx→Ry,Rz / dissolved}
++     * lifecycle events (returned as a {@link RegionDelta}).
++     *
+      * <p>O(N · (2r+1)^2) per recompute over N loaded chunks; fine for the data-structure
+-     * milestone. P1.2 will switch to incremental union-find driven by load/unload deltas
+-     * instead of full recompute.
++     * milestone. P1.2b may switch to incremental union-find driven by load/unload deltas.
++     *
++     * @return the structural delta describing how regions changed (never {@code null}).
+      */
+-    public void recompute() {
+-        // Clear the index entries for this dimension's previously-owned chunks.
++    public RegionDelta recompute() {
++        // Snapshot the previous partition (id -> member chunks) for diffing.
++        final Long2ObjectOpenHashMap<LongOpenHashSet> previous = new Long2ObjectOpenHashMap<>();
+         for (final Region old : this.regions.values()) {
+-            final long[] keys = old.chunkKeysSnapshot().toLongArray();
+-            for (final long key : keys) {
+-                this.index.unassign(this.dimension, key);
++            previous.put(old.id().value(), new LongOpenHashSet(old.chunkKeysSnapshot()));
++            final LongIterator it = old.chunkKeysSnapshot().iterator();
++            while (it.hasNext()) {
++                this.index.unassign(this.dimension, it.nextLong());
+             }
+         }
+         this.regions.clear();
+ 
++        // Compute the new clusters (sets of chunk keys), unlabelled for now.
++        final List<LongOpenHashSet> newClusters = new ArrayList<>();
+         final LongOpenHashSet unvisited = new LongOpenHashSet(this.loadedChunks);
+         while (!unvisited.isEmpty()) {
+             final long seed = unvisited.iterator().nextLong();
+-            final LongOpenHashSet cluster = this.floodFill(seed, unvisited);
++            newClusters.add(this.floodFill(seed, unvisited));
++        }
++
++        // Assign each new cluster a RegionId, preferring the previous region with the
++        // largest membership overlap (so identity follows the dominant predecessor).
++        // Each previous id may be claimed by at most one new cluster (the one that best
++        // matches it); ties / first-come resolved deterministically by iteration order.
++        final LongOpenHashSet claimedPrev = new LongOpenHashSet();
++        // new-cluster-index -> chosen RegionId
++        final RegionId[] labels = new RegionId[newClusters.size()];
++        // new-cluster-index -> set of previous region ids that overlap it
++        final List<LongOpenHashSet> overlapsPerCluster = new ArrayList<>(newClusters.size());
+ 
+-            final RegionId id = RegionId.next();
++        for (int i = 0; i < newClusters.size(); i++) {
++            final LongOpenHashSet cluster = newClusters.get(i);
++            final LongOpenHashSet overlaps = new LongOpenHashSet();
++            long bestPrev = Long.MIN_VALUE;
++            int bestOverlap = 0;
++            for (final Long2ObjectOpenHashMap.Entry<LongOpenHashSet> e : previous.long2ObjectEntrySet()) {
++                final long prevId = e.getLongKey();
++                int overlap = 0;
++                final LongIterator pit = e.getValue().iterator();
++                while (pit.hasNext()) {
++                    if (cluster.contains(pit.nextLong())) {
++                        overlap++;
++                    }
++                }
++                if (overlap > 0) {
++                    overlaps.add(prevId);
++                    if (overlap > bestOverlap && !claimedPrev.contains(prevId)) {
++                        bestOverlap = overlap;
++                        bestPrev = prevId;
++                    }
++                }
++            }
++            overlapsPerCluster.add(overlaps);
++            if (bestOverlap > 0) {
++                claimedPrev.add(bestPrev);
++                labels[i] = new RegionId(bestPrev);
++            } else {
++                labels[i] = null; // fresh id assigned below (kept distinct from reuse pass)
++            }
++        }
++
++        // Materialize regions + rebuild index.
++        for (int i = 0; i < newClusters.size(); i++) {
++            RegionId id = labels[i];
++            if (id == null) {
++                id = RegionId.next();
++                labels[i] = id;
++            }
+             final Region region = new Region(id, this.dimension);
+-            final long[] members = cluster.toLongArray();
+-            for (final long member : members) {
++            final LongIterator it = newClusters.get(i).iterator();
++            while (it.hasNext()) {
++                final long member = it.nextLong();
+                 region.addChunkInternal(member);
+                 this.index.assign(this.dimension, member, id);
+             }
+             this.regions.put(id.value(), region);
+         }
++
++        return buildDelta(previous, newClusters, labels, overlapsPerCluster);
++    }
++
++    /**
++     * Classifies the transition from {@code previous} (id -> chunks) to the new clusters
++     * (each now labelled with a {@link RegionId}) into lifecycle events.
++     *
++     * <ul>
++     *   <li><b>formed</b>: a new cluster that overlaps zero previous regions.</li>
++     *   <li><b>merged</b>: a new cluster that overlaps ≥2 previous regions → those
++     *       predecessors collapsed into the (surviving) labelled id.</li>
++     *   <li><b>split</b>: a previous region whose chunks now spread across ≥2 new
++     *       clusters → that predecessor split into those labelled ids.</li>
++     *   <li><b>dissolved</b>: a previous region that overlaps zero new clusters (all
++     *       its chunks unloaded).</li>
++     * </ul>
++     */
++    private RegionDelta buildDelta(final Long2ObjectOpenHashMap<LongOpenHashSet> previous,
++                                   final List<LongOpenHashSet> newClusters,
++                                   final RegionId[] labels,
++                                   final List<LongOpenHashSet> overlapsPerCluster) {
++        final List<RegionDelta.Formed> formed = new ArrayList<>();
++        final List<RegionDelta.Merged> merged = new ArrayList<>();
++        final List<RegionDelta.Split> splits = new ArrayList<>();
++        final List<RegionId> dissolved = new ArrayList<>();
++
++        // prev id -> list of new cluster indices it overlaps (for split detection)
++        final Map<Long, List<Integer>> prevToNewClusters = new LinkedHashMap<>();
++        for (final long prevId : previous.keySet()) {
++            prevToNewClusters.put(prevId, new ArrayList<>());
++        }
++
++        for (int i = 0; i < newClusters.size(); i++) {
++            final LongOpenHashSet overlaps = overlapsPerCluster.get(i);
++            final RegionId id = labels[i];
++            final int chunkCount = newClusters.get(i).size();
++
++            for (final long prevId : overlaps) {
++                prevToNewClusters.get(prevId).add(i);
++            }
++
++            if (overlaps.isEmpty()) {
++                formed.add(new RegionDelta.Formed(id, chunkCount));
++            } else if (overlaps.size() >= 2) {
++                final List<RegionId> sources = new ArrayList<>();
++                for (final long prevId : overlaps) {
++                    sources.add(new RegionId(prevId));
++                }
++                merged.add(new RegionDelta.Merged(sources, id, chunkCount));
++            }
++        }
++
++        // Splits + dissolutions: examine each previous region's fan-out.
++        for (final Map.Entry<Long, List<Integer>> e : prevToNewClusters.entrySet()) {
++            final RegionId prevId = new RegionId(e.getKey());
++            final List<Integer> dests = e.getValue();
++            if (dests.isEmpty()) {
++                dissolved.add(prevId);
++            } else if (dests.size() >= 2) {
++                final List<RegionDelta.RegionRef> parts = new ArrayList<>();
++                for (final int idx : dests) {
++                    parts.add(new RegionDelta.RegionRef(labels[idx], newClusters.get(idx).size()));
++                }
++                splits.add(new RegionDelta.Split(prevId, parts));
++            }
++        }
++
++        if (formed.isEmpty() && merged.isEmpty() && splits.isEmpty() && dissolved.isEmpty()) {
++            return RegionDelta.EMPTY;
++        }
++        return new RegionDelta(formed, merged, splits, dissolved);
+     }
+ 
+     /**
