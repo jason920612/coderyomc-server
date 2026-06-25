@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/com/coderyo/compat/Governor.java
-@@ -1,0 +_,106 @@
+@@ -1,0 +_,130 @@
 +/*
 + * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
 + * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
@@ -63,16 +63,41 @@
 +    }
 +
 +    /**
-+     * Static pre-classification (gate 1): the tier a handler should run at <em>before</em> any
-+     * speculation evidence. P3.1 conservatively returns the always-correct
++     * Static pre-classification (gate 1) for the <b>event/scheduler</b> path: the tier a handler
++     * should run at <em>before</em> any speculation evidence. Returns the always-correct
 +     * {@link CompatTier#LEGACY_SERIALIZED} for every cross-region / context-free handler — the
 +     * speculative tier that would promote it is phase 3+. (Same-region calls are decided inline
 +     * by the router as {@link CompatTier#INLINE}; this classifier governs only the non-inline
 +     * remainder.)
 +     */
 +    public CompatTier classify(final String handlerKey) {
-+        // P3.1: no bytecode scan yet; default to the safe serialized tier. Marking a handler
-+        // never-speculate is honored for when Tier 1.5 lands.
++        // No bytecode scan yet; default to the safe serialized tier for event/scheduler dispatch.
++        // Marking a handler never-speculate is honored for when Tier 1.5 lands.
++        return CompatTier.LEGACY_SERIALIZED;
++    }
++
++    /**
++     * P3.2 — classify a <b>cross-region Craft* API call</b> (block/world op) to the tier the
++     * {@link com.coderyo.compat.MarshalRouter} should use: {@link CompatTier#MARSHAL} (Tier 1)
++     * when the target is safely marshalable, else {@link CompatTier#LEGACY_SERIALIZED} (Tier 2).
++     *
++     * <p>"Safe to marshal" (Tier 1) means: the target chunk has a live owning region
++     * ({@code hasOwningRegion}) AND the call carries <b>no irreversible cross-region side effect
++     * that requires an immediate, same-tick, atomic result</b> ({@code reversible} — true for the
++     * block get/set + world-access ops Tier 1 currently wires). A void write is always reversible
++     * w.r.t. ordering (the owning region applies it in submission order); a block-state read is
++     * side-effect-free. Anything else (no owning region, or an op flagged irreversible/atomic by
++     * the caller) stays Tier 2 — the always-correct serialized fallback. <b>Never silently
++     * disables a thread check.</b>
++     *
++     * @param hasOwningRegion whether the target chunk resolves to a live region (marshalable).
++     * @param reversible      whether the op is free of an irreversible immediate-return side
++     *                        effect (true for the block/world ops Tier 1 wires today).
++     */
++    public CompatTier classifyCall(final boolean hasOwningRegion, final boolean reversible) {
++        if (hasOwningRegion && reversible) {
++            return CompatTier.MARSHAL;
++        }
 +        return CompatTier.LEGACY_SERIALIZED;
 +    }
 +

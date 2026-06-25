@@ -2,5 +2,12 @@ name: CompatProbe
 version: 1.0.0
 main: com.coderyo.test.CompatProbePlugin
 api-version: '1.21'
-description: Minimal P3.1 plugin-compat e2e probe (lifecycle + listener + scheduled task).
+description: Minimal P3.1/P3.2 plugin-compat e2e probe (lifecycle + listener + scheduled task + Tier-1 cross-region command).
 author: coderyoMC
+commands:
+  probetier1:
+    description: P3.2 cross-region Tier-1 marshal driver (Bukkit Block API set/get across two regions).
+    usage: /probetier1 x1 y1 z1 x2 y2 z2
+  probeverify:
+    description: P3.2 read-only verify a marshaled cross-region write landed (Bukkit getType).
+    usage: /probeverify x1 y1 z1 x2 y2 z2

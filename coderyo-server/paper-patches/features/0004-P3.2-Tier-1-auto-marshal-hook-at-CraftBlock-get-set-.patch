@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyoMC <dev@coderyo.local>
+Date: Thu, 25 Jun 2026 16:27:07 +0800
+Subject: [PATCH] P3.2: Tier 1 auto-marshal hook at CraftBlock get/set surface
+
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java b/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+index f85f32cd4e892c2b3c59d7202385c36fa0dabf78..a633a45530e450f03c140bd4a7a6267103001a53 100644
+--- a/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
++++ b/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+@@ -78,6 +78,23 @@ public class CraftBlock implements Block {
+     }
+ 
+     public net.minecraft.world.level.block.state.BlockState getBlockState() {
++        // coderyoMC Tier 1 (auto-marshal, read path): a cross-region block-state read is routed so
++        // a region tick thread NEVER blocks on another region (ADR-0001 rule #1) — it reads from a
++        // read-only snapshot (block-state reads are side-effect-free + lock-free). A non-tick caller
++        // (legacy region / plugin thread) may marshal-and-wait (watchdog-bounded). Tier 0 (same
++        // region) and region.enabled=false read inline, unchanged.
++        if (com.coderyo.compat.CompatConfig.isEnabled()
++                && this.level instanceof final net.minecraft.server.level.ServerLevel serverLevel) {
++            final long chunkKey = net.minecraft.world.level.ChunkPos.pack(this.position);
++            final com.coderyo.compat.MarshalRouter.MarshalResult<net.minecraft.world.level.block.state.BlockState> r =
++                com.coderyo.compat.MarshalRouter.marshalQuery(
++                    serverLevel.dimension(), chunkKey,
++                    () -> this.level.getBlockState(this.position),
++                    () -> this.level.getBlockState(this.position));
++            if (r.handled()) {
++                return r.value();
++            }
++        }
+         return this.level.getBlockState(this.position);
+     }
+ 
+@@ -185,6 +202,23 @@ public class CraftBlock implements Block {
+     }
+ 
+     boolean setBlockState(final net.minecraft.world.level.block.state.BlockState state, final boolean applyPhysics) {
++        // coderyoMC Tier 1 (auto-marshal): if regionized ticking is on and this block lives in a
++        // region OTHER than the calling thread's owner, marshal the write to the owning region's
++        // inbound queue (fire-and-forget) instead of mutating a foreign region's chunk off-thread.
++        // Tier 0 (same region) / region.enabled=false fall through to the inline vanilla write.
++        if (com.coderyo.compat.CompatConfig.isEnabled()
++                && this.level instanceof final net.minecraft.server.level.ServerLevel serverLevel) {
++            final long chunkKey = net.minecraft.world.level.ChunkPos.pack(this.position);
++            final boolean marshaled = com.coderyo.compat.MarshalRouter.marshalVoid(
++                serverLevel.dimension(), chunkKey,
++                () -> setBlockState(serverLevel, this.position.immutable(), state, applyPhysics));
++            if (marshaled) {
++                // Tier 0 ran inline already, or Tier 1 enqueued it; the legacy void API returns
++                // true (the historical "queued / applied" contract — no observable return for a
++                // marshaled write). Unowned chunks return false here and fall through below.
++                return true;
++            }
++        }
+         return setBlockState(this.level, this.position, state, applyPhysics);
+     }
+ 

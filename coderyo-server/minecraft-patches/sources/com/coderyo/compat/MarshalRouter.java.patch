@@ -1,0 +1,289 @@
+--- /dev/null
++++ b/com/coderyo/compat/MarshalRouter.java
+@@ -1,0 +_,286 @@
++/*
++ * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
++ * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
++ * ADR-0001 (the LOCKED tier model).
++ */
++package com.coderyo.compat;
++
++import com.coderyo.region.Region;
++import com.coderyo.region.RegionId;
++import com.coderyo.region.RegionLifecycle;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.function.Supplier;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.Level;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Tier 1 — the <b>auto-marshal</b> engine (design-spec §5.2「Tier 1」/ ADR-0001).
++ *
++ * <p>When a plugin API call targets a region OTHER than the one the calling thread owns,
++ * Tier 1 marshals the work to the owning region's single-drainer inbound queue
++ * ({@link Region#inbound()}), instead of forcing the always-correct-but-serial Tier 2 legacy
++ * fallback. This keeps cross-region plugin work <em>parallel</em>: the owning region executes
++ * it on its own tick thread, under that region's single-writer invariant.
++ *
++ * <h2>The two call shapes</h2>
++ * <ul>
++ *   <li><b>Void / fire-and-forget</b> ({@code setBlock}, particles, region-targeted message):
++ *       {@link #marshalVoid} enqueues to the owning region and returns immediately. The legacy
++ *       Bukkit caller does not observe a return value, so there is nothing to wait for.</li>
++ *   <li><b>Value-returning</b> ({@code getBlock}, {@code getBlockState}): {@link #marshalQuery}
++ *       posts a {@link Supplier} and returns a {@link CompletableFuture} resolved on the owning
++ *       region thread. The synchronous Bukkit API needs an immediate value, so the caller may
++ *       block — <b>but only if it is NOT a parallel region tick thread</b> (ADR-0001 rule #1: a
++ *       region tick thread NEVER synchronously waits on another region). A region tick thread is
++ *       instead served from a <em>read-only snapshot</em> (a direct read of the target chunk's
++ *       block state, which is safe because block-state reads do not mutate the foreign region).</li>
++ * </ul>
++ *
++ * <h2>Deadlock rules (ADR-0001 §"deadlock rules", enforced here)</h2>
++ * <ol>
++ *   <li><b>Single-direction posting only:</b> we only ever {@code post} to another region's
++ *       inbound queue; the owning region never posts back-and-then-waits on the caller. The
++ *       inbound queue is MPSC (many posters, one drainer) — no cross-region lock is taken.</li>
++ *   <li><b>No cross-region locks:</b> resolution uses the lock-light copy-on-merge index; the
++ *       marshaled body runs entirely on the owning region thread.</li>
++ *   <li><b>A region tick thread never synchronously waits on another region:</b> enforced by
++ *       {@link #isRegionTickThread()} — a worker gets the snapshot path, never {@code join()}.</li>
++ *   <li><b>Watchdog / timeout on any marshal-and-wait:</b> {@link #marshalQuery}'s blocking wait
++ *       (only reachable off a tick thread) is bounded by {@link #MARSHAL_WAIT_MS}; on timeout it
++ *       falls back to the always-correct legacy path rather than hanging.</li>
++ * </ol>
++ *
++ * <p><b>Never fail silent.</b> Tier 1 never disables a thread check. The marshaled body runs on
++ * the owning region's tick thread (a {@code TickThread}), so {@code AsyncCatcher} /
++ * {@code isPrimaryThread()} still pass; the read-snapshot path performs only reads (no mutation
++ * of foreign game state, so no thread-check is bypassed — a read of a loaded chunk's block state
++ * is lock-free and side-effect-free).
++ */
++public final class MarshalRouter {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/compat");
++
++    /** Watchdog bound for a marshal-and-wait (only ever reached OFF a region tick thread). */
++    private static final long MARSHAL_WAIT_MS = 50L;
++
++    /** Diagnostics: total Tier-1 void marshals, query marshals, snapshot-serviced, fallbacks. */
++    private static final AtomicLong VOID_MARSHALS = new AtomicLong();
++    private static final AtomicLong QUERY_MARSHALS = new AtomicLong();
++    private static final AtomicLong SNAPSHOT_READS = new AtomicLong();
++    private static final AtomicLong FALLBACKS = new AtomicLong();
++
++    private MarshalRouter() {
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Void / fire-and-forget marshaling (Tier 1 write path).
++    // ---------------------------------------------------------------------------------------
++
++    /**
++     * Marshal a void/fire-and-forget block op to the region owning {@code (dimension, chunkKey)}.
++     *
++     * <p>Returns {@code true} if the call was handled by Tier 0 (inline) or Tier 1 (marshaled to
++     * the owning region); {@code false} if it could not be marshaled (no owning region resolved —
++     * an unowned/unloaded chunk) and the caller must fall back to Tier 2 / inline.
++     *
++     * @param apply the mutation body — runs on the owning region's tick thread (Tier 1) or inline
++     *              on the current thread (Tier 0).
++     */
++    public static boolean marshalVoid(final ResourceKey<Level> dimension, final long chunkKey,
++                                      final Runnable apply) {
++        final Region owner = ownerOf(dimension, chunkKey);
++        if (owner == null) {
++            // Unowned chunk / no region formed -> caller's Tier 2 fallback handles it.
++            return false;
++        }
++        if (owner.isOwnedByCurrentThread()) {
++            // Tier 0: the current thread already owns the target region -> inline, zero cost.
++            if (CompatConfig.isDebug()) {
++                LOGGER.info("compat: block write INLINE (Tier 0) region=R{} chunk={},{}",
++                    owner.id().value(), ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
++            }
++            apply.run();
++            return true;
++        }
++        // Tier 1: single-direction post to the owning region's inbound queue; drained at its next
++        // tick on its own thread under its single-writer invariant. Return immediately — the
++        // caller (a region worker, the orchestrator, the legacy region, or a plugin thread) never
++        // blocks for a fire-and-forget write. Deadlock-free by construction (MPSC, one direction).
++        owner.inbound().post(apply);
++        VOID_MARSHALS.incrementAndGet();
++        if (CompatConfig.isDebug()) {
++            LOGGER.info("compat: block write MARSHALED (Tier 1) -> owning region R{} chunk={},{} "
++                    + "from thread '{}' (fire-and-forget, no block)",
++                owner.id().value(), ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey),
++                Thread.currentThread().getName());
++        }
++        return true;
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Value-returning marshaling (Tier 1 read path).
++    // ---------------------------------------------------------------------------------------
++
++    /**
++     * Service a value-returning block op for the region owning {@code (dimension, chunkKey)}.
++     *
++     * <p>Routing:
++     * <ul>
++     *   <li><b>Tier 0:</b> current thread owns the target region -> read inline.</li>
++     *   <li><b>Tier 1 (region tick thread caller):</b> NEVER block on another region. Block-state
++     *       reads are side-effect-free and lock-free against a loaded chunk, so we read from a
++     *       read-only snapshot inline (the {@code snapshotRead}) — correctness preserved, no
++     *       cross-region wait.</li>
++     *   <li><b>Tier 1 (non-tick caller — legacy region / plugin thread):</b> marshal the read to
++     *       the owning region and block on the future, bounded by the watchdog; on timeout, fall
++     *       back to the snapshot read (still correct, just possibly a tick stale).</li>
++     * </ul>
++     *
++     * @param snapshotRead a read-only read of the value that is safe to run from ANY thread
++     *                     (block-state reads do not mutate foreign region state). Used by the
++     *                     tick-thread path and as the watchdog fallback.
++     * @param marshaledRead the read to run ON the owning region thread (the authoritative,
++     *                     same-tick value). Used by the non-tick blocking path.
++     * @return the read value, or {@code null} sentinel handling left to the caller's supplier.
++     */
++    public static <T> MarshalResult<T> marshalQuery(final ResourceKey<Level> dimension, final long chunkKey,
++                                                    final Supplier<T> snapshotRead,
++                                                    final Supplier<T> marshaledRead) {
++        final Region owner = ownerOf(dimension, chunkKey);
++        if (owner == null) {
++            return MarshalResult.notMarshaled();
++        }
++        if (owner.isOwnedByCurrentThread()) {
++            if (CompatConfig.isDebug()) {
++                LOGGER.info("compat: block read INLINE (Tier 0) region=R{}", owner.id().value());
++            }
++            return MarshalResult.of(snapshotRead.get());
++        }
++        if (isRegionTickThread()) {
++            // ADR-0001 rule #1: a region tick thread NEVER synchronously waits on another region.
++            // Block-state reads are side-effect-free, so serve from the read-only snapshot inline.
++            SNAPSHOT_READS.incrementAndGet();
++            if (CompatConfig.isDebug()) {
++                LOGGER.info("compat: block read SNAPSHOT (Tier 1, tick thread '{}' never blocks) "
++                        + "-> region R{}", Thread.currentThread().getName(), owner.id().value());
++            }
++            return MarshalResult.of(snapshotRead.get());
++        }
++        // Non-tick caller (legacy region / plugin own thread) MAY block: marshal the read to the
++        // owning region and await, bounded by the watchdog. Single-direction post; no cross lock.
++        QUERY_MARSHALS.incrementAndGet();
++        final CompletableFuture<T> future = new CompletableFuture<>();
++        owner.inbound().post(() -> {
++            try {
++                future.complete(marshaledRead.get());
++            } catch (final Throwable t) {
++                future.completeExceptionally(t);
++            }
++        });
++        try {
++            final T value = future.get(MARSHAL_WAIT_MS, TimeUnit.MILLISECONDS);
++            if (CompatConfig.isDebug()) {
++                LOGGER.info("compat: block read MARSHALED (Tier 1) -> region R{} resolved on owner",
++                    owner.id().value());
++            }
++            return MarshalResult.of(value);
++        } catch (final TimeoutException te) {
++            // Watchdog: the owning region did not tick within the bound (e.g. quiescent / busy).
++            // Fall back to the always-correct snapshot read rather than hang the caller.
++            FALLBACKS.incrementAndGet();
++            if (CompatConfig.isDebug()) {
++                LOGGER.info("compat: block read MARSHAL TIMEOUT -> snapshot fallback (region R{} "
++                    + "did not drain within {}ms)", owner.id().value(), MARSHAL_WAIT_MS);
++            }
++            return MarshalResult.of(snapshotRead.get());
++        } catch (final Throwable t) {
++            FALLBACKS.incrementAndGet();
++            Thread.currentThread().interrupt();
++            return MarshalResult.of(snapshotRead.get());
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Helpers.
++    // ---------------------------------------------------------------------------------------
++
++    /** Resolve the live owning {@link Region} of a chunk, or {@code null} if unowned. */
++    private static Region ownerOf(final ResourceKey<Level> dimension, final long chunkKey) {
++        final RegionId id = RegionLifecycle.index().regionOf(dimension, chunkKey);
++        if (id == null) {
++            return null;
++        }
++        return RegionLifecycle.regionById(dimension, id);
++    }
++
++    /**
++     * Whether the current thread is a parallel region tick worker (NOT the orchestrator and NOT
++     * the legacy region). Such a thread must never block on another region (ADR rule #1). The
++     * region worker pool names its threads {@code coderyo-region-worker-N}; the orchestrator main
++     * thread and the {@code coderyo-legacy-region} thread are not.
++     */
++    public static boolean isRegionTickThread() {
++        return Thread.currentThread().getName().startsWith("coderyo-region-worker-");
++    }
++
++    /** Tier-1 diagnostics line (logged at shutdown / on demand). */
++    public static String stats() {
++        return "Tier1[void=" + VOID_MARSHALS.get()
++            + " query=" + QUERY_MARSHALS.get()
++            + " snapshot=" + SNAPSHOT_READS.get()
++            + " fallback=" + FALLBACKS.get() + "]";
++    }
++
++    public static long voidMarshals() {
++        return VOID_MARSHALS.get();
++    }
++
++    public static long queryMarshals() {
++        return QUERY_MARSHALS.get();
++    }
++
++    public static long snapshotReads() {
++        return SNAPSHOT_READS.get();
++    }
++
++    /**
++     * The outcome of a marshaled value-returning call: either a resolved value (Tier 0/1 handled
++     * it) or "not marshaled" (no owning region — caller does its Tier 2 / inline default).
++     */
++    public static final class MarshalResult<T> {
++        private static final MarshalResult<?> NOT_MARSHALED = new MarshalResult<>(false, null);
++
++        private final boolean handled;
++        private final T value;
++
++        private MarshalResult(final boolean handled, final T value) {
++            this.handled = handled;
++            this.value = value;
++        }
++
++        static <T> MarshalResult<T> of(final T value) {
++            return new MarshalResult<>(true, value);
++        }
++
++        @SuppressWarnings("unchecked")
++        static <T> MarshalResult<T> notMarshaled() {
++            return (MarshalResult<T>) NOT_MARSHALED;
++        }
++
++        /** Whether Tier 0/1 handled the call (true) or the caller must use its default (false). */
++        public boolean handled() {
++            return this.handled;
++        }
++
++        /** The resolved value (only meaningful when {@link #handled()} is true). */
++        public T value() {
++            return this.value;
++        }
++    }
++}

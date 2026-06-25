@@ -5,6 +5,8 @@ import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
@@ -60,6 +62,76 @@ public final class CompatProbePlugin extends JavaPlugin implements Listener {
     @Override
     public void onDisable() {
         getLogger().info("PROBE_DISABLE onDisable taskRuns=" + this.taskRuns);
+    }
+
+    /**
+     * P3.2 Tier-1 driver command ({@code /probetier1}). Runs on the orchestrator main thread
+     * (console/command dispatch happens between ticks, while regions are quiescent) and performs
+     * <b>cross-region</b> block writes + reads via the <b>real Bukkit {@code Block} API</b>
+     * ({@code World#getBlockAt(...).setType / getType}) — which funnels through
+     * {@code CraftBlock.setBlockState / getBlockState}, the coderyoMC Tier-1 hook points.
+     *
+     * <p>Because the orchestrator does not own any region mid-tick, a write/read targeting a
+     * forceloaded region resolves to an owning region the current thread does NOT own → the
+     * Tier-1 marshal fires (void write → enqueue to the owning region; read → snapshot/marshal).
+     * This is the cross-region path the no-players P3.1 test could not exercise. Coordinates are
+     * passed in so the harness can target the two disjoint forceloaded regions.
+     *
+     * <p>Usage: {@code /probetier1 <x1> <y1> <z1> <x2> <y2> <z2>} — sets + reads a block in each
+     * of two locations (expected to be in two different regions). All on the Bukkit API.
+     */
+    @Override
+    public boolean onCommand(final CommandSender sender, final Command command,
+                             final String label, final String[] args) {
+        final World world = Bukkit.getWorlds().isEmpty() ? null : Bukkit.getWorlds().get(0);
+        final String name = command.getName().toLowerCase(java.util.Locale.ROOT);
+        if (!name.equals("probetier1") && !name.equals("probeverify")) {
+            return false;
+        }
+        if (world == null) {
+            getLogger().info("PROBE_TIER1 no-world");
+            return true;
+        }
+        if (args.length < 6) {
+            getLogger().info("PROBE_TIER1 usage: /" + name + " x1 y1 z1 x2 y2 z2");
+            return true;
+        }
+        try {
+            final int ax = Integer.parseInt(args[0]);
+            final int ay = Integer.parseInt(args[1]);
+            final int az = Integer.parseInt(args[2]);
+            final int bx = Integer.parseInt(args[3]);
+            final int by = Integer.parseInt(args[4]);
+            final int bz = Integer.parseInt(args[5]);
+            if (name.equals("probeverify")) {
+                // READ-ONLY: confirm a previously-marshaled cross-region write actually LANDED
+                // (drained at the owning region's tick). Pure Bukkit getType() -> Tier-1 read hook.
+                getLogger().info("PROBE_VERIFY regionA landed=" + world.getBlockAt(ax, ay, az).getType()
+                    + " @ " + ax + "," + ay + "," + az);
+                getLogger().info("PROBE_VERIFY regionB landed=" + world.getBlockAt(bx, by, bz).getType()
+                    + " @ " + bx + "," + by + "," + bz);
+                return true;
+            }
+            setReadAt(world, "A", ax, ay, az, Material.LAPIS_BLOCK);
+            setReadAt(world, "B", bx, by, bz, Material.REDSTONE_BLOCK);
+        } catch (final NumberFormatException nfe) {
+            getLogger().info("PROBE_TIER1 bad-args " + nfe.getMessage());
+        }
+        return true;
+    }
+
+    /** Bukkit-API write then read at one location — the Tier-1-hooked Craft* surface. */
+    private void setReadAt(final World world, final String tag, final int x, final int y, final int z,
+                           final Material material) {
+        final Block b = world.getBlockAt(x, y, z);
+        // WRITE via the Bukkit API -> CraftBlock.setBlockState -> Tier-1 void marshal hook.
+        b.setType(material);
+        // READ via the Bukkit API -> CraftBlock.getBlockState -> Tier-1 read hook.
+        final Material got = b.getType();
+        getLogger().info("PROBE_TIER1 region" + tag + " set=" + material + " readback=" + got
+            + " @ " + x + "," + y + "," + z
+            + " thread=" + Thread.currentThread().getName()
+            + " primary=" + Bukkit.isPrimaryThread());
     }
 
     @EventHandler
