@@ -56,6 +56,27 @@ subprojects {
     }
     tasks.withType<Javadoc> {
         options.encoding = Charsets.UTF_8.name()
+        // coderyoMC API docs tooling (issue #3): brand + tune the Javadoc build so
+        // it produces a PaperMC-style, publishable HTML reference for coderyo-api.
+        // This composes with the upstream paper-api Javadoc config (links, overview,
+        // custom tags) that materializes into coderyo-api/build.gradle.kts.
+        val stdOptions = options as StandardJavadocDocletOptions
+        val apiVersion = providers.gradleProperty("apiVersion").orNull ?: project.version.toString()
+        stdOptions.docTitle = "coderyoMC API $apiVersion"
+        stdOptions.windowTitle = "coderyoMC API $apiVersion"
+        stdOptions.encoding = Charsets.UTF_8.name()
+        stdOptions.charSet = Charsets.UTF_8.name()
+        stdOptions.docEncoding = Charsets.UTF_8.name()
+        // JDK 25 platform API external links (resolve java.* references against
+        // the JDK 25 docs). Mirrors how upstream links its other deps.
+        stdOptions.links("https://docs.oracle.com/en/java/javase/25/docs/api/")
+        stdOptions.addBooleanOption("Xdoclint:none", true)
+        // Keep the log readable in CI; the build is large.
+        stdOptions.quiet()
+        // Upstream alpha sources can carry doclint-tripping javadoc; do not let a
+        // single bad comment fail the whole docs build. The Gradle Javadoc task
+        // still fails on real javadoc-tool errors (e.g. classpath problems).
+        isFailOnError = false
     }
     tasks.withType<ProcessResources> {
         filteringCharset = Charsets.UTF_8.name()

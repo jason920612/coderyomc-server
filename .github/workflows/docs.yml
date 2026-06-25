@@ -1,0 +1,112 @@
+name: API Docs
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  # Build the coderyo-api Javadoc and assemble the publishable doc-site.
+  build-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Cache the multi-GB paperweight upstream work so applyAllPatches
+          # does not re-download/re-decompile Minecraft every run.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Cache paperweight upstream
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/paperweight
+            .gradle/caches/paperweight
+            coderyo-server/.gradle/caches/paperweight
+          key: paperweight-${{ runner.os }}-${{ hashFiles('gradle.properties') }}
+          restore-keys: |
+            paperweight-${{ runner.os }}-
+
+      - name: Configure git identity (paperweight commits internally during patch apply)
+        run: |
+          git config --global user.email "ci@coderyo.local"
+          git config --global user.name "coderyoMC CI"
+          git config --global core.autocrlf false
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Apply patches (materialize upstream)
+        run: ./gradlew applyAllPatches --stacktrace
+
+      - name: Build coderyo-api Javadoc
+        run: ./gradlew :coderyo-api:javadoc --stacktrace
+
+      - name: Assemble doc-site
+        run: |
+          set -euo pipefail
+          # apiVersion in gradle.properties is the single source of truth for the
+          # published version label (matches the docTitle the Javadoc task uses).
+          API_VERSION="$(awk -F= '/^apiVersion=/ {print $2}' gradle.properties | tr -d '[:space:]')"
+          echo "Publishing coderyoMC API docs for apiVersion=${API_VERSION}"
+
+          SITE=_site
+          rm -rf "$SITE"
+          mkdir -p "$SITE/apidocs"
+
+          # The generated Javadoc HTML is the browsable reference.
+          JAVADOC_DIR="coderyo-api/build/docs/javadoc"
+          if [ ! -f "$JAVADOC_DIR/index.html" ]; then
+            echo "ERROR: expected Javadoc at $JAVADOC_DIR/index.html but it was not generated" >&2
+            exit 1
+          fi
+          cp -r "$JAVADOC_DIR/." "$SITE/apidocs/"
+
+          # Branded landing page, version-substituted from the template.
+          sed "s/@API_VERSION@/${API_VERSION}/g" docs-site/index.html.template > "$SITE/index.html"
+
+          echo "Assembled doc-site:"
+          ls -la "$SITE"
+          ls "$SITE/apidocs" | head
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  # Publish to GitHub Pages. Safe to keep even before Pages is enabled in repo
+  # settings: this job only runs on pushes to main, and deploy-pages no-ops/
+  # fails loudly with a clear message until Pages is turned on. The build-docs
+  # job above is the gate that must always work.
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build-docs
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
