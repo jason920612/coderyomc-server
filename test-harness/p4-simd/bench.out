@@ -1,0 +1,13 @@
+config: GRID=2 side=32ch total=1024 target=921 regions r.[16..16]
+>>> cfg=scalar run=1 ms=16262 chunks=1024/1024
+>>> cfg=scalar run=2 ms=16283 chunks=1024/1024
+>>> cfg=scalar run=3 ms=16730 chunks=1024/1024
+>>> cfg=scalar run=4 ms=16166 chunks=1024/1024
+>>> cfg=simd run=1 ms=18648 chunks=1024/1024
+>>> cfg=simd run=2 ms=18895 chunks=1024/1024
+>>> cfg=simd run=3 ms=18411 chunks=1024/1024
+>>> cfg=simd run=4 ms=18596 chunks=1024/1024
+================ RESULT (1024 fresh chunks, seed 515151512121, GRID=2 @ chunk 512) ================
+scalar  median ms=16283  chunks/sec=62.9   samples=(16283 16730 16166)
+simd    median ms=18596  chunks/sec=55.1   samples=(18895 18411 18596)
+speedup (scalar_ms / simd_ms) = 0.876x
