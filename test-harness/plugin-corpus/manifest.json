@@ -1,0 +1,96 @@
+{
+  "corpus": "coderyoMC real-plugin compat corpus (issue #10)",
+  "target_build": "coderyoMC 26.2 (paperweight-v2 hard-fork of Paper 26.2)",
+  "generated": "2026-06-25",
+  "note": "26.2 released 2026-06-16; many plugins do NOT yet ship a 26.2-tagged build. declares_26_2 records whether the listed version explicitly tags Minecraft 26.2 on its distribution page. Jars are NOT committed (licensing/size) — fetch with download.sh.",
+  "plugins": [
+    {
+      "plugin": "LuckPerms",
+      "version": "5.5.53",
+      "declared_mc_support": "1.8.9-1.21.11, 26.1-26.2",
+      "declares_26_2": true,
+      "source": "modrinth",
+      "url": "https://cdn.modrinth.com/data/Vebnzrzj/versions/MBSY8toc/LuckPerms-Bukkit-5.5.53.jar",
+      "category": "permissions",
+      "deps": [],
+      "notes": "Standalone, no hard deps. Bukkit loader build."
+    },
+    {
+      "plugin": "WorldEdit",
+      "version": "7.4.4-beta-01",
+      "declared_mc_support": "1.21.4-1.21.11, 26.1-26.2",
+      "declares_26_2": true,
+      "source": "modrinth",
+      "url": "https://cdn.modrinth.com/data/1u6JkXh5/versions/ESAHQFYo/worldedit-bukkit-7.4.4-beta-01.jar",
+      "category": "world-edit",
+      "deps": [],
+      "notes": "First WE build listing 26.2 (beta channel). Standalone."
+    },
+    {
+      "plugin": "ViaVersion",
+      "version": "5.10.1-SNAPSHOT+1012",
+      "declared_mc_support": "1.8.9-26.2",
+      "declares_26_2": true,
+      "source": "modrinth",
+      "url": "https://cdn.modrinth.com/data/P1OZGk5p/versions/z0sCGSmk/ViaVersion-5.10.1-SNAPSHOT.jar",
+      "category": "protocol",
+      "deps": [],
+      "notes": "Snapshot build explicitly built for mc26.2. Paper loader."
+    },
+    {
+      "plugin": "VaultUnlocked",
+      "version": "2.20.2",
+      "declared_mc_support": "1.8-26.2",
+      "declares_26_2": true,
+      "source": "modrinth",
+      "url": "https://cdn.modrinth.com/data/ayRaM8J7/versions/cLNipSgw/VaultUnlocked-2.20.2.jar",
+      "category": "economy-api",
+      "deps": [],
+      "notes": "Vault fork with Folia support + 26.2 tag. Economy API shim; no economy provider bundled (Vault itself provides no economy)."
+    },
+    {
+      "plugin": "PlaceholderAPI",
+      "version": "2.12.2",
+      "declared_mc_support": "1.8-1.21.11, 26.1-26.1.2",
+      "declares_26_2": false,
+      "source": "modrinth",
+      "url": "https://cdn.modrinth.com/data/lKEzGugV/versions/UmbIiI5H/PlaceholderAPI-2.12.2.jar",
+      "category": "placeholders",
+      "deps": [],
+      "notes": "Newest build stops at 26.1.2 — NO 26.2 tag yet. Standalone."
+    },
+    {
+      "plugin": "WorldGuard",
+      "version": "7.0.17",
+      "declared_mc_support": "1.21.11, 26.1-26.1.2",
+      "declares_26_2": false,
+      "source": "modrinth",
+      "url": "https://cdn.modrinth.com/data/DKY9btbd/versions/pI4UHLJL/worldguard-bukkit-7.0.17.jar",
+      "category": "region-protection",
+      "deps": ["WorldEdit"],
+      "notes": "Newest build stops at 26.1.2 — NO 26.2 tag. Hard-depends on WorldEdit."
+    },
+    {
+      "plugin": "EssentialsX",
+      "version": "2.22.0",
+      "declared_mc_support": "1.8.8-1.21.11, 26.1.2",
+      "declares_26_2": false,
+      "source": "modrinth",
+      "url": "https://cdn.modrinth.com/data/hXiIvTyT/versions/nY6VN1XH/EssentialsX-2.22.0.jar",
+      "category": "core-utilities",
+      "deps": [],
+      "notes": "Modrinth stable stops at 26.1.2. essentialsx.net claims 26.2 via snapshot repo (repo.essentialsx.net/snapshots) but no 26.2-tagged stable release."
+    },
+    {
+      "plugin": "CoreProtect",
+      "version": "23.2",
+      "declared_mc_support": "1.16-1.21.11",
+      "declares_26_2": false,
+      "source": "modrinth",
+      "url": "https://cdn.modrinth.com/data/Lu3KuzdV/versions/6W2ad1iI/CoreProtect-CE-23.2.jar",
+      "category": "block-logging",
+      "deps": [],
+      "notes": "Community Edition fork (official PlayPro CoreProtect ships 26.2 as dev-build-only, no Modrinth/CurseForge tagged release). CE stops at 1.21.11 — NO 26.2 tag."
+    }
+  ]
+}

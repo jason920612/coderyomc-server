@@ -1,0 +1,5 @@
+# Plugin JAR binaries are NOT committed (licensing + size). Fetch via download.sh.
+jars/
+# Server run dir produced by the baseline boot
+run/
+*.log
