@@ -1,0 +1,6 @@
+# Large JFR binary recordings — do not commit (regenerate via run-profile.sh).
+*.jfr
+# Raw server/driver logs and per-run dumps.
+*.log
+samples-*.txt
+leaves-*.txt
