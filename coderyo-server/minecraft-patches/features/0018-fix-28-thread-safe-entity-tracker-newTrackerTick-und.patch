@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Fri, 26 Jun 2026 09:40:00 +0800
+Subject: [PATCH] fix(#28): thread-safe entity-tracker under parallel region
+ spawning (no newTrackerTick NPE)
+
+
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index b42bf0ecd381c07ff7c42dea3970f598ec426e98..2993a4f42fa60ab2a4286d05ce97d1478e3cd09e 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1041,19 +1041,49 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+     // Paper start - optimise entity tracker
+     private void newTrackerTick() {
++        // coderyoMC - issue #28: newTrackerTick runs on the ORCHESTRATOR (main) thread inside
++        // chunkSource.tick -> chunkMap.tick. Under region.enabled=true, region WORKER threads
++        // concurrently add (per-region natural spawning, P1.2e) and remove (entity death / item
++        // despawn / projectile impact during the worker entity tick) entities from the SAME
++        // Moonrise trackerEntities ReferenceList via entityStartLoaded/entityEndLoaded, AND a
++        // removed entity's chunkData/chunkStatus are nulled on the worker (ChunkEntitySlices
++        // .removeEntity). The ReferenceList is NOT thread-safe, so a concurrent add/remove can
++        //   (a) tear the raw array vs size() -> a null slot at trackerEntitiesRaw[i], or
++        //   (b) leave a still-listed entity whose moonrise$getChunkData()/getChunkStatus() was
++        //       just nulled mid-removal,
++        // either of which crashed newTrackerTick with an NPE (the #28 spawn-storm crash; same
++        // class as the #24 EntityTickList/navigatingMobs races). region.enabled=false keeps all
++        // add/remove/iteration single-threaded on main, so the null windows below never occur and
++        // the path stays byte-for-byte vanilla. The defensive skips are correct: an entity that is
++        // being added/removed on a worker this tick needs no tracker tick now (it is handled next
++        // tick, after the barrier, in a fully consistent state).
++        final boolean regionGuard = com.coderyo.region.RegionConfig.isEnabled(); // coderyoMC - issue #28
+         final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.server.ServerEntityLookup entityLookup = (ca.spottedleaf.moonrise.patches.chunk_system.level.entity.server.ServerEntityLookup)((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)this.level).moonrise$getEntityLookup();;
+ 
+         final ca.spottedleaf.moonrise.common.list.ReferenceList<net.minecraft.world.entity.Entity> trackerEntities = entityLookup.trackerEntities;
+         final Entity[] trackerEntitiesRaw = trackerEntities.getRawDataUnchecked();
+         for (int i = 0, len = trackerEntities.size(); i < len; ++i) {
+             final Entity entity = trackerEntitiesRaw[i];
++            if (regionGuard && entity == null) { // coderyoMC - issue #28: torn raw-array slot from a concurrent worker remove
++                continue;
++            }
+             final ChunkMap.TrackedEntity tracker = ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity)entity).moonrise$getTrackedEntity();
+             if (tracker == null) {
+                 continue;
+             }
+-            ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity)tracker).moonrise$tick(((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkData().nearbyPlayers);
++            // coderyoMC - issue #28: an entity concurrently mid-removal on a worker has its
++            // chunkData (and chunkStatus) nulled (ChunkEntitySlices.removeEntity) BEFORE it is
++            // pulled from trackerEntities; skip it rather than NPE on the null chunkData below.
++            final ca.spottedleaf.moonrise.patches.chunk_system.level.chunk.ChunkData chunkData =
++                ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkData(); // coderyoMC - issue #28
++            if (regionGuard && chunkData == null) { // coderyoMC - issue #28
++                continue;
++            }
++            ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity)tracker).moonrise$tick(chunkData.nearbyPlayers); // coderyoMC - issue #28: use the captured (non-null) chunkData
++            final FullChunkStatus chunkStatus =
++                ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkStatus(); // coderyoMC - issue #28
+             if (((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity)tracker).moonrise$hasPlayers()
+-                || ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkStatus().isOrAfter(FullChunkStatus.ENTITY_TICKING)) {
++                || (chunkStatus != null && chunkStatus.isOrAfter(FullChunkStatus.ENTITY_TICKING))) { // coderyoMC - issue #28: chunkStatus nulled concurrently on worker remove
+                 tracker.serverEntity.sendChanges();
+             }
+         }
