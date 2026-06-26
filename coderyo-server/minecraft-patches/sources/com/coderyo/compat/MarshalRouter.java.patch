@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/com/coderyo/compat/MarshalRouter.java
-@@ -1,0 +_,286 @@
+@@ -1,0 +_,296 @@
 +/*
 + * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
 + * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
@@ -8,6 +8,7 @@
 + */
 +package com.coderyo.compat;
 +
++import ca.spottedleaf.moonrise.common.util.TickThread;
 +import com.coderyo.region.Region;
 +import com.coderyo.region.RegionId;
 +import com.coderyo.region.RegionLifecycle;
@@ -52,8 +53,10 @@
 + *       inbound queue is MPSC (many posters, one drainer) — no cross-region lock is taken.</li>
 + *   <li><b>No cross-region locks:</b> resolution uses the lock-light copy-on-merge index; the
 + *       marshaled body runs entirely on the owning region thread.</li>
-+ *   <li><b>A region tick thread never synchronously waits on another region:</b> enforced by
-+ *       {@link #isRegionTickThread()} — a worker gets the snapshot path, never {@code join()}.</li>
++ *   <li><b>No tick thread ever synchronously waits on another region:</b> enforced on the read
++ *       path by {@code TickThread.isTickThread()} — ANY tick thread (the orchestrator main
++ *       "Server thread" AND a region worker) gets the snapshot path, never {@code join()} (issue
++ *       #27). The worker-only {@link #isRegionTickThread()} still gates the write/marshal path.</li>
 + *   <li><b>Watchdog / timeout on any marshal-and-wait:</b> {@link #marshalQuery}'s blocking wait
 + *       (only reachable off a tick thread) is bounded by {@link #MARSHAL_WAIT_MS}; on timeout it
 + *       falls back to the always-correct legacy path rather than hanging.</li>
@@ -165,9 +168,17 @@
 +            }
 +            return MarshalResult.of(snapshotRead.get());
 +        }
-+        if (isRegionTickThread()) {
-+            // ADR-0001 rule #1: a region tick thread NEVER synchronously waits on another region.
-+            // Block-state reads are side-effect-free, so serve from the read-only snapshot inline.
++        if (TickThread.isTickThread()) {
++            // issue #27: ANY tick thread — the orchestrator main ("Server thread") AND a region
++            // worker — must NEVER synchronously wait on another region. The orchestrator main
++            // thread is a Moonrise TickThread too (MinecraftServer spawns "Server thread" as a
++            // TickThread), but the old worker-name-only guard (isRegionTickThread) excluded it, so
++            // a plugin event handler reading a cross-region block on the main thread took the 50ms
++            // may-block branch — and since the owning region's inbound queue can't drain during the
++            // orchestrator's command/event window, a flood of those reads stacked into a multi-second
++            // main-thread stall (Watchdog thread-dumps). Block-state reads are side-effect-free, so
++            // serving them from the read-only snapshot inline on ANY tick thread preserves correctness
++            // and never blocks. (Write/marshal path is UNAFFECTED — writes still marshal.)
 +            SNAPSHOT_READS.incrementAndGet();
 +            if (CompatConfig.isDebug()) {
 +                LOGGER.info("compat: block read SNAPSHOT (Tier 1, tick thread '{}' never blocks) "
