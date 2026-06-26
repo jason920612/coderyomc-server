@@ -49,3 +49,14 @@ To **run it for max performance with plugin compatibility** (the proven flags + 
 ---
 
 *Based on PaperMC (Minecraft 26.2). Not affiliated with Mojang or the PaperMC project. Minecraft is a trademark of Mojang AB.*
+
+## Stability & production hardening
+
+Concurrency correctness is validated by composing all features under heavy real load (not just unit-style probes). Bugs that only surface when regionization, LOD, and plugin compat run together — or under stress — were found and fixed:
+
+- **#11** — region worker-pool not drained on shutdown → intermittent hang. Fixed (clean shutdown).
+- **#24** — multiple region workers race-polling the shared mid-tick task queue → `NoSuchElementException` crash under multi-region entity load. Fixed (single-owner draining; preserves single-writer-per-region).
+- **#27** — Tier-1 marshal blocking-read from the orchestrator/command thread stacked 50 ms waits into a multi-second main-thread stall under plugin event load. Fixed (any tick thread serves cross-region block *reads* from a read-only snapshot, non-blocking).
+- **#28** — entity-tracker (`ChunkMap.newTrackerTick`) iterating a non-thread-safe list while region workers add/remove entities → NPE under spawn-storm. Fixed (defensive guard, gated on regionization).
+
+Each fix is flag-gated such that `region.enabled=false` remains byte-for-byte vanilla, and each is proven by a sustained heavy-load e2e run (0 crashes / 0 single-writer violations).
