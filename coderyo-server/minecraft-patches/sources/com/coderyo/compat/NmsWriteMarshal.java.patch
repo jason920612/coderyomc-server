@@ -1,0 +1,174 @@
+--- /dev/null
++++ b/com/coderyo/compat/NmsWriteMarshal.java
+@@ -1,0 +_,171 @@
++/*
++ * coderyoMC — plugin compatibility layer. Clean-room independent implementation;
++ * Folia (GPL-3.0) studied as concept only, never copied. See design-spec §5 and
++ * ADR-0001 (the LOCKED tier model).
++ */
++package com.coderyo.compat;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Tier 1 — the <b>NMS {@code Level.setBlock} auto-marshal</b> funnel (P3.3).
++ *
++ * <p>P3.2 marshaled cross-region block writes that flow through the Bukkit {@code CraftBlock}
++ * surface ({@code Block.setType} / {@code setBlockData}). But the high-value bulk editors —
++ * WorldEdit's {@code //set} (via {@code PaperweightAdapter}), and vanilla {@code /setblock} /
++ * {@code /fill} — call {@link net.minecraft.world.level.Level#setBlock} <b>directly</b>, bypassing
++ * {@code CraftBlock}, so P3.2's hook never saw them. P3.3 hooks the NMS {@code setBlock} funnel
++ * itself and reuses {@link MarshalRouter#marshalVoid} to marshal a cross-region write to the
++ * owning region's single-drainer inbound queue.
++ *
++ * <h2>The hard constraint: marshal ONLY genuinely external writes (positive opt-in)</h2>
++ * {@code Level.setBlock} is the busiest write funnel on the server — region-internal ticking
++ * (redstone, fluids, growth), <b>worldgen / chunk-population</b>, and every same-region edit pour
++ * through it. Marshaling any of those would be a perf <em>and</em> correctness disaster (the hot
++ * path must stay inline). An early P3.3 cut tried to <em>exclude</em> the internal writers and
++ * marshal "everything else"; an e2e immediately exposed the flaw — ~12k worldgen / chunk-load
++ * writes fire on the Server thread at startup (outside any tick body), and got wrongly marshaled.
++ * So this funnel takes the inverse, conservative stance: it marshals a write <b>only</b> when it
++ * is <em>positively</em> tagged as an external command/plugin write. ALL of the following must hold:
++ * <ol>
++ *   <li>{@code compat.enabled} (⇒ {@code region.enabled}); else byte-for-byte vanilla.</li>
++ *   <li>The level is a {@link ServerLevel}. Worldgen writes go through {@code WorldGenRegion} /
++ *       {@code ProtoChunk} (a different {@code LevelAccessor}), so they never reach this gate.</li>
++ *   <li><b>The current thread is in an EXTERNAL write context</b> ({@link #isExternalWrite()}) —
++ *       a thread-local flag set <em>only</em> around {@code Commands.performCommand}, the
++ *       universal command chokepoint that BOTH console (DedicatedServer.performPrefixedCommand) and Bukkit (CraftServer.dispatchCommand) paths funnel through.
++ *       This positively scopes the hook to {@code /setblock}, {@code /fill}, and WorldEdit
++ *       {@code //set} (a command → {@code PaperweightAdapter} → NMS {@code setBlock}). Engine
++ *       writes — worldgen, chunk-load, region-internal ticking, global tick work — are never in
++ *       this context, so they are excluded by construction (no fragile internal-writer denylist).</li>
++ *   <li>The caller is <b>NOT a region tick worker</b> ({@link MarshalRouter#isRegionTickThread()})
++ *       and <b>NOT inside the orchestrator's internal tick phase</b>
++ *       ({@link #isOrchestratorInternalTick()}). Defense-in-depth for a command dispatched from a
++ *       command-block / function during ticking (regions ticking ⇒ that write stays inline).</li>
++ *   <li>The target chunk is owned by a region the calling thread does not own
++ *       ({@link MarshalRouter#marshalVoid} resolves this — an unowned chunk falls through to the
++ *       inline vanilla write).</li>
++ * </ol>
++ * What survives all gates is precisely an external command write (console / player / plugin
++ * command, e.g. {@code /setblock}, {@code /fill}, WorldEdit {@code //set}) targeting a chunk owned
++ * by a <em>different</em> region — the gap P3.2 left. <b>When in doubt, do not marshal</b> (pass
++ * inline): a missed external write becomes a same-thread inline write, still correct because the
++ * command phase is region-quiescent (the orchestrator dispatches commands outside the parallel
++ * region phase). Over-marshaling the hot path is the unacceptable failure.
++ *
++ * <h2>No double-marshal</h2>
++ * A write marshaled here re-enters {@code Level.setBlock} when the owning region drains its
++ * inbound queue — but that runs on the region's worker thread, so gate (3) short-circuits it to
++ * an inline write. The P3.2 {@code CraftBlock} hook returns before ever calling {@code setBlock}
++ * for a marshaled Bukkit write, so the two hooks never both fire for one call.
++ */
++public final class NmsWriteMarshal {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("coderyoMC/compat");
++
++    /**
++     * Per-thread depth of the orchestrator's internal level-tick phase. Set on the Server
++     * (orchestrator) thread for the whole duration of {@link RegionTickOrchestrator}'s
++     * per-level work (global {@code level.tick} + unowned fallback ticking); zero everywhere
++     * else, including on plugin/command dispatch (which happens outside the tick body). A
++     * thread-local depth counter (not a flag) tolerates any nesting without losing the bracket.
++     */
++    private static final ThreadLocal<int[]> ORCH_INTERNAL_DEPTH = ThreadLocal.withInitial(() -> new int[1]);
++
++    /**
++     * Per-thread depth of an EXTERNAL command/plugin write context. Set <em>only</em> around
++     * {@code Commands.performCommand} (the universal command chokepoint). Non-zero exactly
++     * while a console / player / vanilla command is executing on this thread — the precise scope
++     * in which {@code /setblock}, {@code /fill} and WorldEdit {@code //set} perform their NMS
++     * {@code setBlock} writes. Zero everywhere else, so engine writes (worldgen, chunk-load,
++     * region/global ticking) can never be misclassified as external.
++     */
++    private static final ThreadLocal<int[]> EXTERNAL_WRITE_DEPTH = ThreadLocal.withInitial(() -> new int[1]);
++
++    private NmsWriteMarshal() {
++    }
++
++    /** Mark the start of an external command/plugin dispatch on the current thread. */
++    public static void enterExternalWrite() {
++        EXTERNAL_WRITE_DEPTH.get()[0]++;
++    }
++
++    /** Mark the end of an external command/plugin dispatch on the current thread. */
++    public static void exitExternalWrite() {
++        final int[] cell = EXTERNAL_WRITE_DEPTH.get();
++        if (cell[0] > 0) {
++            cell[0]--;
++        }
++    }
++
++    /** Whether the current thread is executing an external command/plugin dispatch. */
++    public static boolean isExternalWrite() {
++        return EXTERNAL_WRITE_DEPTH.get()[0] > 0;
++    }
++
++    /** Mark the start of orchestrator-internal tick work on the current (Server) thread. */
++    public static void enterOrchestratorTick() {
++        ORCH_INTERNAL_DEPTH.get()[0]++;
++    }
++
++    /** Mark the end of orchestrator-internal tick work on the current (Server) thread. */
++    public static void exitOrchestratorTick() {
++        final int[] cell = ORCH_INTERNAL_DEPTH.get();
++        if (cell[0] > 0) {
++            cell[0]--;
++        }
++    }
++
++    /** Whether the current thread is mid orchestrator-internal tick work (⇒ never marshal). */
++    public static boolean isOrchestratorInternalTick() {
++        return ORCH_INTERNAL_DEPTH.get()[0] > 0;
++    }
++
++    /**
++     * Decide whether an NMS {@code Level.setBlock} write is a genuinely external cross-region
++     * write that should be marshaled to the owning region.
++     *
++     * @param level the server level the write targets.
++     * @param pos   the block position (an immutable copy is captured for the marshaled body).
++     * @param apply the inline write body — re-runs {@code Level.setBlock} on the owning region's
++     *              tick thread (Tier 1) when marshaled.
++     * @return {@code true} if the write was handled (marshaled to the owning region); the caller
++     *         must then return without performing the inline write. {@code false} if the caller
++     *         must perform the normal inline vanilla write (hot path / same region / unowned).
++     */
++    public static boolean maybeMarshalExternalWrite(final ServerLevel level, final BlockPos pos,
++                                                    final Runnable apply) {
++        if (!CompatConfig.isEnabled()) {
++            return false;
++        }
++        // Gate (3): POSITIVE opt-in — only an external command/plugin dispatch may marshal. This
++        // single gate excludes worldgen, chunk-load, and all engine ticking writes by construction.
++        if (!isExternalWrite()) {
++            return false;
++        }
++        // Gate (4a): region tick worker -> hot path, inline (e.g. a command-block on a worker).
++        if (MarshalRouter.isRegionTickThread()) {
++            return false;
++        }
++        // Gate (4b): orchestrator internal tick phase (command-block / function during ticking).
++        if (isOrchestratorInternalTick()) {
++            return false;
++        }
++        // Gate (5): owned by a foreign region -> marshal (MarshalRouter handles unowned -> false).
++        final long chunkKey = ChunkPos.pack(pos);
++        final boolean marshaled = MarshalRouter.marshalVoid(level.dimension(), chunkKey, apply);
++        if (CompatConfig.isDebug()) {
++            // Distinct NMS-path marker so an NMS setBlock marshal is identifiable apart from the
++            // P3.2 CraftBlock-path marshal (both funnel through MarshalRouter's shared log line).
++            LOGGER.info("compat: NMS setBlock EXTERNAL @ {},{},{} chunk={},{} -> {} (thread '{}')",
++                pos.getX(), pos.getY(), pos.getZ(), ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey),
++                marshaled ? "MARSHALED to owning region (Tier 1)" : "inline (chunk unowned by any region)",
++                Thread.currentThread().getName());
++        }
++        return marshaled;
++    }
++}

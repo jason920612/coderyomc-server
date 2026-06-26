@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Fri, 26 Jun 2026 08:15:14 +0800
+Subject: [PATCH] P3.3: NMS setBlock Tier-1 marshaling (WorldEdit/fill
+ cross-region)
+
+---
+ com/coderyo/region/RegionTickOrchestrator.java | 12 ++++++++++++
+ net/minecraft/commands/Commands.java           | 15 +++++++++++++++
+ net/minecraft/world/level/Level.java           | 16 ++++++++++++++++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/com/coderyo/region/RegionTickOrchestrator.java b/com/coderyo/region/RegionTickOrchestrator.java
+index d406a1c..471afa6 100644
+--- a/com/coderyo/region/RegionTickOrchestrator.java
++++ b/com/coderyo/region/RegionTickOrchestrator.java
+@@ -108,6 +108,15 @@ public final class RegionTickOrchestrator {
+ 
+     private static void tickLevel(final ServerLevel level, final BooleanSupplier haveTime,
+                                   final boolean debug, final long serverTick) {
++        // coderyoMC - P3.3: bracket ALL orchestrator-thread tick work as "internal". The Server
++        // thread runs the level's global work (block events, raids, dragon fight) and the
++        // unowned-chunk fallback tick, both of which setBlock to owned chunks. Those are
++        // vanilla-ordered internal writes (regions are quiescent here), so the NMS setBlock hook
++        // must NOT marshal them — only writes from OUTSIDE this bracket (commands / plugin tasks)
++        // are external. Worker threads have their own (unset) thread-local, so the parallel region
++        // phase is unaffected; commands dispatched outside tickLevel see depth 0 -> marshal.
++        com.coderyo.compat.NmsWriteMarshal.enterOrchestratorTick();
++        try {
+         // 1) Run the level's global work on the orchestrator with the parallel phases
+         //    suppressed (entity + block-entity loops skipped — regions run them).
+         level.coderyoSetParallelTickActive(true);
+@@ -266,6 +275,9 @@ public final class RegionTickOrchestrator {
+         if (debug) {
+             logParallelEvidence(level, serverTick, activeWork, work);
+         }
++        } finally {
++            com.coderyo.compat.NmsWriteMarshal.exitOrchestratorTick(); // coderyoMC - P3.3
++        }
+     }
+ 
+     private static List<TickingBlockEntity> snapshotBlockEntities(final ServerLevel level) {
+diff --git a/net/minecraft/commands/Commands.java b/net/minecraft/commands/Commands.java
+index d210f99..d3ee732 100644
+--- a/net/minecraft/commands/Commands.java
++++ b/net/minecraft/commands/Commands.java
+@@ -373,6 +373,18 @@ public class Commands {
+         Profiler.get().push(() -> "/" + commandString);
+         ContextChain<CommandSourceStack> commandChain = finishParsing(command, commandString, sender);
+ 
++        // coderyoMC start - P3.3: mark this thread as an EXTERNAL command-write context for the
++        // synchronous duration of command execution (the queue drains inline below). This is the
++        // universal command chokepoint for BOTH console (DedicatedServer.performPrefixedCommand)
++        // and Bukkit (CraftServer.dispatchCommand) paths, so /setblock, /fill and WorldEdit //set
++        // (command -> NMS Level.setBlock) get their cross-region writes marshaled to the owning
++        // region. Engine writes (worldgen, chunk-load, region/global ticking) are never in this
++        // context, so they stay inline. Inert unless compat.enabled. See NmsWriteMarshal.
++        final boolean coderyoExternalWrite = com.coderyo.compat.CompatConfig.isEnabled();
++        if (coderyoExternalWrite) {
++            com.coderyo.compat.NmsWriteMarshal.enterExternalWrite();
++        }
++        // coderyoMC end - P3.3
+         try {
+             if (commandChain != null) {
+                 executeCommandInContext(
+@@ -406,6 +418,9 @@ public class Commands {
+                 LOGGER.error("'/{}' threw an exception", commandString, e);
+             }
+         } finally {
++            if (coderyoExternalWrite) {
++                com.coderyo.compat.NmsWriteMarshal.exitExternalWrite(); // coderyoMC - P3.3
++            }
+             Profiler.get().pop();
+         }
+     }
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 67b0150..11ff3e0 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -1128,6 +1128,22 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+ 
+     @Override
+     public boolean setBlock(final BlockPos pos, final BlockState blockState, final @Block.UpdateFlags int updateFlags, final int updateLimit) {
++        // coderyoMC start - P3.3 Tier-1 NMS auto-marshal. WorldEdit //set (PaperweightAdapter),
++        // vanilla /setblock and /fill call Level.setBlock DIRECTLY, bypassing the P3.2 CraftBlock
++        // hook. When regionized ticking is on AND this is a genuinely EXTERNAL write (command /
++        // plugin task dispatched outside the tick body, NOT a region worker, NOT the orchestrator's
++        // internal tick phase, NOT worldgen) targeting a chunk owned by a DIFFERENT region, marshal
++        // it to the owning region's inbound queue (fire-and-forget). The hot path -- region-internal
++        // ticking, worldgen, same-region writes -- passes straight through inline (see NmsWriteMarshal).
++        if (com.coderyo.compat.CompatConfig.isEnabled()
++                && this instanceof final net.minecraft.server.level.ServerLevel coderyoServerLevel) {
++            final net.minecraft.core.BlockPos coderyoPos = pos.immutable();
++            if (com.coderyo.compat.NmsWriteMarshal.maybeMarshalExternalWrite(coderyoServerLevel, coderyoPos,
++                    () -> this.setBlock(coderyoPos, blockState, updateFlags, updateLimit))) {
++                return true; // marshaled to the owning region (Tier 1); applied at its next tick.
++            }
++        }
++        // coderyoMC end - P3.3
+         // CraftBukkit start - tree generation
+         final CaptureState coderyoCap = this.coderyoCapture(); // coderyoMC - P1.2f
+         if (coderyoCap.captureTreeGeneration) {
+-- 
+2.54.0.windows.1
+
