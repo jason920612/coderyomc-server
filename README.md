@@ -23,7 +23,11 @@ A high-throughput fork of **PaperMC for Minecraft 26.2**, built on the `paperwei
 
 ## Plugin compatibility
 
-With regionization **off**, full Paper/Bukkit compatibility (it *is* Paper). With regionization **on**, plugins that assume a single main thread or reach into internals may need to be region-aware; pure-API plugins generally work. This is the standard regionized-server trade-off.
+With regionization **off**, full Paper/Bukkit compatibility (it *is* Paper). With regionization **on**, a `compat` router keeps plugins working by routing scheduler tasks, events, and cross-region block writes to a valid tick thread (`AsyncCatcher` / `isPrimaryThread()` still pass — no thread check is ever disabled). Pure-API plugins generally work; plugins that reach into NMS internals or cache cross-thread references may need to be region-aware. This is the standard regionized-server trade-off.
+
+**Corpus result (region.enabled=true):** **6 of 7** popular plugins are fully functional and **7/7** load+run with no crash / AsyncCatcher / single-writer / thread-safety exception under regionized parallel ticking — meeting the design target (ADR ~70–80% correct-execution ceiling). Tested: LuckPerms, WorldEdit (incl. cross-region `//set` via NMS auto-marshal), WorldGuard, VaultUnlocked, EssentialsX (economy), ViaVersion — all work; PlaceholderAPI loads+parses but leaves some placeholders unresolved (a resolution gap, not a region/compat defect).
+
+See **[USAGE.md](./USAGE.md)** for the recommended run command, the per-flag trade-offs, and the full plugin-compat / benchmark detail.
 
 ## Honest engineering log (what was rigorously tested and **rejected**)
 
@@ -39,6 +43,8 @@ Performance work here is benchmark-driven. These were each built, measured, and 
 ## Build
 
 Requires **JDK 25**. `./gradlew applyAllPatches` then `./gradlew createPaperclipJar`.
+
+To **run it for max performance with plugin compatibility** (the proven flags + trade-offs), see **[USAGE.md](./USAGE.md)**.
 
 ---
 
