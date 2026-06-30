@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c570668b1d
+index 0000000000000000000000000000000000000000..7ae4052c24aef4e152e311af88fdb8a6d7710ec8
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,2157 @@
+@@ -0,0 +1,2290 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -55,6 +55,8 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +import net.minecraft.world.level.block.DaylightDetectorBlock;
 +import net.minecraft.world.level.block.JukeboxBlock;
 +import net.minecraft.world.level.block.LecternBlock;
++import net.minecraft.world.level.block.LightningRodBlock;
++import net.minecraft.world.level.block.BellBlock;
 +import net.minecraft.world.level.block.NoteBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
@@ -117,7 +119,10 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 + */
 +final class CompiledNetwork {
 +
-+    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP, BUTTON, TARGET, PISTON, DISPENSER, CRAFTER }
++    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP, BUTTON, TARGET, PISTON, DISPENSER, CRAFTER, LIGHTNING_ROD }
++
++    /** {@code LightningRodBlock.ACTIVATION_TICKS} (private in vanilla) — the scheduled un-power delay. */
++    private static final int LIGHTNING_ROD_ACTIVATION_TICKS = 8;
 +
 +    /**
 +     * One cell of an in-flight piston contraption — the compiled analogue of a vanilla
@@ -195,6 +200,35 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +     * modelled from {@code NoteBlock.neighborChanged}. Included for block-state parity only.
 +     */
 +    private final LongSet noteBlocks = new LongOpenHashSet();
++
++    /**
++     * Lightning rods: a redstone SOURCE that goes POWERED for {@code ACTIVATION_TICKS} (8) on a
++     * lightning strike, then a scheduled tick un-powers it — modelled exactly like a button
++     * ({@link #strikeLightningRod} / {@link #runLightningRod}). The strike is a controlled boundary
++     * stimulus; the POWERED signal (weak all sides + strong out FACING) is propagated by the shared
++     * vanilla SignalGetter code, so the downstream output is bit-identical by construction.
++     */
++    private final LongSet lightningRods = new LongOpenHashSet();
++
++    /**
++     * Bells: a pure redstone LOAD with NO output. {@code BellBlock} overrides no signal method
++     * (isSignalSource defaults false) so it emits ZERO redstone; its {@code POWERED} state merely
++     * mirrors the neighbour signal (rings on the rising edge — {@code BellBlock.neighborChanged}),
++     * exactly like a note block. Tracked only to keep the POWERED block-state bit-identical and to
++     * PROVE (via difftest) that a powered bell drives no downstream redstone (parity = both emit 0).
++     */
++    private final LongSet bells = new LongOpenHashSet();
++
++    /**
++     * Per-piston snapshot of its 6 face-neighbour block states, indexed by {@code Direction.ordinal()}.
++     * The compiler's poll model re-evaluates every piston each tick, but vanilla re-evaluates a piston
++     * only from {@code neighborChanged} — i.e. when a real block update is delivered, which happens iff
++     * one of its FACE-neighbour cells changes (vanilla {@code updateNeighborsAt} notifies the 6 direct
++     * neighbours). A pure quasi-connectivity power change in the above-diagonal QC cells delivers NO
++     * update, so vanilla leaves the piston un-fired — the zero-update BUD. {@link #pistonNeighborUpdated}
++     * diffs this snapshot to reproduce that event-driven laziness without a full poll-&gt;event rewrite.
++     */
++    private final java.util.Map<Long, BlockState[]> pistonNeighborSeen = new HashMap<>();
 +
 +    /**
 +     * Entity-detection INPUT cells: pressure plates (binary/weighted), tripwire hooks +
@@ -334,6 +368,10 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +                c.copperBulbs.add(packed); // 1-bit memory: rising-edge LIT toggle
 +            } else if (state.getBlock() instanceof NoteBlock) {
 +                c.noteBlocks.add(packed); // load only: POWERED mirrors neighbour signal
++            } else if (state.getBlock() instanceof LightningRodBlock) {
++                c.lightningRods.add(packed); // source: POWERED 8 ticks on a strike (button-like)
++            } else if (state.getBlock() instanceof BellBlock) {
++                c.bells.add(packed); // load only: POWERED mirrors neighbour signal, NO redstone output
 +            } else if (state.getBlock() instanceof DaylightDetectorBlock) {
 +                // Analog signal source driven by SKY LIGHT — a boundary INPUT read live each
 +                // step (vanilla computes light->POWER, incl. the inverted mode), exactly like a
@@ -413,7 +451,22 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +        for (final long packed : c.lamps) {
 +            c.lampLastSignal.put(packed, c.vw.hasNeighborSignal(BlockPos.of(packed)));
 +        }
++        // Seed each piston's face-neighbour snapshot from the SETTLED grid (the zero-update BUD gate).
++        // The snapshot is the state the piston has already "observed"; a later step re-evaluates the
++        // piston only when one of these six cells differs — i.e. a real neighbour update was delivered.
++        for (final long packed : c.pistons) {
++            c.pistonNeighborSeen.put(packed, c.snapshotPistonNeighbors(BlockPos.of(packed)));
++        }
 +        return c;
++    }
++
++    /** Capture a piston's 6 face-neighbour block states, indexed by {@code Direction.ordinal()}. */
++    private BlockState[] snapshotPistonNeighbors(final BlockPos p) {
++        final BlockState[] seen = new BlockState[6];
++        for (final Direction d : Direction.values()) {
++            seen[d.ordinal()] = this.vw.getBlockState(p.relative(d));
++        }
++        return seen;
 +    }
 +
 +    /**
@@ -556,6 +609,17 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +        this.schedule(pos.asLong(), Kind.TARGET, duration, P_NORMAL, nowRel);
 +    }
 +
++    /**
++     * Apply a lightning strike to a lightning rod (a controlled boundary stimulus): set its POWERED
++     * state into the grid and schedule the un-power exactly like {@code LightningRodBlock.onLightningStrike}
++     * (which calls {@code level.scheduleTick(pos, this, 8)} — ACTIVATION_TICKS). The un-power lands on
++     * {@code nowRel + 8}, matching the real rod's scheduled {@code tick} that resets POWERED to false.
++     */
++    void strikeLightningRod(final BlockPos pos, final BlockState powered, final long nowRel) {
++        this.vw.set(pos, powered);
++        this.schedule(pos.asLong(), Kind.LIGHTNING_ROD, LIGHTNING_ROD_ACTIVATION_TICKS, P_NORMAL, nowRel);
++    }
++
 +    // ----------------------------------------------------------------- stepping
 +
 +    /** Advance the compiled model by exactly one game tick. */
@@ -626,6 +690,7 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +            case LAMP -> this.runLamp(e.pos());
 +            case BUTTON -> this.runButton(e.pos());
 +            case TARGET -> this.runTarget(e.pos());
++            case LIGHTNING_ROD -> this.runLightningRod(e.pos());
 +            case PISTON -> this.runPistonEvent(e.pos());
 +            case DISPENSER -> this.runDispenser(e.pos());
 +            case CRAFTER -> this.runCrafter(e.pos());
@@ -641,6 +706,9 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +        }
 +        for (final long pos : this.noteBlocks) {
 +            this.updateNoteBlock(pos);
++        }
++        for (final long pos : this.bells) {
++            this.updateBell(pos);
 +        }
 +        for (final long pos : this.torches) {
 +            this.scheduleTorchIfNeeded(pos, tick);
@@ -1178,6 +1246,24 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +        }
 +    }
 +
++    // ----------------------------------------------------------------- bell
++
++    /**
++     * Bell — pure redstone LOAD. Transcribed from {@code BellBlock.neighborChanged}: the
++     * {@code POWERED} state mirrors the neighbour signal (vanilla rings the bell on the rising edge —
++     * not modelled, no game effect on the circuit). The bell is NOT a signal source (it overrides no
++     * signal method), so it emits ZERO redstone; this only keeps the block-state bit-identical and
++     * lets the harness prove a powered bell drives nothing downstream (parity = both worlds emit 0).
++     */
++    private void updateBell(final long pos) {
++        this.m.set(pos);
++        final boolean signal = this.vw.hasNeighborSignal(this.m.immutable());
++        final BlockState state = this.state(pos);
++        if (signal != state.getValue(BlockStateProperties.POWERED)) {
++            this.vw.set(pos, state.setValue(BlockStateProperties.POWERED, signal));
++        }
++    }
++
 +    // ---------------------------------------------------------------- button
 +
 +    // Transcribed from ButtonBlock.tick -> checkPressed: with no arrow present the button
@@ -1197,6 +1283,17 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +        final BlockState state = this.state(pos);
 +        if (state.getValue(BlockStateProperties.POWER) != 0) {
 +            this.vw.set(pos, state.setValue(BlockStateProperties.POWER, 0));
++        }
++    }
++
++    // ------------------------------------------------------------- lightning rod
++
++    // Transcribed from LightningRodBlock.tick: the scheduled tick (8 ticks after the strike) resets
++    // POWERED to false, dropping the rod's redstone output back to 0.
++    private void runLightningRod(final long pos) {
++        final BlockState state = this.state(pos);
++        if (state.getValue(BlockStateProperties.POWERED)) {
++            this.vw.set(pos, state.setValue(BlockStateProperties.POWERED, false));
 +        }
 +    }
 +
@@ -1258,6 +1355,32 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +        return false;
 +    }
 +
++    /**
++     * The zero-update BUD gate: returns true iff a real neighbour update reached this piston since it
++     * was last evaluated — i.e. at least one of its 6 face-neighbour cells changed block-state (the
++     * exact condition under which vanilla's {@code updateNeighborsAt} would post a {@code neighborChanged}
++     * to the piston). Refreshes the stored snapshot to the current state, so the next call compares
++     * against what the piston has now observed (mirroring vanilla's per-update re-evaluation). A pure
++     * above-diagonal QC change touches NO face-neighbour, so this returns false and the piston is left
++     * un-fired — reproducing vanilla's BUD. BlockState values are canonical singletons (identity-comparable).
++     */
++    private boolean pistonNeighborUpdated(final long pos) {
++        final BlockState[] seen = this.pistonNeighborSeen.get(pos);
++        if (seen == null) {
++            return true; // not snapshotted (defensive) — evaluate, matching the eager fallback
++        }
++        final BlockPos p = BlockPos.of(pos);
++        boolean changed = false;
++        for (final Direction d : Direction.values()) {
++            final BlockState cur = this.vw.getBlockState(p.relative(d));
++            if (seen[d.ordinal()] != cur) {
++                seen[d.ordinal()] = cur;
++                changed = true;
++            }
++        }
++        return changed;
++    }
++
 +    // Transcribed from PistonBaseBlock.checkIfExtend: a state mismatch posts a block event.
 +    // Vanilla posts the event during the neighbour-update that changed power; it runs in the
 +    // NEXT level block-event phase, i.e. one tick later — so we schedule with delay 1.
@@ -1265,6 +1388,16 @@ index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c5
 +        final BlockState st = this.state(pos);
 +        if (!(st.getBlock() instanceof PistonBaseBlock)) {
 +            return; // body is mid-retract (MOVING_PISTON); no checkIfExtend on it
++        }
++        // ZERO-UPDATE BUD: vanilla calls checkIfExtend ONLY from neighborChanged — i.e. when a real
++        // block update is delivered to the piston, which happens iff one of its 6 FACE-neighbour cells
++        // changes (vanilla updateNeighborsAt notifies the 6 direct neighbours). A pure quasi-
++        // connectivity power change in the above-DIAGONAL QC cells (read by getNeighborSignal but NOT
++        // face-adjacent to the piston) delivers NO update, so vanilla leaves the piston un-fired. The
++        // poll model would eagerly fire it; gate on a genuine neighbour update to reproduce vanilla's
++        // event-driven laziness (the classic BUD), without a fundamental poll->event rewrite.
++        if (!this.pistonNeighborUpdated(pos)) {
++            return;
 +        }
 +        final Direction dir = st.getValue(BlockStateProperties.FACING);
 +        final boolean extend = this.pistonHasSignal(pos, dir);
@@ -2345,10 +2478,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1bb4352624
+index 0000000000000000000000000000000000000000..3961c858ea6550fc96b4e3de13dc440a8fbbb56e
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,1899 @@
+@@ -0,0 +1,2006 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -2390,6 +2523,8 @@ index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1b
 +import net.minecraft.world.level.block.DispenserBlock;
 +import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.LeverBlock;
++import net.minecraft.world.level.block.LightningRodBlock;
++import net.minecraft.world.level.block.BellBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.JukeboxBlock;
 +import net.minecraft.world.level.block.LecternBlock;
@@ -2489,7 +2624,15 @@ index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1b
 +                    // level (its analog POWER is computed by vanilla and copied live into the compiled
 +                    // grid each tick — a fixed light keeps the input, and thus the parity, constant).
 +                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.ADVANCE_TIME, false, level);
-+                    LOG.info("[redstone-difftest] forceloaded build-area chunks; mob-spawning OFF; world clock frozen; waiting for load");
++                    // FREEZE random block ticking too. Random ticks drive environmental processes the
++                    // redstone compiler does NOT model and that are OUT of scope (copper/copper-bulb
++                    // weathering oxidising a bulb mid-run, crop growth, leaf decay, etc.). With a non-zero
++                    // tick speed a copper bulb can randomly oxidise (copper_bulb -> exposed_copper_bulb)
++                    // and diverge from the compiled snapshot — a flaky, RNG-dependent boundary change, not
++                    // a logic bug. Zeroing it keeps the boundary deterministic, exactly like freezing the
++                    // clock and mob spawns, so the parity comparison isolates redstone logic alone.
++                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.RANDOM_TICK_SPEED, 0, level);
++                    LOG.info("[redstone-difftest] forceloaded build-area chunks; mob-spawning OFF; world clock + random-ticking frozen; waiting for load");
 +                }
 +                if (ticks > 40 && areaLoaded(level)) {
 +                    buildCorpus(level);
@@ -2858,6 +3001,10 @@ index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1b
 +    private static final BlockState DAYLIGHT = Blocks.DAYLIGHT_DETECTOR.defaultBlockState();
 +    private static final BlockState COPPER_BULB = Blocks.COPPER_BULB.weathering().unaffected().defaultBlockState();
 +    private static final BlockState NOTEBLOCK = Blocks.NOTE_BLOCK.defaultBlockState();
++    /** Lightning rod (un-oxidised copper variant), FACING UP: weak power all sides + strong out top when POWERED. */
++    private static final BlockState LIGHTNING_ROD = Blocks.LIGHTNING_ROD.weathering().unaffected().defaultBlockState();
++    /** Bell, FLOOR attachment (needs a sturdy block below): a pure load, mirrors neighbour signal, no output. */
++    private static final BlockState BELL = Blocks.BELL.defaultBlockState();
 +    /** Crafter (1.21): default orientation NORTH_UP (ejects the result toward NORTH, into air). */
 +    private static final BlockState CRAFTER = Blocks.CRAFTER.defaultBlockState();
 +    private static final BlockState CHISELED_BOOKSHELF = Blocks.CHISELED_BOOKSHELF.defaultBlockState();
@@ -3843,6 +3990,68 @@ index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1b
 +                lvl.gameEvent(null, GameEvent.BLOCK_PLACE, new BlockPos(9, 103, 52)); // freq 13 -> comparator emits 13
 +            }
 +        }));
++
++        // =================================================================
++        //  WEATHER / EXOTIC SOURCES — lightning rod (redstone source on a strike) + bell (load,
++        //  no output) + a zero-update BUD piston. Row z=100, x 62-78 (clear of the misc signal
++        //  blocks at x<=57). The strike is a CONTROLLED LightningRodBlock.onLightningStrike at a
++        //  fixed pos+tick (vanilla's exact activation path), NOT a summoned bolt — deterministic.
++        // =================================================================
++
++        // ---- Circuit 48: LIGHTNING ROD — controlled strike -> POWERED 8 ticks -> dust -> lamp ----
++        // A strike sets the rod POWERED (ownSignal = weak 15 to all sides, getDirectSignal = strong 15
++        // out FACING=UP), driving the adjacent dust line + lamp; vanilla schedules an un-power exactly
++        // ACTIVATION_TICKS=8 ticks later (LightningRodBlock.tick), dropping the output. POWERED, the
++        // emitted redstone and the 8-tick un-power timing are differential-compared bit-identical every
++        // tick. Struck twice (rel 30 + 100) so a second activation cycle is also proven.
++        put(level, 62, 100, 100, STONE);  put(level, 62, 101, 100, LIGHTNING_ROD); // rod (FACING UP)
++        put(level, 63, 100, 100, STONE);  put(level, 63, 101, 100, WIRE);          // dust reads weak 15
++        put(level, 64, 100, 100, STONE);  put(level, 64, 101, 100, WIRE);
++        put(level, 65, 101, 100, LAMP);                                            // load follows the rod
++        SCENARIOS.add(new Scenario("lightning-rod-output", new BlockPos(62, 101, 100), (lvl, c, rel) -> {
++            if (rel == 30 || rel == 100) {
++                strikeRod(lvl, c, new BlockPos(62, 101, 100), rel); // controlled strike -> POWERED, un-power @+8
++            }
++        }));
++
++        // ---- Circuit 49: BELL — pure load, NO redstone output (parity = both worlds emit 0) ----
++        // A redstone block beside the bell drives its POWERED state (BellBlock.neighborChanged mirrors
++        // the neighbour signal + rings on the rising edge); but the bell emits NO redstone, so the dust
++        // on its FAR side and the lamp stay DARK throughout. We differential-compare the bell's POWERED
++        // (load parity) AND the far dust/lamp staying 0 (proving zero output) — bit-identical every tick.
++        // Redstone-trivial: confirmed the bell is a load at most, never a source.
++        put(level, 71, 100, 100, STONE);  put(level, 71, 101, 100, BELL);  // bell (FLOOR, sturdy block below)
++        put(level, 72, 100, 100, STONE);  put(level, 72, 101, 100, WIRE);  // FAR-side dust — must stay 0
++        put(level, 73, 101, 100, LAMP);                                    // load — must stay OFF
++        SCENARIOS.add(new Scenario("bell-load-no-output", new BlockPos(71, 101, 100), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(70, 101, 100), REDBLOCK); // power -> bell POWERED true (rings)
++            } else if (rel == 80) {
++                setBoth(lvl, c, new BlockPos(70, 101, 100), AIR);      // unpower -> bell POWERED false
++            }
++        }));
++
++        // ---- Circuit 50: ZERO-UPDATE BUD — pure-QC change does NOT fire the piston (vanilla parity) ----
++        // The classic block-update-detector case the poll model used to get WRONG. Phase 1 (rel 30):
++        // a redstone block TWO above the piston (68,103,86) supplies QC power via getNeighborSignal's
++        // above-pass, but (68,103,86) is NOT a face-neighbour of the piston — so vanilla delivers NO
++        // neighborChanged and the piston stays UN-EXTENDED (zero-update BUD). The compiled model now
++        // gates on a real neighbour update (pistonNeighborUpdated) and matches: both stay retracted.
++        // Phase 2 (rel 60): a stone at (68,102,86) — a genuine FACE-neighbour (UP) — delivers the update
++        // while QC is still powered, so BOTH now EXTEND. Phase 3 (rel 90): removing both retracts.
++        // Every cell (piston EXTENDED, QC cells, pushed block) is bit-identical every tick.
++        put(level, 68, 101, 86, PISTON_E);
++        put(level, 69, 101, 86, STONE);   // pushed block
++        SCENARIOS.add(new Scenario("zero-update-bud", new BlockPos(68, 101, 86), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(68, 103, 86), REDBLOCK); // pure QC, NO update to piston -> BUD: no fire
++            } else if (rel == 60) {
++                setBoth(lvl, c, new BlockPos(68, 102, 86), STONE);    // real FACE-neighbour update -> piston EXTENDS
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(68, 103, 86), AIR);
++                setBoth(lvl, c, new BlockPos(68, 102, 86), AIR);      // remove both -> QC lost + update -> retract
++            }
++        }));
 +    }
 +
 +    /** Seed a live crafter's 3x3 grid: fill {@code slots} with {@code item} x{@code count}, then
@@ -3956,6 +4165,21 @@ index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1b
 +        level.setBlockAndUpdate(pos, on);
 +        level.scheduleTick(pos, on.getBlock(), duration);
 +        c.hitTarget(pos, on, duration, rel);
++    }
++
++    /**
++     * Strike a lightning rod in BOTH worlds: the real one via the vanilla
++     * {@code LightningRodBlock.onLightningStrike} (which sets POWERED, notifies neighbours, schedules
++     * the 8-tick un-power and emits the spark particle — a CONTROLLED strike at a fixed pos+tick), and
++     * the compiled model via {@link CompiledNetwork#strikeLightningRod} with the same POWERED state.
++     */
++    private static void strikeRod(final ServerLevel level, final CompiledNetwork c,
++                                  final BlockPos pos, final int rel) {
++        final BlockState cur = level.getBlockState(pos);
++        if (cur.getBlock() instanceof LightningRodBlock rod && !cur.getValue(BlockStateProperties.POWERED)) {
++            rod.onLightningStrike(cur, level, pos);
++            c.strikeLightningRod(pos, cur.setValue(BlockStateProperties.POWERED, true), rel);
++        }
 +    }
 +
 +    // -------------------------------------------------------------- scenario
@@ -4191,6 +4415,22 @@ index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1b
 +            final boolean s = sim.getValue(BlockStateProperties.POWERED);
 +            return r == s ? null : pos.toShortString() + " NOTE-POWERED real=" + r + " sim=" + s;
 +        }
++        if (real.getBlock() instanceof LightningRodBlock) {
++            // The rod's redstone OUTPUT is entirely a function of POWERED (ownSignal/getDirectSignal
++            // return 15 iff POWERED); comparing POWERED bit-identically every tick proves the strike
++            // activation, the emitted signal and the 8-tick scheduled un-power all match vanilla.
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            return r == s ? null : pos.toShortString() + " ROD-POWERED real=" + r + " sim=" + s;
++        }
++        if (real.getBlock() instanceof BellBlock) {
++            // The bell emits NO redstone (it is not a signal source); its POWERED merely mirrors the
++            // neighbour signal. Comparing POWERED proves the load-state parity; a wire/lamp on the
++            // bell's far side staying dark (compared elsewhere in the footprint) proves zero output.
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            return r == s ? null : pos.toShortString() + " BELL-POWERED real=" + r + " sim=" + s;
++        }
 +        if (real.getBlock() instanceof PistonBaseBlock) {
 +            final boolean r = real.getValue(BlockStateProperties.EXTENDED);
 +            final boolean s = sim.getValue(BlockStateProperties.EXTENDED);
@@ -4250,10 +4490,10 @@ index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1b
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..85c17b5a7685366310ac04acf18c2f451c6a2270
+index 0000000000000000000000000000000000000000..fd499c4aaf72e84527ee085be5257ff7deb35a66
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,310 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -4271,6 +4511,7 @@ index 0000000000000000000000000000000000000000..85c17b5a7685366310ac04acf18c2f45
 +import net.minecraft.world.level.Level;
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.BasePressurePlateBlock;
++import net.minecraft.world.level.block.BellBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.CopperBulbBlock;
 +import net.minecraft.world.level.block.CrafterBlock;
@@ -4281,6 +4522,7 @@ index 0000000000000000000000000000000000000000..85c17b5a7685366310ac04acf18c2f45
 +import net.minecraft.world.level.block.DispenserBlock;
 +import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.LeverBlock;
++import net.minecraft.world.level.block.LightningRodBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.TripWireBlock;
 +import net.minecraft.world.level.block.TripWireHookBlock;
@@ -4384,6 +4626,16 @@ index 0000000000000000000000000000000000000000..85c17b5a7685366310ac04acf18c2f45
 +            // tick travel delay and the ACTIVE/COOLDOWN phase timing; the sensor is a boundary
 +            // input whose redstone POWER + PHASE are read live each tick (see CompiledNetwork).
 +            || state.getBlock() instanceof SculkSensorBlock
++            // Lightning rod: a redstone signal SOURCE that goes POWERED for ACTIVATION_TICKS (8)
++            // when struck by lightning, emitting weak power all sides + strong power out its FACING
++            // (LightningRodBlock.ownSignal / getDirectSignal); the strike is a controlled boundary
++            // stimulus, the scheduled un-power is modelled like a button (see CompiledNetwork).
++            || state.getBlock() instanceof LightningRodBlock
++            // Bell: a pure redstone LOAD. BellBlock extends BaseEntityBlock and overrides NO signal
++            // method (isSignalSource defaults false) -> it emits ZERO redstone; its POWERED state
++            // merely mirrors the neighbour signal (rings on the rising edge, BellBlock.neighborChanged),
++            // exactly like a note block. Tracked for block-state parity; redstone-trivial (no output).
++            || state.getBlock() instanceof BellBlock
 +            || state.is(Blocks.REDSTONE_BLOCK);
 +    }
 +
