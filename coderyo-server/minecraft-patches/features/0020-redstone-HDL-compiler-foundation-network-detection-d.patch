@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..5ecedbc00327165c5199d41c6e46f39e4d4b916e
+index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc4726a3f2
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,1761 @@
+@@ -0,0 +1,1812 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -39,8 +39,10 @@ index 0000000000000000000000000000000000000000..5ecedbc00327165c5199d41c6e46f39e
 +import net.minecraft.world.Container;
 +import net.minecraft.world.inventory.AbstractContainerMenu;
 +import net.minecraft.world.item.ItemStack;
++import net.minecraft.world.level.block.BasePressurePlateBlock;
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.ComparatorBlock;
++import net.minecraft.world.level.block.DetectorRailBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
 +import net.minecraft.world.level.block.DispenserBlock;
 +import net.minecraft.world.level.block.DropperBlock;
@@ -51,6 +53,8 @@ index 0000000000000000000000000000000000000000..5ecedbc00327165c5199d41c6e46f39e
 +import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
 +import net.minecraft.world.level.block.TargetBlock;
++import net.minecraft.world.level.block.TripWireBlock;
++import net.minecraft.world.level.block.TripWireHookBlock;
 +import net.minecraft.world.level.block.piston.MovingPistonBlock;
 +import net.minecraft.world.level.block.piston.PistonBaseBlock;
 +import net.minecraft.world.level.block.piston.PistonHeadBlock;
@@ -158,6 +162,22 @@ index 0000000000000000000000000000000000000000..5ecedbc00327165c5199d41c6e46f39e
 +    private final LongSet pistons = new LongOpenHashSet();
 +
 +    /**
++     * Entity-detection INPUT cells: pressure plates (binary/weighted), tripwire hooks +
++     * string, detector rails. Each is a boundary input node whose redstone OUTPUT is driven
++     * by ENTITY PRESENCE — external to the logic graph, exactly like a player-toggled lever.
++     * We do NOT simulate entity physics/AI: every step we read the cell's CURRENT block state
++     * straight from the live world (which vanilla updated from its own entity-detection —
++     * {@code BasePressurePlateBlock.getSignalStrength}/{@code getEntityCount}, the tripwire
++     * {@code checkPressed}, {@code DetectorRailBlock} minecart scan — INCLUDING the scheduled
++     * deactivation delay) and write it into the grid. The compiled circuit then propagates
++     * that input through the shared vanilla {@code SignalGetter} code, so the detection block's
++     * own output (and its delayed-off edge) is vanilla's exact value and every downstream
++     * component is differential-compared. This reuses vanilla's detection verbatim — never
++     * re-deriving entity counting or the deactivation schedule.
++     */
++    private final LongSet detectionInputs = new LongOpenHashSet();
++
++    /**
 +     * Hoppers in this network, in compile (insertion) order. The order matters: a hopper's
 +     * transfer reads {@code tickedGameTime} of its source/destination hopper to decide the
 +     * one-tick cooldown skip ({@code HopperBlockEntity.tryMoveInItem}), so hoppers must tick in
@@ -254,6 +274,12 @@ index 0000000000000000000000000000000000000000..5ecedbc00327165c5199d41c6e46f39e
 +                c.hoppers.add(packed);
 +            } else if (state.getBlock() instanceof DispenserBlock) {
 +                c.dispensers.add(packed); // covers DropperBlock (a DispenserBlock subclass)
++            } else if (state.getBlock() instanceof BasePressurePlateBlock
++                || state.getBlock() instanceof TripWireHookBlock
++                || state.getBlock() instanceof TripWireBlock
++                || state.getBlock() instanceof DetectorRailBlock) {
++                // Entity-detection input boundary: re-read from the live world each step.
++                c.detectionInputs.add(packed);
 +            }
 +        }
 +        // A piston's quasi-connectivity (QC) power read samples the block ABOVE it and that
@@ -356,6 +382,23 @@ index 0000000000000000000000000000000000000000..5ecedbc00327165c5199d41c6e46f39e
 +    }
 +
 +    /**
++     * Refresh every entity-detection input cell from the live world. Vanilla owns the entity
++     * detection AND the scheduled deactivation timing of a pressure plate / tripwire / detector
++     * rail; we copy its already-computed block state (POWERED / analog POWER / ATTACHED) into the
++     * compiled grid each step so the input edge is bit-identical and the compiled circuit
++     * propagates it. No entity physics/AI is simulated here — vanilla's detection is the oracle.
++     */
++    private void syncDetectionInputs() {
++        if (this.detectionInputs.isEmpty() || this.level == null) {
++            return;
++        }
++        for (final long packed : this.detectionInputs) {
++            this.m.set(packed);
++            this.vw.set(packed, this.level.getBlockState(this.m));
++        }
++    }
++
++    /**
 +     * Press a button (I/O input source): set its POWERED state into the grid and schedule
 +     * the self-timed un-press exactly like {@code ButtonBlock.press} (which calls
 +     * {@code scheduleTick(pos, this, ticksToStayPressed)} — 20 ticks stone / 30 wood). The
@@ -382,6 +425,14 @@ index 0000000000000000000000000000000000000000..5ecedbc00327165c5199d41c6e46f39e
 +    /** Advance the compiled model by exactly one game tick. */
 +    void step(final long tick) {
 +        this.currentTick = tick;
++        // Entity-detection INPUT boundary: pull each pressure-plate / weighted-plate /
++        // tripwire-hook / tripwire-string / detector-rail cell's CURRENT block state from the
++        // live world (vanilla already updated it from its own entity-detection this tick,
++        // including the scheduled deactivation delay) into the grid, BEFORE any propagation —
++        // exactly like a freshly-toggled lever. We never simulate entities; we read vanilla's
++        // verbatim detection result, so the input edge (and its delayed-off) is bit-identical
++        // and the compiled circuit's propagation of it is what the harness differential-tests.
++        this.syncDetectionInputs();
 +        // Settle wires from any source change applied since the previous step, then let
 +        // observers react to whatever the source change moved.
 +        this.recomputeWires();
@@ -1869,10 +1920,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049c6b5095a
+index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b3abd1c5c
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,1022 @@
+@@ -0,0 +1,1252 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -1886,11 +1937,18 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +import net.minecraft.server.MinecraftServer;
 +import net.minecraft.server.level.ServerLevel;
 +import net.minecraft.world.Container;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.EntityTypes;
++import net.minecraft.world.entity.decoration.ArmorStand;
++import net.minecraft.world.entity.item.ItemEntity;
++import net.minecraft.world.entity.vehicle.minecart.Minecart;
 +import net.minecraft.world.inventory.AbstractContainerMenu;
 +import net.minecraft.world.item.ItemStack;
 +import net.minecraft.world.item.Items;
++import net.minecraft.world.level.block.BasePressurePlateBlock;
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.ComparatorBlock;
++import net.minecraft.world.level.block.DetectorRailBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
 +import net.minecraft.world.level.block.DispenserBlock;
 +import net.minecraft.world.level.block.HopperBlock;
@@ -1899,6 +1957,8 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
 +import net.minecraft.world.level.block.TargetBlock;
++import net.minecraft.world.level.block.TripWireBlock;
++import net.minecraft.world.level.block.TripWireHookBlock;
 +import net.minecraft.world.level.block.piston.PistonBaseBlock;
 +import net.minecraft.world.level.block.piston.PistonMovingBlockEntity;
 +import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
@@ -1906,6 +1966,7 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +import net.minecraft.world.level.block.state.properties.AttachFace;
 +import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 +import net.minecraft.world.level.block.state.properties.ComparatorMode;
++import net.minecraft.world.phys.Vec3;
 +import org.slf4j.Logger;
 +
 +/**
@@ -1956,7 +2017,14 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +                            level.setChunkForced(cx, cz, true);
 +                        }
 +                    }
-+                    LOG.info("[redstone-difftest] forceloaded build-area chunks; waiting for load");
++                    // The entity-detection circuits use CONTROLLED entities (armour stands / a
++                    // dropped item / a minecart) as their only intended detection sources. Disable
++                    // natural mob spawning so stray mobs cannot wander onto a plate/tripwire and
++                    // perturb the detection corpus — keeps the whole difftest deterministic and
++                    // reproducible (the boundary inputs are exactly our controlled entities).
++                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MOBS, false, level);
++                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MONSTERS, false, level);
++                    LOG.info("[redstone-difftest] forceloaded build-area chunks; mob-spawning OFF; waiting for load");
 +                }
 +                if (ticks > 40 && areaLoaded(level)) {
 +                    buildCorpus(level);
@@ -2009,7 +2077,10 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +        boolean allPass = true;
 +        for (final Scenario s : SCENARIOS) {
 +            if (s.divergences == 0) {
-+                LOG.info("[redstone-difftest]   PASS  {}  ({} cells, every tick bit-identical)", s.name, s.net.footprint().size());
++                final String det = s.peakDetection >= 0
++                    ? ", detection peak-output=" + s.peakDetection + " (entity tripped vanilla detection)"
++                    : "";
++                LOG.info("[redstone-difftest]   PASS  {}  ({} cells, every tick bit-identical{})", s.name, s.net.footprint().size(), det);
 +            } else {
 +                allPass = false;
 +                LOG.warn("[redstone-difftest]   FAIL  {}  ({} divergences; first @rel-tick {}: {})",
@@ -2084,6 +2155,54 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +        Blocks.COMPARATOR.defaultBlockState()
 +            .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST)
 +            .setValue(ComparatorBlock.MODE, ComparatorMode.COMPARE);
++    // ---- ENTITY-DETECTION INPUT layer ----
++    private static final BlockState STONE_PLATE = Blocks.STONE_PRESSURE_PLATE.defaultBlockState();
++    private static final BlockState WOOD_PLATE = Blocks.OAK_PRESSURE_PLATE.defaultBlockState();
++    /** Gold = "light" weighted plate (maxWeight 15): analog POWER == entity count (1..15). */
++    private static final BlockState GOLD_PLATE = Blocks.LIGHT_WEIGHTED_PRESSURE_PLATE.defaultBlockState();
++    private static final BlockState HOOK_E = Blocks.TRIPWIRE_HOOK.defaultBlockState()
++        .setValue(TripWireHookBlock.FACING, Direction.EAST);
++    private static final BlockState HOOK_W = Blocks.TRIPWIRE_HOOK.defaultBlockState()
++        .setValue(TripWireHookBlock.FACING, Direction.WEST);
++    private static final BlockState STRING = Blocks.TRIPWIRE.defaultBlockState();
++    private static final BlockState DETECTOR_RAIL = Blocks.DETECTOR_RAIL.defaultBlockState();
++
++    /** Live controlled entities for the detection circuits (spawned/removed by the stimuli). */
++    private static Entity stonePlateEntity;
++    private static Entity woodPlateEntity;
++    private static final List<Entity> goldPlateEntities = new ArrayList<>();
++    private static Entity tripwireEntity;
++    private static Minecart detectorCart;
++    private static BlockPos detectorCartPin;
++
++    /** Spawn a non-marker armour stand (a LivingEntity -> triggers stone+wood+weighted plates,
++     *  tripwire) pinned at a fixed position with gravity off, so detection is deterministic. */
++    private static ArmorStand spawnStand(final ServerLevel level, final double x, final double y, final double z) {
++        final ArmorStand stand = new ArmorStand(level, x, y, z);
++        stand.setNoGravity(true);
++        stand.setDeltaMovement(Vec3.ZERO);
++        stand.setPos(x, y, z);
++        level.addFreshEntity(stand);
++        return stand;
++    }
++
++    /** Spawn a pinned dropped item (an Entity but NOT a LivingEntity -> triggers WOOD/weighted
++     *  plates but NOT a stone plate; demonstrates the stone=mobs / wood=everything sensitivity). */
++    private static ItemEntity spawnItem(final ServerLevel level, final double x, final double y, final double z) {
++        final ItemEntity item = new ItemEntity(level, x, y, z, new ItemStack(Items.STONE));
++        item.setNoGravity(true);
++        item.setDeltaMovement(Vec3.ZERO);
++        item.setPos(x, y, z);
++        item.setNoPickUpDelay();
++        level.addFreshEntity(item);
++        return item;
++    }
++
++    private static void removeEntity(final Entity entity) {
++        if (entity != null) {
++            entity.discard();
++        }
++    }
 +
 +    /** Seed the first {@code slots} slots of a live container with {@code count} of {@code item}. */
 +    private static void fillSlots(final ServerLevel level, final BlockPos pos,
@@ -2657,6 +2776,132 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +                setBoth(lvl, c, new BlockPos(77, 101, 99), AIR);      // unlock -> resume draining
 +            }
 +        }));
++
++        // =================================================================
++        //  ENTITY-DETECTION INPUTS — pressure plates (binary + weighted analog),
++        //  tripwire (hook+string), detector rail. Each is a boundary INPUT node
++        //  whose redstone output is driven by ENTITY PRESENCE (external to the
++        //  circuit, like a lever). A CONTROLLED entity (armour stand / dropped
++        //  item / minecart) trips vanilla's real detection; the compiled circuit
++        //  reads that detection result each tick and propagates it. The plate
++        //  output + its scheduled deactivation edge + the whole downstream circuit
++        //  are differential-compared bit-identically every tick. (z-rows 102-109,
++        //  inside the force-loaded build area; no overlap with circuits 1-29.)
++        // =================================================================
++
++        // ---- Circuit 30: STONE pressure plate (binary 0/15, mobs only) -> wire -> lamp ----
++        // A LivingEntity (armour stand) on the plate powers it to 15; vanilla holds it powered
++        // until 20 ticks (getPressedTime) after the entity leaves, then drops it. The dust line
++        // + lamp follow the rising and the DELAYED-off edge, bit-identical.
++        put(level, 2, 100, 102, STONE);  put(level, 2, 101, 102, STONE_PLATE); // detection input
++        put(level, 3, 100, 102, STONE);  put(level, 3, 101, 102, WIRE);
++        put(level, 4, 100, 102, STONE);  put(level, 4, 101, 102, WIRE);
++        put(level, 5, 100, 102, STONE);  put(level, 5, 101, 102, LAMP);
++        SCENARIOS.add(new Scenario("stone-plate", new BlockPos(2, 101, 102), (lvl, c, rel) -> {
++            if (rel == 20) {
++                stonePlateEntity = spawnStand(lvl, 2.5, 101.0, 102.5);
++            } else if (rel > 20 && rel < 80 && stonePlateEntity != null) {
++                stonePlateEntity.setPos(2.5, 101.0, 102.5); // pin (deterministic detection)
++            } else if (rel == 80) {
++                removeEntity(stonePlateEntity); stonePlateEntity = null; // -> 20t deactivation
++            }
++        }));
++
++        // ---- Circuit 31: WOOD pressure plate (everything, incl. items) -> repeater -> lamp ----
++        // A dropped ITEM (an Entity but NOT a LivingEntity) trips a WOOD plate (sensitivity
++        // EVERYTHING) — it would NOT trip a stone plate. The plate edge passes through a repeater
++        // (re-clocked, delay 1) into a lamp, so the repeater's handling of both the rising and the
++        // 20t-delayed falling plate edge is differential-tested.
++        put(level, 2, 100, 104, STONE);  put(level, 2, 101, 104, WOOD_PLATE); // detection input
++        put(level, 3, 100, 104, STONE);  put(level, 3, 101, 104, WIRE);
++        put(level, 4, 100, 104, STONE);  put(level, 4, 101, 104, REPEATER_W); // in west(3), out east(5)
++        put(level, 5, 100, 104, STONE);  put(level, 5, 101, 104, WIRE);
++        put(level, 6, 100, 104, STONE);  put(level, 6, 101, 104, LAMP);
++        SCENARIOS.add(new Scenario("wood-plate-item", new BlockPos(2, 101, 104), (lvl, c, rel) -> {
++            if (rel == 20) {
++                woodPlateEntity = spawnItem(lvl, 2.5, 101.0, 104.5);
++            } else if (rel > 20 && rel < 80 && woodPlateEntity != null) {
++                woodPlateEntity.setPos(2.5, 101.0, 104.5);
++            } else if (rel == 80) {
++                removeEntity(woodPlateEntity); woodPlateEntity = null;
++            }
++        }));
++
++        // ---- Circuit 32: GOLD (light) WEIGHTED plate — analog POWER == entity count ----
++        // N entities -> POWER = ceil(min(15,N)/15 * 15) = N (light plate, maxWeight 15). Three
++        // pinned armour stands give a STABLE analog 3; the dust decays from it and the lamp reads
++        // the decayed level — the count->analog-strength formula + analog propagation, bit-identical.
++        // (Weighted plate getPressedTime = 10, so a shorter deactivation delay than a stone plate.)
++        put(level, 2, 100, 106, STONE);  put(level, 2, 101, 106, GOLD_PLATE); // detection input
++        put(level, 3, 100, 106, STONE);  put(level, 3, 101, 106, WIRE);
++        put(level, 4, 100, 106, STONE);  put(level, 4, 101, 106, WIRE);
++        put(level, 5, 100, 106, STONE);  put(level, 5, 101, 106, LAMP);
++        SCENARIOS.add(new Scenario("weighted-plate-analog", new BlockPos(2, 101, 106), (lvl, c, rel) -> {
++            if (rel == 20) {
++                goldPlateEntities.add(spawnStand(lvl, 2.30, 101.0, 106.30));
++                goldPlateEntities.add(spawnStand(lvl, 2.55, 101.0, 106.55));
++                goldPlateEntities.add(spawnStand(lvl, 2.70, 101.0, 106.70));
++            } else if (rel > 20 && rel < 80) {
++                if (goldPlateEntities.size() == 3) {
++                    goldPlateEntities.get(0).setPos(2.30, 101.0, 106.30);
++                    goldPlateEntities.get(1).setPos(2.55, 101.0, 106.55);
++                    goldPlateEntities.get(2).setPos(2.70, 101.0, 106.70);
++                }
++            } else if (rel == 80) {
++                for (final Entity e : goldPlateEntities) {
++                    removeEntity(e);
++                }
++                goldPlateEntities.clear();
++            }
++        }));
++
++        // ---- Circuit 33: TRIPWIRE (hook + 2-block string line) -> wire -> lamp ----
++        // Two hooks face each other across a 2-segment string line (ATTACHED once both ends
++        // resolve). An entity standing in a string segment sets the string POWERED, which drives
++        // BOTH hooks POWERED; the emitter hook weakly powers an adjacent dust -> lamp. On exit the
++        // string rechecks (period 10) and drops, un-powering the hooks. Walls support the hooks.
++        put(level, 2, 100, 109, STONE);  put(level, 2, 101, 109, STONE);      // wall for hook A
++        put(level, 7, 100, 109, STONE);  put(level, 7, 101, 109, STONE);      // wall for hook B
++        put(level, 3, 100, 109, STONE);  put(level, 3, 101, 109, HOOK_E);     // emitter hook (faces E)
++        put(level, 6, 100, 109, STONE);  put(level, 6, 101, 109, HOOK_W);     // receiver hook (faces W)
++        put(level, 4, 100, 109, STONE);  put(level, 5, 100, 109, STONE);      // string supports
++        put(level, 3, 100, 108, STONE);  put(level, 3, 101, 108, WIRE);       // dust reads hook A
++        put(level, 3, 100, 107, STONE);  put(level, 3, 101, 107, LAMP);
++        // Strings placed LAST so their onPlace updateSource resolves both hooks' ATTACHED state.
++        put(level, 4, 101, 109, STRING); put(level, 5, 101, 109, STRING);
++        SCENARIOS.add(new Scenario("tripwire-line", new BlockPos(3, 101, 109), (lvl, c, rel) -> {
++            if (rel == 20) {
++                tripwireEntity = spawnStand(lvl, 4.5, 101.0, 109.5);
++            } else if (rel > 20 && rel < 80 && tripwireEntity != null) {
++                tripwireEntity.setPos(4.5, 101.0, 109.5);
++            } else if (rel == 80) {
++                removeEntity(tripwireEntity); tripwireEntity = null;
++            }
++        }));
++
++        // ---- Circuit 34: DETECTOR RAIL (powers while a minecart is on it) -> wire -> lamp ----
++        // A controlled minecart pinned on a detector rail powers it (POWERED -> ownSignal 15);
++        // vanilla rechecks every 20 ticks and drops it once the cart is gone. Dust + lamp follow.
++        // Minecart physics is NOT simulated — the cart is pinned and vanilla's own minecart scan
++        // is the detection oracle, read into the compiled grid each tick.
++        put(level, 14, 100, 102, STONE);  put(level, 14, 101, 102, DETECTOR_RAIL); // detection input
++        put(level, 15, 100, 102, STONE);  put(level, 15, 101, 102, WIRE);
++        put(level, 16, 100, 102, STONE);  put(level, 16, 101, 102, LAMP);
++        detectorCartPin = new BlockPos(14, 101, 102);
++        SCENARIOS.add(new Scenario("detector-rail", new BlockPos(14, 101, 102), (lvl, c, rel) -> {
++            if (rel == 20) {
++                detectorCart = new Minecart(EntityTypes.MINECART, lvl);
++                detectorCart.setNoGravity(true);
++                detectorCart.setPos(14.5, 101.0, 102.5);
++                detectorCart.setDeltaMovement(Vec3.ZERO);
++                lvl.addFreshEntity(detectorCart);
++            } else if (rel > 20 && rel < 80 && detectorCart != null) {
++                detectorCart.setDeltaMovement(Vec3.ZERO);
++                detectorCart.setPos(14.5, 101.0, 102.5); // pin on the rail
++            } else if (rel == 80) {
++                removeEntity(detectorCart); detectorCart = null;
++            }
++        }));
 +    }
 +
 +    /** (rear, side) strength pairs swept across the analog range for the subtractor. */
@@ -2739,6 +2984,9 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +        int divergences;
 +        int firstDivergeTick = -1;
 +        String firstDetail = "";
++        /** Peak live redstone output observed at any detection-input cell (proves the test
++         *  is NON-trivial: the controlled entity really tripped vanilla's detection). -1 = none. */
++        int peakDetection = -1;
 +
 +        Scenario(final String name, final BlockPos seed, final Stim stim) {
 +            this.name = name;
@@ -2761,7 +3009,19 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +            this.compiled.step(rel);
 +            for (final long packed : this.net.footprint()) {
 +                final BlockPos pos = BlockPos.of(packed);
-+                String detail = diff(pos, level.getBlockState(pos), this.compiled.state(packed));
++                final BlockState liveState = level.getBlockState(pos);
++                // Record peak detection output (entity actually tripped vanilla detection).
++                if (liveState.getBlock() instanceof BasePressurePlateBlock) {
++                    final int s = liveState.hasProperty(BlockStateProperties.POWER)
++                        ? liveState.getValue(BlockStateProperties.POWER)
++                        : (liveState.getValue(BlockStateProperties.POWERED) ? 15 : 0);
++                    this.peakDetection = Math.max(this.peakDetection, s);
++                } else if ((liveState.getBlock() instanceof TripWireHookBlock
++                        || liveState.getBlock() instanceof DetectorRailBlock)
++                        && liveState.getValue(BlockStateProperties.POWERED)) {
++                    this.peakDetection = Math.max(this.peakDetection, 15);
++                }
++                String detail = diff(pos, liveState, this.compiled.state(packed));
 +                // Comparator analog output lives in the block entity, not the block state:
 +                // assert the compiled simulator's stored analog value matches vanilla's.
 +                if (detail == null && level.getBlockState(pos).getBlock() instanceof ComparatorBlock) {
@@ -2892,15 +3152,36 @@ index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049
 +            final boolean s = sim.getValue(DispenserBlock.TRIGGERED);
 +            return r == s ? null : pos.toShortString() + " TRIGGERED real=" + r + " sim=" + s;
 +        }
++        // Entity-detection inputs. A weighted plate carries analog POWER (compared above); the
++        // binary pressure plate / tripwire hook / tripwire string / detector rail carry POWERED.
++        // These cells are read each tick straight from the live detection (see CompiledNetwork),
++        // so they are the boundary input — but we still compare them so any input-sync slip shows.
++        if (real.getBlock() instanceof BasePressurePlateBlock
++            || real.getBlock() instanceof TripWireBlock
++            || real.getBlock() instanceof DetectorRailBlock) {
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            return r == s ? null : pos.toShortString() + " POWERED real=" + r + " sim=" + s;
++        }
++        if (real.getBlock() instanceof TripWireHookBlock) {
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            if (r != s) {
++                return pos.toShortString() + " HOOK-POWERED real=" + r + " sim=" + s;
++            }
++            final boolean ra = real.getValue(BlockStateProperties.ATTACHED);
++            final boolean sa = sim.getValue(BlockStateProperties.ATTACHED);
++            return ra == sa ? null : pos.toShortString() + " HOOK-ATTACHED real=" + ra + " sim=" + sa;
++        }
 +        return null;
 +    }
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..1b434d0a120f17eb32be1aa1be74caf8da24fbf1
+index 0000000000000000000000000000000000000000..050f9cca019403e74de1cd5efa3e598a313487fb
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,278 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -2917,12 +3198,16 @@ index 0000000000000000000000000000000000000000..1b434d0a120f17eb32be1aa1be74caf8
 +import net.minecraft.server.level.ServerLevel;
 +import net.minecraft.world.level.Level;
 +import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.BasePressurePlateBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
++import net.minecraft.world.level.block.DetectorRailBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
 +import net.minecraft.world.level.block.DispenserBlock;
 +import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.LeverBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
++import net.minecraft.world.level.block.TripWireBlock;
++import net.minecraft.world.level.block.TripWireHookBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
 +import net.minecraft.world.level.block.TargetBlock;
@@ -2998,6 +3283,15 @@ index 0000000000000000000000000000000000000000..1b434d0a120f17eb32be1aa1be74caf8
 +            || state.getBlock() instanceof PistonBaseBlock
 +            || state.getBlock() instanceof HopperBlock
 +            || state.getBlock() instanceof DispenserBlock
++            // Entity-detection INPUT sources: a pressure plate (stone/wood binary,
++            // weighted analog), a tripwire (hook + string line) and a detector rail are
++            // redstone signal sources driven by ENTITY PRESENCE (external to the circuit).
++            // They are network nodes exactly like a lever — a boundary input whose signal
++            // is read each tick from vanilla's live entity-detection (see CompiledNetwork).
++            || state.getBlock() instanceof BasePressurePlateBlock
++            || state.getBlock() instanceof TripWireHookBlock
++            || state.getBlock() instanceof TripWireBlock
++            || state.getBlock() instanceof DetectorRailBlock
 +            || state.is(Blocks.REDSTONE_BLOCK);
 +    }
 +
