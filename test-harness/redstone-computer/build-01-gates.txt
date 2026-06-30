@@ -1,0 +1,70 @@
+# coderyoMC redstone-computer MAP — rung-1 logic gates (server console commands)
+# Comparator convention: FACING points at the REAR/INPUT; output exits the opposite side.
+# SUBTRACT comparator: out = max(0, rear - max(sideL, sideR)).
+# Digital inputs are driven by a redstone_block placed ONE BLOCK ABOVE an input dust
+# cell (y+1) -> that dust reads 15 (ON); remove the block -> 0 (OFF). Those toggler
+# cells are placed by the test driver, NOT here. y=100 stone = support, y=101 = logic.
+#
+# Gate outputs are dust/comparator cells the difftest validates directly (NO lamps,
+# to avoid the known wire-end-adjacent-lamp compiler divergence).
+
+# ---------------- NOT  (lane Z=10)  out=15-A ----------------
+fill 8 100 10 13 100 12 minecraft:stone
+fill 8 101 10 13 102 12 minecraft:air
+setblock 9 101 10 minecraft:redstone_block
+setblock 10 101 10 minecraft:comparator[facing=west,mode=subtract]
+setblock 11 101 10 minecraft:redstone_wire
+setblock 12 101 10 minecraft:redstone_wire
+setblock 10 101 11 minecraft:redstone_wire
+
+# ---------------- OR  (lane Z=20)  out=A|B (repeater-cleaned) ----------------
+fill 8 100 19 13 100 22 minecraft:stone
+fill 8 101 19 13 102 22 minecraft:air
+setblock 10 101 20 minecraft:redstone_wire
+setblock 10 101 21 minecraft:redstone_wire
+setblock 11 101 20 minecraft:redstone_wire
+setblock 11 101 21 minecraft:redstone_wire
+setblock 12 101 20 minecraft:repeater[facing=west]
+setblock 13 101 20 minecraft:redstone_wire
+
+# ---------------- NOR (lane Z=30)  out=15-max(A,B) ----------------
+fill 8 100 28 13 100 32 minecraft:stone
+fill 8 101 28 13 102 32 minecraft:air
+setblock 9 101 30 minecraft:redstone_block
+setblock 10 101 30 minecraft:comparator[facing=west,mode=subtract]
+setblock 10 101 29 minecraft:redstone_wire
+setblock 10 101 31 minecraft:redstone_wire
+setblock 11 101 30 minecraft:redstone_wire
+
+# ---------------- AND (lane Z=40)  out=A-(15-B) ----------------
+fill 8 100 38 14 100 42 minecraft:stone
+fill 8 101 38 14 102 42 minecraft:air
+setblock 9 101 40 minecraft:redstone_block
+setblock 10 101 40 minecraft:comparator[facing=west,mode=subtract]
+setblock 10 101 41 minecraft:redstone_wire
+setblock 11 101 40 minecraft:redstone_wire
+setblock 12 101 40 minecraft:comparator[facing=north,mode=subtract]
+setblock 12 101 39 minecraft:redstone_wire
+setblock 12 101 41 minecraft:redstone_wire
+
+# ---------------- NAND (lane Z=50)  out=max(15-A,15-B) ----------------
+fill 8 100 48 14 100 52 minecraft:stone
+fill 8 101 48 14 102 52 minecraft:air
+setblock 9 101 50 minecraft:redstone_block
+setblock 10 101 50 minecraft:comparator[facing=west,mode=subtract]
+setblock 10 101 51 minecraft:redstone_wire
+setblock 11 101 50 minecraft:redstone_wire
+setblock 13 101 50 minecraft:redstone_block
+setblock 12 101 50 minecraft:comparator[facing=east,mode=subtract]
+setblock 12 101 51 minecraft:redstone_wire
+
+# ---------------- XOR (lane Z=60)  out=|A-B| ----------------
+fill 8 100 58 14 100 62 minecraft:stone
+fill 8 101 58 14 102 62 minecraft:air
+setblock 10 101 60 minecraft:comparator[facing=west,mode=subtract]
+setblock 9 101 60 minecraft:redstone_wire
+setblock 10 101 61 minecraft:redstone_wire
+setblock 11 101 60 minecraft:redstone_wire
+setblock 12 101 60 minecraft:comparator[facing=east,mode=subtract]
+setblock 13 101 60 minecraft:redstone_wire
+setblock 12 101 61 minecraft:redstone_wire
