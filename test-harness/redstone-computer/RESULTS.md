@@ -387,6 +387,60 @@ issued from a command_block and its verdict read from the server log.)*
 **No feature patch was added — only `test-harness/redstone-computer/`** (build scripts +
 this file).
 
+## Rung 2 — MASTER-SLAVE D FLIP-FLOP: edge-triggered register (build-11) — difftest BIT-IDENTICAL ✅
+
+The **edge-triggered** sequential element a CPU register needs, and the fix for build-10's
+level-latch race-through. Two build-10 gated D-latches in series: a **MASTER** (base x=62)
+enabled while Clock=HIGH (captures D) and a **SLAVE** (base x=46, DX=−16) enabled while
+Clock=LOW (captures Master's Q), driven by a **non-overlapping two-phase clock**. Master.Q is
+wired to Slave.D through a repeater-cleaned forward interconnect (D must arrive at a clean 15 or
+the `R=E−D` subtract mis-fires). Output (ACC = Slave.Q @ `44,101,122`) updates only on the
+clock **falling edge** (slave-enable).
+
+**Edge-triggered, race-free — vanilla live reads.** Both latches init 0, then load a 1 through the edge:
+
+| step | drive | Master.Q | ACC (Slave.Q) | note |
+|------|-------|----------|----------------|------|
+| set D=1, both enables OFF | — | 0 | **0** | D-change alone latches nothing |
+| MASTER phase ON | clock HIGH | 15 | **0** | output FROZEN during master capture |
+| toggle D 1→0→1 while master transparent | — | follows 0→15 | **0** | **no race-through** |
+| MASTER off → SLAVE phase ON | falling edge | 15 (held) | **15** | output updates ONLY on the edge |
+| (load a 0) Master captures 0 | clock HIGH | 0 | **15** | ACC HOLDS during master capture |
+| SLAVE phase ON | falling edge | 0 | **0** | edge updates bidirectionally |
+
+The level-latch race-through (build-10) is **eliminated** — master and slave are never simultaneously
+transparent. **difftest** (`/coderyo redstone difftest 44 101 122 200`, impulse command_block, verdict
+from log): **HOLD ACC=1 → BIT-IDENTICAL (200 ticks, 246 cells, 126 components, single-region); HOLD
+ACC=0 → BIT-IDENTICAL (200 ticks, 244 cells).** The whole flip-flop (~245 cells) compiles bit-for-bit
+to vanilla in **both** held states — the difftest-clean **edge-triggered register** a CPU is built from.
+
+**Build lessons (cost real debug):** (1) `setblock repeater[facing=D]` puts the REAR on side D and
+the OUTPUT on the OPPOSITE side (the build-01..10 convention) — building interconnect repeaters with
+the intuitive "facing=output" reverses every one (dead). (2) A D-feed dust laid one cell from a latch
+ENABLE dust shorts Enable into the D net; route every interconnect leg ≥2 cells clear of all latch
+E/D ports and re-amp every ≤~9 dust so D reaches each port at a clean 15.
+
+## Rung 3 — 1-BIT INCREMENT ACCUMULATOR (build-11) — one clean race-free step; sustained blocked by routing ⚠️
+
+For B=1 the 1-bit adder SUM = ACC XOR 1 = NOT ACC = the slave's Qbar, so the minimal accumulator
+wires **Slave.Qbar → Master.D** (a master-slave **T flip-flop**): one clock cycle ⇒ ACC toggles,
+exactly one clean step. **Cycle 1 incremented cleanly 0 → 1 through the REAL physical feedback**
+(D came from Qbar=15; master captured on φ1, slave output on φ2) — one clean, **deterministic** step,
+**no race-through**: precisely what build-10's level latch could not do. **Cycles 2–3 stuck at 1**:
+the feedback DROP (x=48, z=131→139) **crosses the forward interconnect's S-branch wire at (48,137)**,
+which carries the held Master.Q (=15); the two nets MERGE on the same y-level and pin Master.D=15, so
+the master kept re-capturing 1 (verified: (48,137) reads power 7 sourced from Master.Q). This is a
+**wire-congestion collision in a RETROFIT**, NOT a logic/compiler fault (difftests clean, cycle-1
+increment clean): the forward `Master.Q→Slave.D` path and the feedback `Slave.Qbar→Master.D` path
+fight for the same lanes — the x=50 column is a solid wall of forward repeaters (z 114..139) and the
+slave S-gadget walls off the SW, so the feedback can't reach the Master (east) side without crossing a
+live forward wire. **Fix:** design the feedback channels in from the start on a wider platform
+(dedicated lanes or a y=102 bridge over the one crossing), not retrofit them; with clear lanes the
+master-slave sustains the toggle (proven for one step), and the same structure with B selectable +
+the build-08 ripple adder as the SUM path gives the clean **2-bit ACC=0→1→2→3** milestone. Every
+constituent (edge-triggered register THIS build, ripple adder build-08) is difftest-clean — only
+collision-free routing (and the build-10 settle-isolation between phases) remains.
+
 ### What the CPU rung needs next
 0. **DONE (build-09):** the torch RS latch's HOLD now **difftest-validates BIT-IDENTICAL** for
    both stored bits, and 4 tiled latches form a **4-bit register** that reads back a loaded value
@@ -395,12 +449,17 @@ this file).
 1. **DONE (build-10):** the **D-latch enable-gating** (S=D∧E via the build-01 AND gadget,
    R=D̄∧E = E−D as a single subtract comparator) — captures/HOLDs a clocked bit and
    **difftests BIT-IDENTICAL in both held states** (74/72 cells). The clocked-capture cell is proven.
-2. **EDGE-triggered register (master-slave D flip-flop)** — pair two build-10 D-latches (master
-   on E, slave on ¬E) so the accumulator advances exactly one increment per clock edge instead of
-   racing through the transparent level-latch (build-10's headline finding). Then tile 2–4 wide.
+2. **DONE (build-11):** the **EDGE-triggered register (master-slave D flip-flop)** — two build-10
+   D-latches (master on Clock=HIGH, slave on Clock=LOW) — **difftests BIT-IDENTICAL in both held
+   states** (246/244 cells) and its output changes **only on the clock falling edge**, bidirectionally;
+   the level-latch race-through is eliminated. This is the difftest-clean clocked register a CPU uses.
 3. **Real ACC := ACC + B** — register Q → build-08 ripple adder ← B → SUM → register D, clocked.
-   With the slow (≥40 s) adder settle-isolating a short Enable pulse (or master-slave latches), the
-   accumulate is clean; difftest the whole feedback network and read back ACC=0,B=1 → 0→1→2→3.
+   build-11 wired the 1-bit B=1 case (Slave.Qbar→Master.D) and got **one clean race-free increment
+   (0→1) through real feedback**; sustained counting was blocked by a **wire-congestion collision**
+   in the retrofit (feedback drop merged the held Master.Q at (48,137)). Next: rebuild on a wider
+   platform with **dedicated feedback channels** (or a y=102 bridge) so the master-slave sustains the
+   toggle, then swap the B=1 proxy for the build-08 ripple adder + selectable B and read back
+   ACC=0,B=1 → 0→1→2→3 (the 2-bit milestone). All blocks are difftest-clean; only routing remains.
 4. From the accumulator: a **control unit** (clock/step + opcode), **instruction memory**
    (torch-ROM addressed by a program counter = a counting register), **decode** (opcode → enable
    lines), and a small **register file** (several build-09 registers) — the minimal CPU.

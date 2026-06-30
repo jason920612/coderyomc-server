@@ -1,0 +1,143 @@
+# coderyoMC redstone-computer MAP — MASTER-SLAVE D FLIP-FLOP (edge-triggered register)
+# + 1-bit increment-accumulator feedback experiment.
+#
+# THE sequential element a CPU register needs. build-10 proved a *gated D-latch* (S=D&E,
+# R=!D&E) that is LEVEL-sensitive: while Enable=1 it is transparent, so a feedback loop
+# (accumulator) races through it for the whole multi-tick clock pulse (build-10's headline
+# finding). The fix is an EDGE-triggered flip-flop = TWO build-10 gated D-latches in series:
+#   MASTER latch enabled while Clock=HIGH (captures D)
+#   SLAVE  latch enabled while Clock=LOW  (captures MASTER's Q)
+# so the output updates only on the clock FALLING EDGE — immune to level-latch race-through.
+#
+# Server: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (built FRESH from origin/main 67f89dd which
+#   carries patch 0020, via `./gradlew applyAllPatches && ./gradlew createPaperclipJar`), boot
+#   -Dcoderyo.redstone.compile.enabled=true ; port 15568, flat world, forceload add 0 0 240 200.
+# Convention (locked, same as build-01..10): comparator/repeater [facing=D] => REAR/INPUT on
+#   side D, OUTPUT exits the OPPOSITE side. SUBTRACT comp out = max(0, rear - max(sideL,sideR)).
+#   A redstone_block ABOVE a dust drives that dust to 15.
+#
+# ============================== LAYOUT ==============================
+# MASTER = build-10 gated D-latch verbatim at base x=62 (Q out 60,101,122).
+# SLAVE  = build-10 gated D-latch at base x=46 (DX=-16) (Q out = ACC = 44,101,122 ; Qbar 48,101,130).
+# Two-phase clock (non-overlapping, driven by hand):
+#   MASTER enable (phi1) = redstone_block at (62,102,117) AND (60,102,133)
+#   SLAVE  enable (phi2) = redstone_block at (46,102,117) AND (44,102,133)
+#   MASTER D (external)  = redstone_block at (61,102,118) AND (62,102,135)
+# Forward interconnect MASTER.Q (60,122) -> SLAVE.D_north (45,118) & D_south (46,135), repeater-
+# cleaned to a clean 15 at each slave-D port (D must arrive at a clean 15 or the R=E-D subtract
+# mis-fires; attenuated D breaks the gating — verified).
+#
+# fill 40 100 110 70 100 140 minecraft:stone
+# fill 40 101 110 70 103 140 minecraft:air
+# fill 40 100 110 70 100 140 minecraft:stone
+# --- MASTER latch (build-10 body, base x=62) ---
+# setblock 62 101 122 minecraft:stone
+# setblock 61 101 122 minecraft:redstone_wall_torch[facing=west]
+# setblock 62 101 121 minecraft:repeater[facing=north]
+# setblock 63 101 122 minecraft:repeater[facing=east]
+# setblock 62 101 130 minecraft:stone
+# setblock 63 101 130 minecraft:redstone_wall_torch[facing=east]
+# setblock 62 101 131 minecraft:repeater[facing=south]
+# setblock 61 101 130 minecraft:repeater[facing=west]
+# setblock 60 101 122 minecraft:redstone_wire
+# fill 60 101 123 60 101 130 minecraft:redstone_wire
+# setblock 64 101 130 minecraft:redstone_wire
+# fill 64 101 122 64 101 129 minecraft:redstone_wire
+# setblock 62 101 118 minecraft:comparator[facing=north,mode=subtract]   # R = E - D
+# setblock 62 101 117 minecraft:redstone_wire                            # E_north
+# setblock 61 101 118 minecraft:redstone_wire                            # D_north
+# setblock 62 101 119 minecraft:redstone_wire
+# setblock 62 101 120 minecraft:redstone_wire
+# setblock 59 101 134 minecraft:redstone_block                           # nE 15-src
+# setblock 60 101 134 minecraft:comparator[facing=west,mode=subtract]    # nE = 15 - E
+# setblock 60 101 133 minecraft:redstone_wire                            # E_south
+# setblock 61 101 134 minecraft:redstone_wire                            # nE
+# setblock 62 101 134 minecraft:comparator[facing=south,mode=subtract]   # S = D - nE
+# setblock 62 101 135 minecraft:redstone_wire                            # D_south
+# setblock 62 101 133 minecraft:redstone_wire
+# setblock 62 101 132 minecraft:redstone_wire
+# --- SLAVE latch (build-10 body, base x=46) ---  (same shape, all x shifted -16; D fed by interconnect, no D drivers)
+# setblock 46 101 122 stone ; 45 101 122 redstone_wall_torch[facing=west] ; 46 101 121 repeater[facing=north]
+# setblock 47 101 122 repeater[facing=east] ; 46 101 130 stone ; 47 101 130 redstone_wall_torch[facing=east]
+# setblock 46 101 131 repeater[facing=south] ; 45 101 130 repeater[facing=west]
+# setblock 44 101 122 redstone_wire ; fill 44 101 123 44 101 130 redstone_wire    # ACC=Q rail (out 44,122)
+# setblock 48 101 130 redstone_wire ; fill 48 101 122 48 101 129 redstone_wire    # Qbar rail (48,130)
+# setblock 46 101 118 comparator[facing=north,mode=subtract] ; 46 101 117 wire(E) ; 45 101 118 wire(D_north)
+# setblock 46 101 119 wire ; 46 101 120 wire
+# setblock 43 101 134 redstone_block ; 44 101 134 comparator[facing=west,mode=subtract] ; 44 101 133 wire(E)
+# setblock 45 101 134 wire(nE) ; 46 101 134 comparator[facing=south,mode=subtract] ; 46 101 135 wire(D_south)
+# setblock 46 101 133 wire ; 46 101 132 wire
+# --- FORWARD interconnect MASTER.Q -> SLAVE.D (repeater-cleaned; routed clear of slave E dusts) ---
+# fill 50 101 122 59 101 122 redstone_wire                                        # Q distribution bus
+# setblock 50 101 121 repeater[facing=south] ; fill 50 101 116 50 101 120 wire ; setblock 50 101 115 repeater[facing=south]
+# fill 43 101 114 50 101 114 wire ; fill 43 101 115 43 101 118 wire ; setblock 44 101 118 repeater[facing=west]  # ->D_north
+# setblock 50 101 123 repeater[facing=north] ; fill 50 101 124 50 101 129 wire ; setblock 50 101 130 repeater[facing=north]
+# fill 50 101 131 50 101 137 wire ; fill 46 101 137 49 101 137 wire ; setblock 46 101 136 repeater[facing=south]  # ->D_south
+#
+# !! DECISIVE BUILD LESSONS (cost real debug time) !!
+#  1. REPEATER FACING: setblock repeater[facing=D] places the REAR/input on side D, output on
+#     the OPPOSITE side (per the build-01..10 convention). Building interconnect repeaters with
+#     the intuitive "facing = output direction" reverses every one (rear unpowered -> dead). Verified
+#     live: repeater[facing=south] takes its rear from the SOUTH cell and outputs NORTH.
+#  2. INTERCONNECT-vs-ENABLE SHORTS: a D-feed dust laid one cell from a slave ENABLE dust (e.g. the
+#     z=116 leg passing (46,116) adjacent to E_north (46,117)=15) shorts Enable into the D net.
+#     Reroute every interconnect leg >=2 cells clear of all latch E/D ports (final N leg moved to
+#     z=114 and approached D_north from the WEST). Re-amp repeaters every <=~9 dust (D must reach
+#     each slave-D port at a CLEAN 15, else R=E-D mis-subtracts).
+#
+# ================================ RESULT — EDGE-TRIGGERED, RACE-FREE (vanilla live reads) ================================
+# Both latches initialised to 0 via two-phase clock. Then load a 1 through the edge:
+#   set D=1, both enables OFF        -> ACC (slave Q @44,122) = 0     (D change alone latches nothing)
+#   MASTER phase ON (capture D=1)    -> Master.Q=15, ACC STILL 0      (output frozen during master capture)
+#   while master transparent, toggle D 1->0->1 -> Master.Q follows 0->15, ACC STILL 0   (no race-through)
+#   MASTER off, then SLAVE phase ON  -> ACC -> 15  (output updates ONLY on the falling edge = slave-enable)
+# Load a 0 the same way:  Master captures 0 while ACC HOLDS 15;  slave phase -> ACC -> 0.
+# => OUTPUT CHANGES ONLY ON THE CLOCK EDGE, bidirectionally; the level-latch race-through (build-10)
+#    is ELIMINATED because master and slave are never simultaneously transparent (2-phase, non-overlapping).
+#
+# ================================ RESULT — difftest (compiler == vanilla) ================================
+# Triggered from an impulse command_block (RCON's restricted dispatcher can't reach the op-gated
+# `coderyo` literal); verdict read from the server log "[redstone-difftest/live] PASS ... BIT-IDENTICAL":
+#   HOLD ACC=1 : /coderyo redstone difftest 44 101 122 200 -> BIT-IDENTICAL (200 ticks, 246 cells, 126 components, single-region)
+#   HOLD ACC=0 : /coderyo redstone difftest 44 101 122 200 -> BIT-IDENTICAL (200 ticks, 244 cells)
+# => the WHOLE master-slave flip-flop (both torch latches + both comparator enable-gates + the
+#    forward interconnect, ~245 cells) compiles BIT-FOR-BIT to vanilla in BOTH held states. This is
+#    the difftest-clean EDGE-TRIGGERED register a CPU is built from.
+#
+# ================================ ACCUMULATOR (1-bit increment) — feedback EXPERIMENT ================================
+# Goal: ACC := ACC + B per clock, edge-triggered (no race). For B=1 the 1-bit adder SUM = ACC XOR 1
+# = NOT ACC = the slave's Qbar, so the minimal accumulator wires Slave.Qbar -> Master.D (a master-slave
+# T flip-flop): one clock CYCLE (master phase then slave phase) toggles ACC, exactly one clean step.
+# Feedback wiring added (Slave.Qbar 48,130 -> Master.D_north 61,118 & D_south 62,135, repeater-cleaned):
+#   setblock 48 101 131 repeater[facing=north] ; fill 48 101 132 48 101 139 wire     # drop to south bus
+#   setblock 49 101 139 repeater[facing=west] ; fill 50 101 139 54 101 139 wire ; setblock 55 101 139 repeater[facing=west]
+#   fill 56 101 139 62 101 139 wire
+#   fill 62 101 137 62 101 138 wire ; setblock 62 101 136 repeater[facing=south]       # -> D_south
+#   setblock 52 101 138 repeater[facing=south] ; fill 52 101 128 52 101 137 wire ; setblock 52 101 127 repeater[facing=south]
+#   fill 52 101 119 52 101 126 wire ; fill 52 101 118 59 101 118 wire ; setblock 56 101 118 repeater[facing=west] ; setblock 60 101 118 repeater[facing=west]  # -> D_north
+#
+# OUTCOME (honest):
+#  * CYCLE 1 INCREMENTED CLEANLY 0 -> 1 through the REAL physical feedback (D came from Qbar=15;
+#    master captured it on phi1, slave output it on phi2). One clean, deterministic step — and
+#    crucially NO race-through: the master-slave does exactly what build-10's level latch could not.
+#  * CYCLES 2..3 stuck at 1: the feedback failed to deliver the toggled value because the feedback
+#    DROP (x=48, z=131->139) CROSSES the forward interconnect's S-branch wire at (48,137), which
+#    carries the HELD Master.Q (=15). The two nets MERGE on the same y-level, pinning Master.D=15 so
+#    the master kept re-capturing 1. Verified live: (48,137) reads power 7 sourced from Master.Q.
+#  * This is a WIRE-CONGESTION / LAYOUT-DENSITY collision in a RETROFIT — NOT a logic or compiler
+#    fault (the difftests above are clean; cycle-1 increment is clean). The forward Master.Q->Slave.D
+#    path and the feedback Slave.Qbar->Master.D path fight for the same congested lanes: the x=50
+#    column is a solid wall of forward repeaters (z 114..139) and the slave S-gadget (x43..46,
+#    z131..135) walls off the SW, so the feedback cannot reach the east (Master) side without
+#    crossing a live forward wire on the same level.
+#  * FIX = design the feedback channels in from the START on a wider platform (dedicated routing
+#    lanes, or a y=102 bridge over the one crossing), not retrofit them onto the dense flip-flop.
+#    With clear lanes the master-slave will sustain the toggle (proven for one step) — and the same
+#    structure, with B selectable and the build-08 ripple adder as the SUM path, gives the clean
+#    2-bit ACC=0->1->2->3 milestone. Every constituent (edge-triggered register THIS build, ripple
+#    adder build-08) is difftest-clean; only collision-free routing remains.
+#  * SETTLE NOTE: even with clear routing, the next master phase must wait for the (multi-repeater)
+#    feedback to settle before re-enabling — the build-10 settle-isolation point. A short master
+#    pulse after a full feedback settle captures exactly once.
+#
+# No feature patch was added — only test-harness/redstone-computer/.
