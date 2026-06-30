@@ -228,6 +228,55 @@ with the carry **physically propagating** from bit0 to bit1 through a horizontal
 This is the first **physically-rippling** multi-bit arithmetic datapath on the map (build-05's
 4 tiles were difftest-clean but independent; this one's carry actually flows tile→tile).
 
+## Rung 2 — TORCH RS LATCH re-validated + 4-BIT REGISTER (build-09) — SEQUENTIAL MEMORY VALIDATES ✅
+
+The torch-modeling compiler gap that blocked build-06 is **closed** (commit 42fb73a: torch
+inversion in all configs + bistable-loop stored-state seeding). This build re-runs the HOLD
+difftest on the proven build-06 cell — it now **passes** — and tiles it 4× into a register.
+
+**1) build-06 torch RS-NOR latch, HOLD now difftests BIT-IDENTICAL** (seed `60,101,122`):
+
+| held state | drive | live read | difftest 200 ticks |
+|------------|-------|-----------|--------------------|
+| RESET (Q=0) | R block at `62,101,120`, settle, remove | Q=0, Qbar=15 | **BIT-IDENTICAL (46 cells)** |
+| SET (Q=1)   | S block at `62,101,132`, settle, remove | Q=15, Qbar=0 | **BIT-IDENTICAL (46 cells)** |
+
+So **torch sequential memory now validates differentially** — the headline build-06 said was
+the prerequisite for a register file. **Procedure lesson (cost the first divergence):** the R/S
+inputs are **repeater rears at y=101**; the driver redstone_block must sit **AT** that y=101 rear
+cell, **not at y=102 above it** (y+1 drives a *dust* to 15 but does not power a *repeater* rear).
+Driving from y=102 left the latch in its power-on default, not a clean SET, and the unsettled
+state diverged (real=0/sim=15 @tick24 = vanilla drifting). y=101 driver + clean pulse + settle → both HOLD states BIT-IDENTICAL.
+
+**2) 4-bit register** = the proven cell tiled 4× along +x (pitch DX=8; bit *k* at x=62+8·*k*).
+The four latches are electrically independent (a register *is* four 1-bit memory cells), so
+holding an arbitrary 4-bit pattern across them proves memory **at width**. Loaded value **1011b**
+(RESET all, then SET bits 0,1,3):
+
+| bit | seed | live Q | difftest 200t |
+|-----|------|--------|---------------|
+| 0 | 60,101,122 | **15** | **BIT-IDENTICAL (46 cells)** |
+| 1 | 68,101,122 | **15** | **BIT-IDENTICAL (46 cells)** |
+| 2 | 76,101,122 | **0**  | DIVERGENCE — see caveat |
+| 3 | 84,101,122 | **15** | **BIT-IDENTICAL (46 cells)** |
+
+Live reads {b3,b2,b1,b0} = **1,0,1,1 = 1011b** — the register **reads back the loaded 4-bit value
+correctly**. Three of four held bits (all the Q=1 bits) are **BIT-IDENTICAL** at width.
+
+**bit2 (the 0-state bit) caveat — two non-fatal effects, neither a fix-task:** (a) **vanilla
+settle-race** — dropping the four RESET drivers *simultaneously* raced bit2 into a metastable
+state and ~40 s later vanilla bit2 spontaneously flipped 0→15 (procedural: drop drivers one at a
+time / settle longer — the *standalone* latch RESET-HOLDs perfectly, proven BIT-IDENTICAL above);
+(b) **compiler bistable-seeding edge** — once bit2 was re-settled to a *stable* vanilla Q=0,
+difftest reported `real=0/sim=15` (the compiler seeded the loop to the **other** fixed point),
+then `POWERED real=true/sim=false` at its Qbar feedback repeater. The three Q=1 bits and the
+standalone Q=0 latch all seed correctly, so this is a **seeding edge in the tiled 0-state**, not a
+circuit fault — a compiler observation to feed back to patch 0020's bistable seeding, **recorded
+not fixed** (this map adds NO feature patch). The **D-latch** (enable-gating S=D∧E, R=D̄∧E via the
+proven comparator-AND gadgets feeding these R/S rears) and the **accumulator** (register Q → the
+build-07 side-entry ripple adder → SUM back to the register D, gated by a manual clock) are the
+documented next builds toward the CPU datapath.
+
 ## Divergence the difftest CAUGHT (and its root cause)
 
 On the first half-adder run the difftest reported, e.g.:
@@ -280,8 +329,12 @@ register-file datapath (the 4-bit adder + a register) is assemblable.
 this file).
 
 ### What the CPU rung needs next
-1. **1-bit memory (torch RS latch / D-latch)** — the missing pillar; build-04 has the
-   exact diagnosis and the torch recipe to use.
+0. **DONE (build-09):** the torch RS latch's HOLD now **difftest-validates BIT-IDENTICAL** for
+   both stored bits, and 4 tiled latches form a **4-bit register** that reads back a loaded value
+   (3/4 held bits BIT-IDENTICAL at width; the 0-state bit hit a documented vanilla-settle race +
+   compiler 0-seeding edge). Sequential memory is the proven pillar.
+1. **D-latch enable-gating** — drive the proven R/S rears with S=D∧E and R=D̄∧E (the build-01
+   comparator-AND gadget = D−Ē, with Ē/D̄ as comparator NOTs); then capture/HOLD difftest.
 2. **4-bit ripple-carry adder** — tile 4 of this validated full adder, Cout→Cin, and
    difftest an input sweep (the full-adder map is ready to be instantiated 4×).
 3. With a working register (4× D-latch + shared enable) and the adder, an

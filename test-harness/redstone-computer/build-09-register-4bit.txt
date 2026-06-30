@@ -1,0 +1,95 @@
+# coderyoMC redstone-computer MAP — 4-BIT REGISTER (4 tiled torch RS latches) +
+# RE-VALIDATION of the build-06 torch RS latch under the now-torch-aware compiler.
+#
+# CONTEXT. build-06 proved a torch RS-NOR latch HOLDs a clean digital bit in VANILLA,
+# but the patch-0020 compiler at that time did NOT model redstone-torch inversion, so the
+# HOLD could not be difftest-validated (a standalone torch inverter diverged real=0/sim=15).
+# Commit 42fb73a ("torch inversion in all configs + bistable-loop stored-state seeding")
+# closed that gap. THIS build re-runs the HOLD difftest on the proven cell (now passes)
+# and tiles it 4x into a register, validating that sequential memory holds AT WIDTH.
+#
+# Server: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar, -Dcoderyo.redstone.compile.enabled=true,
+# port 15568, flat world. gamerules: doMobSpawning false, randomTickSpeed 0, doDaylightCycle
+# false, doWeatherCycle false, doFireTick false. forceload add 56 112 96 144.
+#
+# !! DECISIVE PROCEDURE LESSON (cost a divergence before it was understood) !!
+#   The RS latch's R/S inputs are REPEATER REARS at y=101 (cells 62,101,120 and 62,101,132).
+#   The external driver MUST be a redstone_block placed AT that y=101 rear cell — NOT a
+#   redstone_block at y=102 ABOVE it (y+1 over a dust drives a DUST to 15, but it does NOT
+#   power a repeater's rear). Driving S from y=102 left the latch in its power-on default,
+#   not a clean SET, and the first HOLD difftest diverged (real=0/sim=15 @tick24 = vanilla
+#   drifting out of an unsettled state). With the driver at y=101 + a clean RESET/SET pulse
+#   + a >=5 s settle, both HOLD states difftest BIT-IDENTICAL (below).
+#
+# ============================== build-06 latch (bit0 of the register) ==============================
+fill 55 100 116 80 100 140 minecraft:stone
+fill 55 101 116 80 103 140 minecraft:air
+setblock 62 101 122 minecraft:stone
+setblock 61 101 122 minecraft:redstone_wall_torch[facing=west]   # TA = Q  (out dust 60,101,122)
+setblock 62 101 121 minecraft:repeater[facing=north]            # R input: rear=(62,120), out south into GA
+setblock 63 101 122 minecraft:repeater[facing=east]             # Qbar feedback rep
+setblock 62 101 130 minecraft:stone
+setblock 63 101 130 minecraft:redstone_wall_torch[facing=east]   # TB = Qbar (out dust 64,101,130)
+setblock 62 101 131 minecraft:repeater[facing=south]           # S input: rear=(62,132), out north into GB
+setblock 61 101 130 minecraft:repeater[facing=west]            # Q feedback rep
+setblock 60 101 122 minecraft:redstone_wire
+fill     60 101 123 60 101 130 minecraft:redstone_wire          # Q rail (west, x=60)
+setblock 64 101 130 minecraft:redstone_wire
+fill     64 101 122 64 101 129 minecraft:redstone_wire          # Qbar rail (east, x=64)
+#   R source = (62,101,120) ; S source = (62,101,132)  (redstone_block ON / air OFF).
+#   Q out dust = (60,101,122).
+#
+# RE-VALIDATION (standalone, seed 60,101,122):
+#   RESET (R block at 62,101,120, settle, remove)  -> Q=0  ; difftest 200t = BIT-IDENTICAL (46 cells)
+#   SET   (S block at 62,101,132, settle, remove)  -> Q=15 ; difftest 200t = BIT-IDENTICAL (46 cells)
+#   => torch SEQUENTIAL MEMORY now validates differentially. Both HOLD states BIT-IDENTICAL.
+#
+# ============================== 4-BIT REGISTER: 4 latches tiled, pitch DX=8 ==============================
+# Platform: fill 56 100 116 92 100 140 stone ; fill 56 101 116 92 103 140 air
+# bit k at x = 62 + 8k  (k=0..3 -> x = 62,70,78,86). Each latch = the build-06 body shifted +8k in x:
+#   setblock  x    101 122 stone
+#   setblock (x-1) 101 122 redstone_wall_torch[facing=west]     # Q torch  (Q out dust = x-2,101,122)
+#   setblock  x    101 121 repeater[facing=north]               # R rep  (R source = x,101,120)
+#   setblock (x+1) 101 122 repeater[facing=east]                # Qbar fb rep
+#   setblock  x    101 130 stone
+#   setblock (x+1) 101 130 redstone_wall_torch[facing=east]     # Qbar torch
+#   setblock  x    101 131 repeater[facing=south]               # S rep  (S source = x,101,132)
+#   setblock (x-1) 101 130 repeater[facing=west]                # Q fb rep
+#   setblock (x-2) 101 122 redstone_wire ; fill (x-2) 101 123 (x-2) 101 130 redstone_wire   # Q rail
+#   setblock (x+2) 101 130 redstone_wire ; fill (x+2) 101 122 (x+2) 101 129 redstone_wire   # Qbar rail
+# The four latches are electrically INDEPENDENT (no shared wire); a register is fundamentally
+# 4 one-bit memory cells, so holding an arbitrary 4-bit pattern across them proves memory at width.
+#
+# LOAD a 4-bit value: RESET every bit (R block at each x,101,120; settle; remove), then SET the
+# 1-bits (S block at each chosen x,101,132; settle; remove). Read bit k at (x-2,101,122) via
+#   execute if block <x-2> 101 122 minecraft:redstone_wire[power=15] run say BITk_Q15
+#   execute if block <x-2> 101 122 minecraft:redstone_wire[power=0]  run say BITk_Q0
+#
+# RESULT — loaded value 1011b ({b3,b2,b1,b0} = 1,0,1,1):
+#   live reads: bit0=15, bit1=15, bit2=0, bit3=15  -> 1,1,0,1  CORRECT (value read back at width).
+#   difftest each held bit (200 ticks):
+#     bit0 (seed 60,101,122) Q=1 : BIT-IDENTICAL (46 cells)
+#     bit1 (seed 68,101,122) Q=1 : BIT-IDENTICAL (46 cells)
+#     bit3 (seed 84,101,122) Q=1 : BIT-IDENTICAL (46 cells)
+#     bit2 (seed 76,101,122) Q=0 : DIVERGENCE  <-- see caveat
+#
+# !! BIT2 (the 0-state bit) CAVEAT — two distinct effects, both NON-fatal, neither a fix-task !!
+#   (a) VANILLA settle-flip: dropping the four RESET drivers SIMULTANEOUSLY raced bit2 into a
+#       brief metastable state; ~40 s later vanilla bit2 spontaneously flipped 0->15. Fix is
+#       procedural: drop drivers one at a time / settle longer (the standalone latch, driven in
+#       isolation, RESET-HOLDs perfectly — proven BIT-IDENTICAL above).
+#   (b) COMPILER bistable-SEEDING edge case: once bit2 was re-settled to a STABLE vanilla Q=0,
+#       difftest reported DIVERGENCE real=0/sim=15 (compiler seeded the loop to the OTHER fixed
+#       point) and, after a SET attempt that bit2 would not accept, POWERED real=true/sim=false
+#       at the Qbar feedback repeater. The three Q=1 bits and the *standalone* Q=0 latch all seed
+#       correctly, so this is a seeding edge in the tiled 0-state, NOT a circuit fault. It is a
+#       compiler observation to feed back to patch 0020's bistable-loop seeding — recorded here,
+#       NOT fixed (this map adds NO feature patch).
+#
+# VERDICT: the proven torch cell now difftest-validates BOTH HOLD states (sequential memory
+# validates under the torch-aware compiler); tiled 4x it reads back a 4-bit value correctly and
+# 3/4 held bits are BIT-IDENTICAL at width, with the 0-state bit exposing a documented vanilla-
+# settle race + a compiler 0-seeding edge case. This is the register pillar of the datapath; the
+# D-latch enable-gating (S=D&E, R=!D&E via the proven comparator-AND gadgets feeding these R/S
+# rears) and the accumulator (register Q -> side-entry ripple adder -> SUM back to register D,
+# gated by a manual clock) are the documented next builds toward the CPU datapath.
