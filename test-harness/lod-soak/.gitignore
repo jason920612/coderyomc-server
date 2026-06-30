@@ -1,0 +1,6 @@
+# soak run output — regenerate via soak.sh
+run-*/
+*.class
+*.log
+*.jfr
+*.out
