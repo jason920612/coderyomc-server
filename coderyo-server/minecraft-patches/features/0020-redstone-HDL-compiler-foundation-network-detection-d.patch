@@ -8,32 +8,21 @@ MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
----
- com/coderyo/redstone/CompiledNetwork.java     | 388 ++++++++++++++++++
- .../redstone/RedstoneCompileConfig.java       |  85 ++++
- .../redstone/RedstoneDiffTestHarness.java     | 291 +++++++++++++
- com/coderyo/redstone/RedstoneNetwork.java     | 183 +++++++++
- .../redstone/VirtualRedstoneWorld.java        |  84 ++++
- net/minecraft/server/MinecraftServer.java     |   1 +
- 6 files changed, 1032 insertions(+)
- create mode 100644 com/coderyo/redstone/CompiledNetwork.java
- create mode 100644 com/coderyo/redstone/RedstoneCompileConfig.java
- create mode 100644 com/coderyo/redstone/RedstoneDiffTestHarness.java
- create mode 100644 com/coderyo/redstone/RedstoneNetwork.java
- create mode 100644 com/coderyo/redstone/VirtualRedstoneWorld.java
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000..0b7393b
+index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc90749d870b1
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,660 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
 + */
 +package com.coderyo.redstone;
 +
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 +import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 +import it.unimi.dsi.fastutil.longs.LongSet;
 +import java.util.ArrayDeque;
@@ -45,11 +34,17 @@ index 0000000..0b7393b
 +import net.minecraft.core.Direction;
 +import net.minecraft.server.level.ServerLevel;
 +import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.ComparatorBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
++import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
 +import net.minecraft.world.level.block.state.BlockState;
 +import net.minecraft.world.level.block.state.properties.BlockStateProperties;
++import net.minecraft.world.level.block.state.properties.ComparatorMode;
++import net.minecraft.world.level.redstone.Redstone;
 +
 +/**
 + * The compiled logic graph + discrete-event simulator for one redstone network.
@@ -72,13 +67,17 @@ index 0000000..0b7393b
 + *       queue ordered exactly like {@code LevelTicks} (trigger, priority, insertion).</li>
 + * </ul>
 + *
-+ * <p>DEFERRED (not modelled — see RedstoneDiffTestHarness for the corpus that avoids
-+ * them): comparators, observers, pistons, quasi-connectivity, 0-tick pulses, the
-+ * EIGENCRAFT / ALTERNATE_CURRENT wire algorithms and the experimental wire flood.
++ * <p>MODELLED: redstone wire, torch, repeater, lever/redstone-block sources,
++ * <b>comparator</b> (compare/subtract analog, container/block-entity input, 2-tick
++ * delay) and <b>observer</b> (2-tick pulse on observed block-state change).
++ *
++ * <p>DEFERRED (not modelled — see RedstoneDiffTestHarness): pistons, dispensers/droppers,
++ * quasi-connectivity, 0-tick pulses, item frames in front of comparators, the EIGENCRAFT
++ * / ALTERNATE_CURRENT wire algorithms and the experimental wire flood.
 + */
 +final class CompiledNetwork {
 +
-+    private enum Kind { TORCH, REPEATER }
++    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP }
 +
 +    /** Mirrors {@code TickPriority} ordinals: lower drains earlier. */
 +    private static final int P_EXTREMELY_HIGH = -3;
@@ -100,6 +99,22 @@ index 0000000..0b7393b
 +    private final LongSet wires = new LongOpenHashSet();
 +    private final LongSet torches = new LongOpenHashSet();
 +    private final LongSet repeaters = new LongOpenHashSet();
++    private final LongSet comparators = new LongOpenHashSet();
++    private final LongSet observers = new LongOpenHashSet();
++    private final LongSet lamps = new LongOpenHashSet();
++
++    /** The last observed {@link BlockState} of each observer's FACING target (change detector). */
++    private final Long2ObjectMap<BlockState> lastObserved = new Long2ObjectOpenHashMap<>();
++
++    /**
++     * The live server level — used ONLY to read the analog output of a static external
++     * analog-source input (a container the comparator faces) via vanilla's
++     * {@code getAnalogOutputSignal}, which takes a {@code Level} and reads the block
++     * entity's fullness. The container is a region-owned external input; its fullness is
++     * an input to the network, not part of the logic graph we simulate. All redstone
++     * signal propagation still runs entirely over the in-memory grid.
++     */
++    private ServerLevel level;
 +
 +    private final List<ScheduledEntry> queue = new ArrayList<>();
 +    private long subCounter;
@@ -112,6 +127,7 @@ index 0000000..0b7393b
 +    /** Seed the compiled grid from the live (settled) vanilla world. */
 +    static CompiledNetwork compile(final ServerLevel level, final RedstoneNetwork network) {
 +        final CompiledNetwork c = new CompiledNetwork();
++        c.level = level;
 +        for (final long packed : network.footprint()) {
 +            final BlockPos pos = BlockPos.of(packed);
 +            final BlockState state = level.getBlockState(pos);
@@ -120,16 +136,62 @@ index 0000000..0b7393b
 +                c.wires.add(packed);
 +            } else if (state.getBlock() instanceof RedstoneTorchBlock) {
 +                c.torches.add(packed);
++            } else if (state.getBlock() instanceof ComparatorBlock) {
++                c.comparators.add(packed);
++                // Private analog-output block entity, seeded from the live comparator's BE.
++                final ComparatorBlockEntity be = new ComparatorBlockEntity(pos, state);
++                if (level.getBlockEntity(pos) instanceof ComparatorBlockEntity live) {
++                    be.setOutputSignal(live.getOutputSignal());
++                }
++                c.vw.setBlockEntity(packed, be);
 +            } else if (state.getBlock() instanceof DiodeBlock) {
 +                c.repeaters.add(packed);
++            } else if (state.getBlock() instanceof ObserverBlock) {
++                c.observers.add(packed);
++            } else if (state.getBlock() instanceof RedstoneLampBlock) {
++                c.lamps.add(packed);
 +            }
++        }
++        // Auxiliary external inputs that live OUTSIDE the redstone footprint: a comparator's
++        // facing target (container / analog source, and the block beyond when it's a
++        // conductor) and an observer's observed block. Snapshot their block states (and live
++        // block entity, so getAnalogOutputSignal reads the real container fullness) so the
++        // in-memory grid evaluates inputs bit-identically.
++        for (final long packed : c.comparators) {
++            final BlockPos pos = BlockPos.of(packed);
++            final Direction facing = level.getBlockState(pos).getValue(BlockStateProperties.HORIZONTAL_FACING);
++            c.snapshotExternal(level, pos.relative(facing));
++            c.snapshotExternal(level, pos.relative(facing).relative(facing));
++        }
++        for (final long packed : c.observers) {
++            final BlockPos pos = BlockPos.of(packed);
++            final Direction facing = level.getBlockState(pos).getValue(BlockStateProperties.FACING);
++            final BlockPos observed = pos.relative(facing);
++            c.snapshotExternal(level, observed);
++            c.lastObserved.put(packed, level.getBlockState(observed));
 +        }
 +        c.recomputeWires();
 +        return c;
 +    }
 +
++    /** Snapshot an external input cell (block state + live block entity) if not already present. */
++    private void snapshotExternal(final ServerLevel level, final BlockPos pos) {
++        final long packed = pos.asLong();
++        final BlockState state = level.getBlockState(pos);
++        this.vw.set(packed, state);
++        if (state.hasBlockEntity()) {
++            this.vw.setBlockEntity(packed, level.getBlockEntity(pos));
++        }
++    }
++
 +    BlockState state(final long packed) {
 +        return this.vw.getBlockState(BlockPos.of(packed));
++    }
++
++    /** The compiled comparator's stored analog output (-1 if not a comparator); for the harness. */
++    int comparatorOutputSignal(final long packed) {
++        final ComparatorBlockEntity be = this.comparatorBE(packed);
++        return be == null ? -1 : be.getOutputSignal();
 +    }
 +
 +    /** Apply an external source change (lever toggle / redstone-block placement). */
@@ -142,8 +204,10 @@ index 0000000..0b7393b
 +    /** Advance the compiled model by exactly one game tick. */
 +    void step(final long tick) {
 +        this.currentTick = tick;
-+        // Settle wires from any source change applied since the previous step.
++        // Settle wires from any source change applied since the previous step, then let
++        // observers react to whatever the source change moved.
 +        this.recomputeWires();
++        this.syncObservers();
 +
 +        // Collect-then-run, exactly like LevelTicks.tick: gather everything due this
 +        // tick first, then run in drain order. Ticks scheduled during a run get a
@@ -158,6 +222,7 @@ index 0000000..0b7393b
 +        for (final ScheduledEntry e : due) {
 +            this.run(e, tick);
 +            this.recomputeWires(); // vanilla notifies neighbours synchronously per commit
++            this.syncObservers();  // each setBlock fires updateShape on a facing observer
 +        }
 +
 +        // Re-evaluate downstream scheduling (mirrors neighborChanged / checkTickOnNeighbor).
@@ -165,10 +230,12 @@ index 0000000..0b7393b
 +    }
 +
 +    private void run(final ScheduledEntry e, final long tick) {
-+        if (e.kind() == Kind.TORCH) {
-+            this.runTorch(e.pos(), tick);
-+        } else {
-+            this.runRepeater(e.pos());
++        switch (e.kind()) {
++            case TORCH -> this.runTorch(e.pos(), tick);
++            case REPEATER -> this.runRepeater(e.pos());
++            case COMPARATOR -> this.runComparator(e.pos());
++            case OBSERVER -> this.runObserver(e.pos());
++            case LAMP -> this.runLamp(e.pos());
 +        }
 +    }
 +
@@ -179,6 +246,12 @@ index 0000000..0b7393b
 +        for (final long pos : this.repeaters) {
 +            this.updateRepeaterLock(pos);
 +            this.scheduleRepeaterIfNeeded(pos, tick);
++        }
++        for (final long pos : this.comparators) {
++            this.scheduleComparatorIfNeeded(pos, tick);
++        }
++        for (final long pos : this.lamps) {
++            this.updateLamp(pos, tick);
 +        }
 +    }
 +
@@ -391,6 +464,192 @@ index 0000000..0b7393b
 +        }
 +    }
 +
++    // ------------------------------------------------------------- comparator
++
++    private Direction comparatorFacing(final long pos) {
++        return this.state(pos).getValue(BlockStateProperties.HORIZONTAL_FACING);
++    }
++
++    private ComparatorMode comparatorMode(final long pos) {
++        return this.state(pos).getValue(ComparatorBlock.MODE);
++    }
++
++    private ComparatorBlockEntity comparatorBE(final long pos) {
++        return (ComparatorBlockEntity) this.vw.getBlockEntity(BlockPos.of(pos));
++    }
++
++    // Transcribed from ComparatorBlock.getInputSignal (analog rear/conductor read).
++    private int comparatorInputSignal(final long pos) {
++        this.m.set(pos);
++        final Direction facing = this.comparatorFacing(pos);
++        // super.getInputSignal (DiodeBlock): rear redstone signal + adjacent wire power.
++        BlockPos targetPos = this.m.relative(facing).immutable();
++        int resultSignal = this.vw.getSignal(targetPos, facing);
++        if (resultSignal < Redstone.SIGNAL_MAX) {
++            final BlockState bs = this.vw.getBlockState(targetPos);
++            if (bs.is(Blocks.REDSTONE_WIRE)) {
++                resultSignal = Math.max(resultSignal, bs.getValue(BlockStateProperties.POWER));
++            }
++        }
++        // Comparator analog override.
++        BlockState targetState = this.vw.getBlockState(targetPos);
++        if (targetState.hasAnalogOutputSignal()) {
++            resultSignal = targetState.getAnalogOutputSignal(this.level, targetPos, facing.getOpposite());
++        } else if (resultSignal < Redstone.SIGNAL_MAX && targetState.isRedstoneConductor(this.vw, targetPos)) {
++            targetPos = targetPos.relative(facing);
++            targetState = this.vw.getBlockState(targetPos);
++            // Item frames in front of a comparator are NOT modelled (no entities in the grid).
++            if (targetState.hasAnalogOutputSignal()) {
++                resultSignal = targetState.getAnalogOutputSignal(this.level, targetPos, facing.getOpposite());
++            }
++        }
++        return resultSignal;
++    }
++
++    // Transcribed from DiodeBlock.getAlternateSignal (comparator side input; NOT diodes-only).
++    private int comparatorAlternateSignal(final long pos) {
++        this.m.set(pos);
++        final Direction facing = this.comparatorFacing(pos);
++        final Direction cw = facing.getClockWise();
++        final Direction ccw = facing.getCounterClockWise();
++        return Math.max(
++            this.vw.getControlInputSignal(this.m.relative(cw).immutable(), cw, false),
++            this.vw.getControlInputSignal(this.m.relative(ccw).immutable(), ccw, false));
++    }
++
++    // Transcribed from ComparatorBlock.calculateOutputSignal.
++    private int comparatorOutput(final long pos) {
++        final int input = this.comparatorInputSignal(pos);
++        if (input == 0) {
++            return Redstone.SIGNAL_MIN;
++        }
++        final int alt = this.comparatorAlternateSignal(pos);
++        if (alt > input) {
++            return Redstone.SIGNAL_MIN;
++        }
++        return this.comparatorMode(pos) == ComparatorMode.SUBTRACT ? input - alt : input;
++    }
++
++    // Transcribed from ComparatorBlock.shouldTurnOn.
++    private boolean comparatorShouldTurnOn(final long pos) {
++        final int input = this.comparatorInputSignal(pos);
++        if (input == 0) {
++            return false;
++        }
++        final int side = this.comparatorAlternateSignal(pos);
++        return input > side || (input == side && this.comparatorMode(pos) == ComparatorMode.COMPARE);
++    }
++
++    // Transcribed from ComparatorBlock.checkTickOnNeighbor.
++    private void scheduleComparatorIfNeeded(final long pos, final long tick) {
++        if (this.willTick(pos, Kind.COMPARATOR)) {
++            return;
++        }
++        final int outputValue = this.comparatorOutput(pos);
++        final int oldValue = this.comparatorBE(pos).getOutputSignal();
++        final boolean powered = this.state(pos).getValue(BlockStateProperties.POWERED);
++        if (outputValue != oldValue || powered != this.comparatorShouldTurnOn(pos)) {
++            final int priority = this.diodePrioritize(pos) ? P_HIGH : P_NORMAL;
++            this.schedule(pos, Kind.COMPARATOR, 2, priority, tick);
++        }
++    }
++
++    // Transcribed from ComparatorBlock.refreshOutputState (invoked from tick()).
++    private void runComparator(final long pos) {
++        final int outputValue = this.comparatorOutput(pos);
++        final ComparatorBlockEntity be = this.comparatorBE(pos);
++        final int oldValue = be.getOutputSignal();
++        be.setOutputSignal(outputValue);
++        if (oldValue != outputValue || this.comparatorMode(pos) == ComparatorMode.COMPARE) {
++            final boolean sourceOn = this.comparatorShouldTurnOn(pos);
++            final boolean isOn = this.state(pos).getValue(BlockStateProperties.POWERED);
++            if (isOn && !sourceOn) {
++                this.vw.set(pos, this.state(pos).setValue(BlockStateProperties.POWERED, false));
++            } else if (!isOn && sourceOn) {
++                this.vw.set(pos, this.state(pos).setValue(BlockStateProperties.POWERED, true));
++            }
++        }
++    }
++
++    // DiodeBlock.shouldPrioritize: a diode behind us (opposite FACING) feeding crosswise.
++    private boolean diodePrioritize(final long pos) {
++        this.m.set(pos);
++        final Direction direction = this.comparatorFacing(pos).getOpposite();
++        final BlockState behind = this.vw.getBlockState(this.m.relative(direction));
++        return behind.getBlock() instanceof DiodeBlock
++            && behind.hasProperty(BlockStateProperties.HORIZONTAL_FACING)
++            && behind.getValue(BlockStateProperties.HORIZONTAL_FACING) != direction;
++    }
++
++    // -------------------------------------------------------------- observer
++
++    private Direction observerFacing(final long pos) {
++        return this.state(pos).getValue(BlockStateProperties.FACING);
++    }
++
++    /**
++     * Fire each observer that has just seen its observed block change state, EXACTLY like
++     * vanilla {@code ObserverBlock.updateShape}: a change schedules a 2-tick pulse, but only
++     * when the observer is not already powered and has no pending tick. Called after every
++     * grid mutation (matching vanilla's per-{@code setBlock} {@code updateShape} dispatch).
++     */
++    private void syncObservers() {
++        for (final long pos : this.observers) {
++            this.m.set(pos);
++            final BlockPos observed = this.m.relative(this.observerFacing(pos)).immutable();
++            final BlockState now = this.vw.getBlockState(observed);
++            final BlockState prev = this.lastObserved.get(pos);
++            if (now.equals(prev)) {
++                continue;
++            }
++            this.lastObserved.put(pos, now);
++            if (!this.state(pos).getValue(BlockStateProperties.POWERED) && !this.willTick(pos, Kind.OBSERVER)) {
++                this.schedule(pos, Kind.OBSERVER, 2, P_NORMAL, this.currentTick);
++            }
++        }
++    }
++
++    // Transcribed from ObserverBlock.tick (2-tick pulse: on, reschedule, off).
++    private void runObserver(final long pos) {
++        final BlockState state = this.state(pos);
++        if (state.getValue(BlockStateProperties.POWERED)) {
++            this.vw.set(pos, state.setValue(BlockStateProperties.POWERED, false));
++        } else {
++            this.vw.set(pos, state.setValue(BlockStateProperties.POWERED, true));
++            this.schedule(pos, Kind.OBSERVER, 2, P_NORMAL, this.currentTick);
++        }
++    }
++
++    // ------------------------------------------------------------------ lamp
++
++    // Transcribed from RedstoneLampBlock.neighborChanged: turn ON immediately when a
++    // neighbour signal appears; schedule a 4-tick OFF when the signal is lost.
++    private void updateLamp(final long pos, final long tick) {
++        this.m.set(pos);
++        final BlockState state = this.state(pos);
++        final boolean lit = state.getValue(BlockStateProperties.LIT);
++        final boolean hasSignal = this.vw.hasNeighborSignal(this.m.immutable());
++        if (lit == hasSignal) {
++            return;
++        }
++        if (lit) {
++            if (!this.willTick(pos, Kind.LAMP)) {
++                this.schedule(pos, Kind.LAMP, 4, P_NORMAL, tick);
++            }
++        } else {
++            this.vw.set(pos, state.setValue(BlockStateProperties.LIT, true));
++        }
++    }
++
++    // Transcribed from RedstoneLampBlock.tick.
++    private void runLamp(final long pos) {
++        this.m.set(pos);
++        final BlockState state = this.state(pos);
++        if (state.getValue(BlockStateProperties.LIT) && !this.vw.hasNeighborSignal(this.m.immutable())) {
++            this.vw.set(pos, state.setValue(BlockStateProperties.LIT, false));
++        }
++    }
++
 +    // -------------------------------------------------------------- scheduling
 +
 +    private boolean willTick(final long pos, final Kind kind) {
@@ -418,7 +677,7 @@ index 0000000..0b7393b
 +}
 diff --git a/com/coderyo/redstone/RedstoneCompileConfig.java b/com/coderyo/redstone/RedstoneCompileConfig.java
 new file mode 100644
-index 0000000..ec9c5d7
+index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783166387bc
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneCompileConfig.java
 @@ -0,0 +1,85 @@
@@ -509,10 +768,10 @@ index 0000000..ec9c5d7
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000..c436d6f
+index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633d83a1b43
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,426 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -525,12 +784,20 @@ index 0000000..c436d6f
 +import net.minecraft.core.Direction;
 +import net.minecraft.server.MinecraftServer;
 +import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.Container;
++import net.minecraft.world.item.ItemStack;
++import net.minecraft.world.item.Items;
 +import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.ComparatorBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.ObserverBlock;
++import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
 +import net.minecraft.world.level.block.state.BlockState;
 +import net.minecraft.world.level.block.state.properties.AttachFace;
 +import net.minecraft.world.level.block.state.properties.BlockStateProperties;
++import net.minecraft.world.level.block.state.properties.ComparatorMode;
 +import org.slf4j.Logger;
 +
 +/**
@@ -655,6 +922,18 @@ index 0000000..c436d6f
 +        .setValue(BlockStateProperties.ATTACH_FACE, AttachFace.WALL)
 +        .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.NORTH)
 +        .setValue(BlockStateProperties.POWERED, false);
++    private static final BlockState COMP_SUB_W =
++        Blocks.COMPARATOR.defaultBlockState()
++            .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.WEST)
++            .setValue(ComparatorBlock.MODE, ComparatorMode.SUBTRACT);
++    private static final BlockState COMP_CMP_W =
++        Blocks.COMPARATOR.defaultBlockState()
++            .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.WEST)
++            .setValue(ComparatorBlock.MODE, ComparatorMode.COMPARE);
++    private static final BlockState BARREL = Blocks.BARREL.defaultBlockState();
++    private static final BlockState LAMP = Blocks.REDSTONE_LAMP.defaultBlockState();
++    private static final BlockState OBS_W =
++        Blocks.OBSERVER.defaultBlockState().setValue(BlockStateProperties.FACING, Direction.WEST);
 +
 +    private static void put(final ServerLevel level, final int x, final int y, final int z, final BlockState state) {
 +        level.setBlockAndUpdate(new BlockPos(x, y, z), state);
@@ -705,6 +984,101 @@ index 0000000..c436d6f
 +                setBoth(lvl, c, new BlockPos(40, 101, 0), AIR);      // de-energise
 +            }
 +        }));
++
++        // ---- Circuit 4: comparator SUBTRACT-mode gate (analog 15 - sideInput) ----
++        // Comparator faces WEST: rear(51)=redstone-block (main input 15), south side(z=5)
++        // carries a wire whose power is toggled; output east -> wire line. SUBTRACT mode
++        // emits 15 - sideStrength, so toggling the side changes the analog output level.
++        put(level, 51, 101, 4, REDBLOCK);          // main (rear) input = 15
++        put(level, 52, 100, 4, STONE);
++        put(level, 52, 101, 4, COMP_SUB_W);        // comparator @ (52)
++        put(level, 53, 100, 4, STONE);
++        put(level, 53, 101, 4, WIRE);              // output wire
++        put(level, 54, 100, 4, STONE);
++        put(level, 54, 101, 4, WIRE);
++        put(level, 52, 100, 5, STONE);             // side-input wire (south of comparator)
++        put(level, 52, 101, 5, WIRE);
++        put(level, 52, 100, 6, STONE);
++        put(level, 52, 101, 6, WIRE);              // side feed wire
++        SCENARIOS.add(new Scenario("comparator-subtract", new BlockPos(52, 101, 4), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(52, 101, 7), REDBLOCK); // side on -> subtract ~14
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(52, 101, 7), AIR);      // side off -> output 15
++            }
++        }));
++
++        // ---- Circuit 5: comparator COMPARE-mode reading a CONTAINER (barrel BE) ----
++        // Comparator faces WEST at a partially-filled barrel (analog input = fullness via
++        // the block entity). A toggleable side input gates the compare. COMPARE emits the
++        // container level when input >= side, else 0.
++        put(level, 51, 100, 8, STONE);
++        put(level, 51, 101, 8, BARREL);            // rear container input
++        put(level, 52, 100, 8, STONE);
++        put(level, 52, 101, 8, COMP_CMP_W);        // comparator
++        put(level, 53, 100, 8, STONE);
++        put(level, 53, 101, 8, WIRE);              // output wire
++        put(level, 54, 100, 8, STONE);
++        put(level, 54, 101, 8, WIRE);
++        put(level, 52, 100, 9, STONE);             // side-input wire (south)
++        put(level, 52, 101, 9, WIRE);
++        fillBarrel(level, new BlockPos(51, 101, 8));
++        SCENARIOS.add(new Scenario("comparator-container", new BlockPos(52, 101, 8), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(52, 101, 10), REDBLOCK); // side high -> compare blocks -> 0
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(52, 101, 10), AIR);      // side off -> output = fullness
++            }
++        }));
++
++        // ---- Circuit 6: observer pulse driving a redstone lamp ----
++        // Observer faces WEST observing block @ (51); its 2-tick pulse exits the back (east)
++        // into a wire that lights a lamp. Toggling the observed block fires a pulse each edge.
++        put(level, 51, 101, 12, STONE);            // observed block (toggled)
++        put(level, 52, 101, 12, OBS_W);            // observer (floats, no support needed)
++        put(level, 53, 100, 12, STONE);
++        put(level, 53, 101, 12, WIRE);             // output wire behind observer
++        put(level, 54, 100, 12, STONE);
++        put(level, 54, 101, 12, LAMP);             // lamp lit by the pulse
++        SCENARIOS.add(new Scenario("observer-pulse", new BlockPos(52, 101, 12), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(51, 101, 12), AIR);    // observed change -> pulse
++            } else if (rel == 80) {
++                setBoth(lvl, c, new BlockPos(51, 101, 12), STONE);  // observed change -> pulse
++            }
++        }));
++
++        // ---- Circuit 7: observer pulse train into a repeater (delay 2) ----
++        // A periodically-toggled observed block emits a stream of 2-tick observer pulses;
++        // a repeater downstream re-clocks them. Exercises repeated observer timing +
++        // observer->repeater interaction. (A free-running two-observer clock is DEFERRED:
++        // the harness snapshots block states but not in-flight scheduled ticks, so a circuit
++        // that is already oscillating at snapshot cannot be seeded — see notes.)
++        put(level, 51, 101, 15, STONE);            // observed block (periodically toggled)
++        put(level, 52, 101, 15, OBS_W);            // observer
++        put(level, 53, 100, 15, STONE);
++        put(level, 53, 101, 15, WIRE);             // pulse wire
++        put(level, 54, 100, 15, STONE);
++        put(level, 54, 101, 15, REPEATER_W);       // repeater input west(53), output east(55)
++        put(level, 55, 100, 15, STONE);
++        put(level, 55, 101, 15, WIRE);             // output wire
++        SCENARIOS.add(new Scenario("observer-train", new BlockPos(52, 101, 15), (lvl, c, rel) -> {
++            // Toggle the observed block every 12 ticks to emit a pulse train.
++            if (rel >= 20 && rel < 140 && (rel - 20) % 12 == 0) {
++                final boolean stone = ((rel - 20) / 12) % 2 == 0;
++                setBoth(lvl, c, new BlockPos(51, 101, 15), stone ? AIR : STONE);
++            }
++        }));
++    }
++
++    /** Fill several slots of a barrel so its comparator (analog) output is a stable mid value. */
++    private static void fillBarrel(final ServerLevel level, final BlockPos pos) {
++        if (level.getBlockEntity(pos) instanceof Container container) {
++            for (int slot = 0; slot < 9 && slot < container.getContainerSize(); slot++) {
++                container.setItem(slot, new ItemStack(Items.STONE, 64));
++            }
++            container.setChanged();
++        }
 +    }
 +
 +    private static void setBoth(final ServerLevel level, final CompiledNetwork c, final BlockPos pos, final BlockState state) {
@@ -758,7 +1132,17 @@ index 0000000..c436d6f
 +            this.compiled.step(rel);
 +            for (final long packed : this.net.footprint()) {
 +                final BlockPos pos = BlockPos.of(packed);
-+                final String detail = diff(pos, level.getBlockState(pos), this.compiled.state(packed));
++                String detail = diff(pos, level.getBlockState(pos), this.compiled.state(packed));
++                // Comparator analog output lives in the block entity, not the block state:
++                // assert the compiled simulator's stored analog value matches vanilla's.
++                if (detail == null && level.getBlockState(pos).getBlock() instanceof ComparatorBlock) {
++                    final int simOut = this.compiled.comparatorOutputSignal(packed);
++                    final int realOut = level.getBlockEntity(pos) instanceof ComparatorBlockEntity be
++                        ? be.getOutputSignal() : -1;
++                    if (simOut != realOut) {
++                        detail = pos.toShortString() + " COMPARATOR-OUT real=" + realOut + " sim=" + simOut;
++                    }
++                }
 +                if (detail != null) {
 +                    this.divergences++;
 +                    if (this.firstDivergeTick < 0) {
@@ -801,15 +1185,25 @@ index 0000000..c436d6f
 +            }
 +            return null;
 +        }
++        if (real.getBlock() instanceof ObserverBlock) {
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            return r == s ? null : pos.toShortString() + " POWERED real=" + r + " sim=" + s;
++        }
++        if (real.getBlock() instanceof RedstoneLampBlock) {
++            final boolean r = real.getValue(BlockStateProperties.LIT);
++            final boolean s = sim.getValue(BlockStateProperties.LIT);
++            return r == s ? null : pos.toShortString() + " LIT real=" + r + " sim=" + s;
++        }
 +        return null;
 +    }
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000..2ffc157
+index 0000000000000000000000000000000000000000..438ee7c432d2b30db1e358fab344e20f7239595e
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,185 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -828,6 +1222,7 @@ index 0000000..2ffc157
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.DiodeBlock;
 +import net.minecraft.world.level.block.LeverBlock;
++import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
 +import net.minecraft.world.level.ChunkPos;
@@ -892,6 +1287,7 @@ index 0000000..2ffc157
 +        return state.is(Blocks.REDSTONE_WIRE)
 +            || state.getBlock() instanceof RedstoneTorchBlock
 +            || state.getBlock() instanceof DiodeBlock
++            || state.getBlock() instanceof ObserverBlock
 +            || state.getBlock() instanceof LeverBlock
 +            || state.is(Blocks.REDSTONE_BLOCK);
 +    }
@@ -995,10 +1391,10 @@ index 0000000..2ffc157
 +}
 diff --git a/com/coderyo/redstone/VirtualRedstoneWorld.java b/com/coderyo/redstone/VirtualRedstoneWorld.java
 new file mode 100644
-index 0000000..2164e40
+index 0000000000000000000000000000000000000000..347735946425b4dd7e69f07baca14ada660d7b5e
 --- /dev/null
 +++ b/com/coderyo/redstone/VirtualRedstoneWorld.java
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,100 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -1037,6 +1433,14 @@ index 0000000..2164e40
 +    private static final BlockState AIR = Blocks.AIR.defaultBlockState();
 +
 +    private final Long2ObjectMap<BlockState> states = new Long2ObjectOpenHashMap<>();
++    /**
++     * Block entities backing analog-output reads. Comparators get a private
++     * {@link net.minecraft.world.level.block.entity.ComparatorBlockEntity} that the
++     * compiled simulator writes their analog output into; static analog-source inputs
++     * (containers such as a barrel) get the live block entity reference, so vanilla's
++     * {@code getAnalogOutputSignal} reads the EXACT same fullness the real world reads.
++     */
++    private final Long2ObjectMap<BlockEntity> blockEntities = new Long2ObjectOpenHashMap<>();
 +
 +    void set(final BlockPos pos, final BlockState state) {
 +        this.states.put(pos.asLong(), state);
@@ -1044,6 +1448,14 @@ index 0000000..2164e40
 +
 +    void set(final long packed, final BlockState state) {
 +        this.states.put(packed, state);
++    }
++
++    void setBlockEntity(final long packed, final @Nullable BlockEntity be) {
++        if (be == null) {
++            this.blockEntities.remove(packed);
++        } else {
++            this.blockEntities.put(packed, be);
++        }
 +    }
 +
 +    @Override
@@ -1070,7 +1482,7 @@ index 0000000..2164e40
 +
 +    @Override
 +    public @Nullable BlockEntity getBlockEntity(final BlockPos pos) {
-+        return null; // no block entities in the redstone logic-graph substrate (comparators deferred)
++        return this.blockEntities.get(pos.asLong());
 +    }
 +
 +    @Override
@@ -1084,7 +1496,7 @@ index 0000000..2164e40
 +    }
 +}
 diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
-index 5f34b66..05e877c 100644
+index 5f34b66f8fef34431e2e0efe7ad7e787206c6046..05e877c93d771a3c47c7fc6f11fd661f7c1b403a 100644
 --- a/net/minecraft/server/MinecraftServer.java
 +++ b/net/minecraft/server/MinecraftServer.java
 @@ -1628,6 +1628,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
@@ -1095,6 +1507,3 @@ index 5f34b66..05e877c 100644
          if (nano - this.lastServerStatus >= STATUS_EXPIRE_TIME_NANOS) {
              this.lastServerStatus = nano;
              this.status = this.buildServerStatus();
--- 
-2.54.0.windows.1
-
