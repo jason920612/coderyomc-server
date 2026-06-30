@@ -1,0 +1,63 @@
+# coderyoMC redstone-computer MAP — 1-bit MEMORY (RS NOR latch) — ATTEMPTED.
+#
+# Goal: a cross-coupled NOR RS latch (Q = NOR(R, Qbar); Qbar = NOR(S, Q)) so the
+# bit HOLDs with no input — the key memory property — then difftest set/reset/HOLD.
+#
+# RESULT: built as below and exercised live (RESET/HOLD/SET/HOLD probed). It does
+# NOT latch to clean digital levels: Q settles to a non-digital equilibrium
+# (~6..9 of 15) instead of 0/15. ROOT CAUSE (diagnosed e2e, NOT a compiler/harness
+# fault): a comparator-SUBTRACT NOR computes 15 - max(side). For the latch to be
+# digital, each feedback must arrive at the consumer comparator's SIDE port at a
+# CLEAN 15 or 0. A comparator output routed as plain dust attenuates 1/level/block,
+# so the feedback reaches the far side at ~6, and 15 - 6 = 9 forms a stable analog
+# fixed point. Inserting ONE mid-lane cleaning repeater is not enough: the dust
+# AFTER that repeater still attenuates before the port. The repeater must sit
+# DIRECTLY ADJACENT to the side input — and because the two cross-coupled feedbacks
+# must reach opposite comparators, that forces a signal CROSSOVER (the two feedback
+# rails intersect) which did not fit collision-free in the comparator-subtract
+# layout within budget.
+#
+# RECOMMENDATION (next iteration): build the latch from REDSTONE TORCHES (pure
+# digital inverters). A torch's control block reads "powered" for ANY level >= 1,
+# so torch NOR latches are immune to dust attenuation and are the canonical robust
+# 1-bit cell; the difftest harness already validated combinational comparator gates
+# bit-identically, so a torch latch is the right vehicle to prove HOLD.
+#
+# The comparator latch as built (for reference / to reproduce the diagnosis):
+# y=100 stone, y=101 logic, y=102 R/S togglers.
+
+fill 24 100 96 44 100 112 minecraft:stone
+fill 24 101 96 44 103 112 minecraft:air
+
+# NOR_Q  : Q = 15 - max(R, Qbar_fb)     out Q = (31,101,100)
+setblock 29 101 100 minecraft:redstone_block
+setblock 30 101 100 minecraft:comparator[facing=west,mode=subtract]
+setblock 30 101 99  minecraft:redstone_wire
+setblock 30 101 101 minecraft:redstone_wire
+setblock 31 101 100 minecraft:redstone_wire
+# NOR_Qb : Qbar = 15 - max(S, Q_fb)     out Qbar = (31,101,110)
+setblock 29 101 110 minecraft:redstone_block
+setblock 30 101 110 minecraft:comparator[facing=west,mode=subtract]
+setblock 30 101 109 minecraft:redstone_wire
+setblock 30 101 111 minecraft:redstone_wire
+setblock 31 101 110 minecraft:redstone_wire
+# Q -> Q_fb (30,109) feedback lane (this is the lane that attenuates to ~6)
+setblock 32 101 100 minecraft:redstone_wire
+fill     33 101 100 33 101 108 minecraft:redstone_wire
+setblock 32 101 108 minecraft:redstone_wire
+setblock 31 101 108 minecraft:redstone_wire
+setblock 30 101 108 minecraft:redstone_wire
+# Qbar -> Qbar_fb (30,101) feedback lane
+setblock 32 101 110 minecraft:redstone_wire
+setblock 33 101 110 minecraft:redstone_wire
+setblock 34 101 110 minecraft:redstone_wire
+fill     35 101 102 35 101 110 minecraft:redstone_wire
+setblock 34 101 102 minecraft:redstone_wire
+setblock 33 101 102 minecraft:redstone_wire
+setblock 32 101 102 minecraft:redstone_wire
+setblock 31 101 102 minecraft:redstone_wire
+setblock 30 101 102 minecraft:redstone_wire
+
+# Inputs (toggler at y=102 over the dust):
+#   R : over (30,99)      S : over (30,111)
+# Drive: RESET = R1/S0 (Q->0), HOLD = R0/S0 (should keep), SET = R0/S1 (Q->15).

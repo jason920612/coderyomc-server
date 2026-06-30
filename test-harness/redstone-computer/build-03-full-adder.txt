@@ -1,25 +1,39 @@
-# coderyoMC redstone-computer MAP — full-adder (SUM path: A XOR B XOR Cin)
+# coderyoMC redstone-computer MAP — 1-bit FULL ADDER (SUM + Cout), VALIDATED.
 #
-# STATUS: stage-1 XOR(A,B) is built + VERIFIED (X1 = A XOR B, 4/4 combos correct,
-# difftest BIT-IDENTICAL). The 2-stage cascade (stage-2 = XOR(X1,Cin)) is built and
-# the X1 repeater-cleaned routing is proven functional (hub powers to 15), but full
-# 8-combo SUM verification was time-boxed out: multi-stage setblock-driven builds are
-# flaky to settle in vanilla (scheduled repeater ticks do not always fire on a bare
-# setblock — a primary-input toggle edge is needed to force propagation), and the
-# cramped stage-2 cluster suffered a redstone-update integrity loss during input
-# sweeps. Treat stage-2 below as the intended design, not a validated result.
+# SUM  = A XOR B XOR Cin   (two cascaded XOR gadgets)
+# Cout = majority(A,B,Cin) = (A AND B) OR (B AND Cin) OR (A AND Cin)   (3 ANDs + OR)
 #
-# Comparator/repeater FACING points at the REAR/INPUT; output exits the opposite side.
-# So a repeater that must PUSH a signal toward +Z (south) has facing=south (rear=south),
-# and toward -Z (north) has facing=north. (This bit me once — the routing repeaters
-# only start passing signal after the upstream input is toggled to force an update.)
+# STATUS: fully validated as a MAP. SUM 8/8 and Cout 8/8 input combos are
+# BIT-IDENTICAL to vanilla under `/coderyo redstone difftest`, AND both truth
+# tables are correct for all 8 (A,B,Cin) combinations. 16/16 difftests
+# BIT-IDENTICAL, 0 divergences. (See RESULTS.md.)
 #
-# Lane z=86..94, y=100 stone, y=101 logic, y=102 input togglers (driver-placed).
+# Convention (proven, same as build-01/02): comparator/repeater FACING points at
+# the REAR/INPUT; output exits the opposite side. SUBTRACT comparator:
+# out = max(0, rear - max(sideL, sideR)). Every comparator PORT is fed either a
+# fresh 15 (redstone_block- or repeater-output-adjacent) or 0 — internal signals
+# are repeater-cleaned right before each consumer so dust attenuation never
+# corrupts the subtract arithmetic.
+#
+# BUGFIX vs the prior partial build-03: the X1 branch-2 distribution repeater at
+# (32,101,88) was facing=north (rear pointing INTO the X1 bus, output dead-ended
+# at the Pb port) so Pb never powered and SUM was wrong whenever X1=1 & Cin=1.
+# It must be facing=south (rear=bus side, output=north toward Pb). With that one
+# block corrected the whole SUM path settles and is BIT-IDENTICAL across all 8.
+#
+# Boot: -Dcoderyo.redstone.compile.enabled=true ; forceload the build area and
+# settle (the prior agent's "false divergence" was an unticked chunk, not a
+# compiler fault). Drive A,B,Cin with redstone_block togglers placed ONE BLOCK
+# ABOVE (y=102) each input dust cell (see the toggler map at the bottom); the
+# difftest re-reads those external sources live each tick.
+#
+# Platform: y=100 stone support, y=101 logic, y=102 input togglers (driver-placed).
 
-fill 26 100 84 40 100 96 minecraft:stone
-fill 26 101 84 40 102 96 minecraft:air
+fill 24 100 70 44 100 100 minecraft:stone
+fill 24 101 70 44 103 100 minecraft:air
 
-# ===== STAGE 1: X1 = A XOR B  (shared out X1 = 31,101,92)  [VERIFIED] =====
+# ============================== SUM = A XOR B XOR Cin ==============================
+# ----- STAGE 1: X1 = A XOR B   (shared out X1 = 31,101,92) -----
 setblock 30 101 92 minecraft:comparator[facing=west,mode=subtract]
 setblock 29 101 92 minecraft:redstone_wire
 setblock 30 101 93 minecraft:redstone_wire
@@ -28,31 +42,71 @@ setblock 32 101 92 minecraft:comparator[facing=east,mode=subtract]
 setblock 33 101 92 minecraft:redstone_wire
 setblock 32 101 93 minecraft:redstone_wire
 
-# ===== X1 distribution: tap north, repeater-clean hub, two cleaned branches =====
+# ----- X1 distribution: tap north, repeater-clean hub, two cleaned branches -----
 setblock 31 101 91 minecraft:redstone_wire
 setblock 31 101 90 minecraft:repeater[facing=south]
 setblock 31 101 89 minecraft:redstone_wire
-# branch1 -> Pa (29,101,86): push north -> facing=south
+# branch1 -> Pa (29,101,86) [rear of stage-2 west comparator]: push north -> facing=south
 setblock 30 101 89 minecraft:redstone_wire
 setblock 29 101 89 minecraft:redstone_wire
 setblock 29 101 88 minecraft:redstone_wire
 setblock 29 101 87 minecraft:repeater[facing=south]
 setblock 29 101 86 minecraft:redstone_wire
-# branch2 -> Pb (32,101,87): push south -> facing=north
+# branch2 -> Pb (32,101,87) [side of stage-2 east comparator]: push north -> facing=south
+# (BUGFIX: was facing=north and Pb never powered)
 setblock 32 101 89 minecraft:redstone_wire
-setblock 32 101 88 minecraft:repeater[facing=north]
+setblock 32 101 88 minecraft:repeater[facing=south]
 setblock 32 101 87 minecraft:redstone_wire
 
-# ===== STAGE 2: SUM = XOR(X1, Cin)  (shared out SUM = 31,101,86) =====
+# ----- STAGE 2: SUM = XOR(X1, Cin)   (shared out SUM = 31,101,86) -----
 setblock 30 101 86 minecraft:comparator[facing=west,mode=subtract]
 setblock 30 101 87 minecraft:redstone_wire
 setblock 31 101 86 minecraft:redstone_wire
 setblock 32 101 86 minecraft:comparator[facing=east,mode=subtract]
 setblock 33 101 86 minecraft:redstone_wire
 
-# Driver toggles (y+1 over input dust):
-#   A   : 29 102 92 , 32 102 93
-#   B   : 30 102 93 , 33 102 92
-#   Cin : 30 102 87 , 33 102 86
-# After every input change, toggle the source OFF->ON to force vanilla propagation,
-# settle >=2s, then read SUM @ (31,101,86) / difftest seed (31,101,86).
+# ============== Cout = (A AND B) OR (B AND Cin) OR (A AND Cin) ==============
+# AND gadget: 15-source(rear) - NOT'd input(comp1 side) gives 15-Q; comp2 (facing
+# north, rear=P) subtracts -> P-(15-Q) = AND(P,Q), output exits south.
+# --- AND1 = A AND B   (out 29,101,75) ---
+setblock 26 101 74 minecraft:redstone_block
+setblock 27 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 27 101 75 minecraft:redstone_wire
+setblock 28 101 74 minecraft:redstone_wire
+setblock 29 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 29 101 73 minecraft:redstone_wire
+setblock 29 101 75 minecraft:redstone_wire
+# --- AND2 = B AND Cin   (out 34,101,75) ---
+setblock 31 101 74 minecraft:redstone_block
+setblock 32 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 32 101 75 minecraft:redstone_wire
+setblock 33 101 74 minecraft:redstone_wire
+setblock 34 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 34 101 73 minecraft:redstone_wire
+setblock 34 101 75 minecraft:redstone_wire
+# --- AND3 = A AND Cin   (out 39,101,75) ---
+setblock 36 101 74 minecraft:redstone_block
+setblock 37 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 37 101 75 minecraft:redstone_wire
+setblock 38 101 74 minecraft:redstone_wire
+setblock 39 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 39 101 73 minecraft:redstone_wire
+setblock 39 101 75 minecraft:redstone_wire
+# --- OR (3-way dust merge) -> repeater-clean -> Cout out (34,101,79) ---
+setblock 29 101 76 minecraft:redstone_wire
+setblock 34 101 76 minecraft:redstone_wire
+setblock 39 101 76 minecraft:redstone_wire
+fill 29 101 77 39 101 77 minecraft:redstone_wire
+setblock 34 101 78 minecraft:repeater[facing=north]
+setblock 34 101 79 minecraft:redstone_wire
+
+# ================================ DRIVER / INPUTS ================================
+# Place a redstone_block at y=102 over EACH cell below to drive that logical input
+# to 1 (remove -> 0). Drive every cell of a given input together.
+#   A   : (29,92) (32,93)  [SUM] + (29,73) (39,73)  [Cout]
+#   B   : (33,92) (30,93)  [SUM] + (27,75) (34,73)  [Cout]
+#   Cin : (30,87) (33,86)  [SUM] + (32,75) (37,75)  [Cout]
+# Read / difftest seeds:
+#   SUM  out = (31,101,86)   ->  /coderyo redstone difftest 31 101 86 30
+#   Cout out = (34,101,79)   ->  /coderyo redstone difftest 34 101 79 30
+# After each input change, toggle the source OFF->ON and settle ~2s before reading.
