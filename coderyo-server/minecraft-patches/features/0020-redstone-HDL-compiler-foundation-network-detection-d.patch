@@ -2403,10 +2403,10 @@ index 0000000000000000000000000000000000000000..392364776098f3331df652388a8592c4
 +}
 diff --git a/com/coderyo/redstone/RedstoneCompileConfig.java b/com/coderyo/redstone/RedstoneCompileConfig.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783166387bc
+index 0000000000000000000000000000000000000000..f54de038469379d1278cd8dabdbd7cac0b69c634
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneCompileConfig.java
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,117 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent
 + * implementation. MCHPRS studied as concept only (logic-graph idea), never copied.
@@ -2441,12 +2441,34 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +
 +    public static final String MAXTICKS_PROPERTY = "coderyo.redstone.difftest.maxTicks";
 +
++    /**
++     * DRIVE-THE-WORLD master switch (the MSPT payoff). With this ON <em>and</em> the master
++     * {@link #ENABLED_PROPERTY} ON, a network that the differential validator has confirmed
++     * BIT-IDENTICAL becomes <strong>compiler-authoritative</strong>: each tick the compiled
++     * model computes the next state and APPLIES it to the world while vanilla's scheduled
++     * redstone ticks are suppressed for those cells. Default false → the compiler stays a
++     * read-only validator and vanilla owns world state (the prior increment's behaviour).
++     */
++    public static final String DRIVE_PROPERTY = "coderyo.redstone.drive.enabled";
++    public static final String DRIVE_ENV = "CODERYO_REDSTONE_DRIVE_ENABLED";
++
++    /**
++     * Run the self-contained heavy-circuit MSPT benchmark: build a large array of
++     * differential-proven redstone networks, measure server MSPT under vanilla redstone,
++     * then under compiler-drive, and report the speedup. Requires {@link #ENABLED_PROPERTY}
++     * + {@link #DRIVE_PROPERTY}.
++     */
++    public static final String DRIVE_BENCH_PROPERTY = "coderyo.redstone.drive.benchmark";
++
 +    public static final boolean DEFAULT_ENABLED = false;
 +    public static final boolean DEFAULT_DIFFTEST = false;
++    public static final boolean DEFAULT_DRIVE = false;
 +    public static final int DEFAULT_MAXTICKS = 300;
 +
 +    private static final boolean ENABLED = resolveBoolean(ENABLED_PROPERTY, ENABLED_ENV, DEFAULT_ENABLED);
 +    private static final boolean DIFFTEST = resolveBoolean(DIFFTEST_PROPERTY, DIFFTEST_ENV, DEFAULT_DIFFTEST);
++    private static final boolean DRIVE = resolveBoolean(DRIVE_PROPERTY, DRIVE_ENV, DEFAULT_DRIVE);
++    private static final boolean DRIVE_BENCH = resolveBoolean(DRIVE_BENCH_PROPERTY, null, false);
 +    private static final int MAXTICKS = resolveInt(MAXTICKS_PROPERTY, DEFAULT_MAXTICKS);
 +
 +    private RedstoneCompileConfig() {
@@ -2467,12 +2489,22 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +        return MAXTICKS;
 +    }
 +
++    /** DRIVE-THE-WORLD master switch (requires {@link #isEnabled()}). Default false. */
++    public static boolean isDrive() {
++        return ENABLED && DRIVE;
++    }
++
++    /** Whether the self-contained heavy-circuit MSPT benchmark should run (requires drive). */
++    public static boolean isDriveBenchmark() {
++        return ENABLED && DRIVE && DRIVE_BENCH;
++    }
++
 +    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
 +        final String prop = System.getProperty(property);
 +        if (prop != null) {
 +            return Boolean.parseBoolean(prop.trim());
 +        }
-+        final String envValue = System.getenv(env);
++        final String envValue = env == null ? null : System.getenv(env);
 +        if (envValue != null) {
 +            return Boolean.parseBoolean(envValue.trim());
 +        }
@@ -2494,10 +2526,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..3961c858ea6550fc96b4e3de13dc440a8fbbb56e
+index 0000000000000000000000000000000000000000..61953b52159eb885eb92a2057c134684ddb91d1b
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,2006 @@
+@@ -0,0 +1,2010 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -2614,6 +2646,10 @@ index 0000000000000000000000000000000000000000..3961c858ea6550fc96b4e3de13dc440a
 +        // whenever the master compiler flag is on — independent of the corpus self-test flag.
 +        if (RedstoneCompileConfig.isEnabled()) {
 +            driveLiveJobs(server);
++        }
++        // DRIVE-THE-WORLD: compiler-authoritative apply + the heavy-circuit MSPT benchmark.
++        if (RedstoneCompileConfig.isDrive()) {
++            RedstoneDriveManager.onServerTickEnd(server);
 +        }
 +        if (!RedstoneCompileConfig.isDiffTest()) {
 +            return;
@@ -4504,6 +4540,647 @@ index 0000000000000000000000000000000000000000..3961c858ea6550fc96b4e3de13dc440a
 +        return null;
 +    }
 +}
+diff --git a/com/coderyo/redstone/RedstoneDriveBenchmark.java b/com/coderyo/redstone/RedstoneDriveBenchmark.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..28fae31e725da53b52ac51c49bcfe15537aed101
+--- /dev/null
++++ b/com/coderyo/redstone/RedstoneDriveBenchmark.java
+@@ -0,0 +1,389 @@
++/*
++ * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
++ */
++package com.coderyo.redstone;
++
++import com.mojang.logging.LogUtils;
++import java.util.ArrayList;
++import java.util.List;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.Direction;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.block.Block;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.block.state.properties.BlockStateProperties;
++import net.minecraft.world.level.gamerules.GameRules;
++import org.slf4j.Logger;
++
++/**
++ * The self-contained heavy-circuit MSPT benchmark — the headline "drive-the-world" payoff.
++ *
++ * <p>Builds a large array of identical, differential-proven redstone networks across
++ * force-loaded chunks, then:
++ * <ol>
++ *   <li><b>VALIDATE</b> — under vanilla authority, runs a scripted input toggle and steps a
++ *       compiled clone of every tile in lockstep, scoring each tile BIT-IDENTICAL (the
++ *       drive-safety gate; reuses {@link RedstoneDiffTestHarness#cellDivergence}).</li>
++ *   <li><b>VANILLA_MEASURE</b> — vanilla redstone owns the array; the same toggle script runs and
++ *       per-tick server compute time is accumulated → vanilla MSPT.</li>
++ *   <li><b>DRIVE_MEASURE</b> — every validated tile is made compiler-authoritative
++ *       ({@link RedstoneDriveManager}); the same script runs SILENTLY (no vanilla cascade), the
++ *       compiled model drives the world, vanilla scheduled ticks are suppressed → driven MSPT.</li>
++ * </ol>
++ * A world-state checksum captured after each measure window settles to the SAME constant-input
++ * steady state must be IDENTICAL — the concrete proof drive did not change behaviour. Finally it
++ * logs the vanilla vs driven MSPT and the speedup factor.
++ */
++final class RedstoneDriveBenchmark {
++
++    private static final Logger LOG = LogUtils.getLogger();
++
++    // ---- layout ----
++    private static final int COLS = 4;
++    private static final int ROWS = 50;            // COLS*ROWS = 200 independent tile networks
++    private static final int TRAIL = 15;           // wires per tile trail
++    private static final int TILE_W = TRAIL + 5;   // source + trail + repeater + wire + lamp + gap
++    private static final int ROW_DZ = 3;           // z spacing so neighbouring tiles never connect
++    private static final int BASE_X = 2;
++    private static final int BASE_Y = 100;
++    private static final int BASE_Z = 2;
++
++    // ---- timing ----
++    private static final int PERIOD = 8;           // toggle: 4 on / 4 off
++    private static final int VALIDATE_TICKS = 64;  // multiple of PERIOD
++    private static final int SETTLE_TICKS = 20;
++    private static final int WARM_TICKS = 16;
++    private static final int MEASURE_TICKS = 200;  // multiple of PERIOD
++
++    private static final BlockState STONE = Blocks.STONE.defaultBlockState();
++    private static final BlockState WIRE = Blocks.REDSTONE_WIRE.defaultBlockState();
++    private static final BlockState REDBLOCK = Blocks.REDSTONE_BLOCK.defaultBlockState();
++    private static final BlockState AIR = Blocks.AIR.defaultBlockState();
++    private static final BlockState LAMP = Blocks.REDSTONE_LAMP.defaultBlockState();
++    private static final BlockState REPEATER_E = Blocks.REPEATER.defaultBlockState()
++        .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST);
++
++    private static final int SILENT = Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE;
++
++    private static final int CHUNK_X0 = -1;
++    private static final int CHUNK_X1 = (BASE_X + COLS * TILE_W) >> 4;
++    private static final int CHUNK_Z0 = -1;
++    private static final int CHUNK_Z1 = (BASE_Z + ROWS * ROW_DZ) >> 4;
++
++    private static final int S_INIT = 0;
++    private static final int S_BUILD = 1;
++    private static final int S_PRESETTLE = 2;
++    private static final int S_VALIDATE = 3;
++    private static final int S_SETTLE_A = 4;
++    private static final int S_VANILLA_WARM = 5;
++    private static final int S_VANILLA_MEASURE = 6;
++    private static final int S_SETTLE_B = 7;        // settle vanilla to steady all-ON, checksum
++    private static final int S_DRIVE_WARM = 8;
++    private static final int S_DRIVE_MEASURE = 9;
++    private static final int S_SETTLE_C = 10;       // settle drive to steady all-ON, checksum
++    private static final int S_DONE = 11;
++
++    private static int state = S_INIT;
++    private static boolean inited;
++    private static long ticks;
++    private static long phaseStart;
++
++    private static final List<BlockPos> SOURCES = new ArrayList<>();
++    private static final List<RedstoneNetwork> NETS = new ArrayList<>();
++    private static final List<CompiledNetwork> CLONES = new ArrayList<>();
++    private static boolean[] bitIdentical;
++
++    private static long vanillaNanos;
++    private static int vanillaTicks;
++    private static long driveNanos;
++    private static int driveTicks;
++    private static long vanillaChecksum;
++    private static long driveChecksum;
++    private static int drivenCount;
++    private static int passCount;
++
++    private RedstoneDriveBenchmark() {
++    }
++
++    static void onServerTickEnd(final MinecraftServer server) {
++        ticks++;
++        final ServerLevel level = server.overworld();
++        switch (state) {
++            case S_INIT -> init(level);
++            case S_BUILD -> {
++                if (areaLoaded(level) && ticks - phaseStart > 5) {
++                    build(level);
++                    enter(S_PRESETTLE);
++                    LOG.info("[redstone-drive] built {} tiles; settling static build {} ticks",
++                        SOURCES.size(), SETTLE_TICKS);
++                }
++            }
++            case S_PRESETTLE -> {
++                if (ticks - phaseStart >= SETTLE_TICKS) {
++                    compileClones(level);          // clean seed from the settled all-ON world
++                    bitIdentical = new boolean[NETS.size()];
++                    java.util.Arrays.fill(bitIdentical, true);
++                    enter(S_VALIDATE);
++                    LOG.info("[redstone-drive] compiled {} clones ({} components); VALIDATE {} ticks",
++                        NETS.size(), totalComponents(), VALIDATE_TICKS);
++                }
++            }
++            case S_VALIDATE -> {
++                final int rel = (int) (ticks - phaseStart);
++                applyScript(level, rel, false);
++                validateStep(level, rel);
++                if (rel >= VALIDATE_TICKS) {
++                    passCount = 0;
++                    for (final boolean b : bitIdentical) {
++                        if (b) passCount++;
++                    }
++                    LOG.info("[redstone-drive] VALIDATE done: {}/{} tiles BIT-IDENTICAL (drive-safe)",
++                        passCount, bitIdentical.length);
++                    sourcesConstant(level, false);
++                    enter(S_SETTLE_A);
++                }
++            }
++            case S_SETTLE_A -> {
++                if (ticks - phaseStart >= SETTLE_TICKS) {
++                    enter(S_VANILLA_WARM);
++                }
++            }
++            case S_VANILLA_WARM -> {
++                applyScript(level, (int) (ticks - phaseStart), false);
++                if (ticks - phaseStart >= WARM_TICKS) {
++                    vanillaNanos = 0;
++                    vanillaTicks = 0;
++                    enter(S_VANILLA_MEASURE);
++                    LOG.info("[redstone-drive] VANILLA_MEASURE {} ticks", MEASURE_TICKS);
++                }
++            }
++            case S_VANILLA_MEASURE -> {
++                final int rel = (int) (ticks - phaseStart);
++                applyScript(level, rel, false);
++                vanillaNanos += System.nanoTime() - server.coderyoCurrentTickStartNanos();
++                vanillaTicks++;
++                if (rel >= MEASURE_TICKS) {
++                    sourcesConstant(level, false);
++                    enter(S_SETTLE_B);
++                }
++            }
++            case S_SETTLE_B -> {
++                if (ticks - phaseStart >= SETTLE_TICKS) {
++                    vanillaChecksum = worldChecksum(level);
++                    enableDrive(level);            // compile fresh from this settled steady state
++                    enter(S_DRIVE_WARM);
++                    LOG.info("[redstone-drive] vanilla settled (checksum {}); drive ENABLED for {} tiles",
++                        vanillaChecksum, drivenCount);
++                }
++            }
++            case S_DRIVE_WARM -> {
++                applyScript(level, (int) (ticks - phaseStart), true);
++                if (ticks - phaseStart >= WARM_TICKS) {
++                    driveNanos = 0;
++                    driveTicks = 0;
++                    enter(S_DRIVE_MEASURE);
++                    LOG.info("[redstone-drive] DRIVE_MEASURE {} ticks", MEASURE_TICKS);
++                }
++            }
++            case S_DRIVE_MEASURE -> {
++                final int rel = (int) (ticks - phaseStart);
++                applyScript(level, rel, true);
++                driveNanos += System.nanoTime() - server.coderyoCurrentTickStartNanos();
++                driveTicks++;
++                if (rel >= MEASURE_TICKS) {
++                    sourcesConstant(level, true);
++                    enter(S_SETTLE_C);
++                }
++            }
++            case S_SETTLE_C -> {
++                if (ticks - phaseStart >= SETTLE_TICKS) {
++                    driveChecksum = worldChecksum(level);
++                    report();
++                    RedstoneDriveManager.clear();
++                    state = S_DONE;
++                }
++            }
++            default -> {
++            }
++        }
++    }
++
++    private static void enter(final int next) {
++        state = next;
++        phaseStart = ticks;
++    }
++
++    private static void init(final ServerLevel level) {
++        if (!inited) {
++            inited = true;
++            for (int cx = CHUNK_X0; cx <= CHUNK_X1; cx++) {
++                for (int cz = CHUNK_Z0; cz <= CHUNK_Z1; cz++) {
++                    level.setChunkForced(cx, cz, true);
++                }
++            }
++            level.getGameRules().set(GameRules.SPAWN_MOBS, false, level);
++            level.getGameRules().set(GameRules.SPAWN_MONSTERS, false, level);
++            level.getGameRules().set(GameRules.ADVANCE_TIME, false, level);
++            level.getGameRules().set(GameRules.RANDOM_TICK_SPEED, 0, level);
++            LOG.info("[redstone-drive] forceloaded chunks [{}..{}]x[{}..{}]; mob-spawn off; clock+random frozen",
++                CHUNK_X0, CHUNK_X1, CHUNK_Z0, CHUNK_Z1);
++        }
++        enter(S_BUILD);
++    }
++
++    private static int totalComponents() {
++        int n = 0;
++        for (final RedstoneNetwork net : NETS) {
++            n += net.size();
++        }
++        return n;
++    }
++
++    // ---- build ----
++
++    private static void build(final ServerLevel level) {
++        for (int c = 0; c < COLS; c++) {
++            for (int r = 0; r < ROWS; r++) {
++                final int bx = BASE_X + c * TILE_W;
++                final int bz = BASE_Z + r * ROW_DZ;
++                buildTile(level, bx, BASE_Y, bz);
++                SOURCES.add(new BlockPos(bx, BASE_Y, bz));
++            }
++        }
++    }
++
++    private static void compileClones(final ServerLevel level) {
++        for (final BlockPos src : SOURCES) {
++            final RedstoneNetwork net = RedstoneNetwork.detect(level, src);
++            NETS.add(net);
++            CLONES.add(CompiledNetwork.compile(level, net));
++        }
++    }
++
++    private static void buildTile(final ServerLevel level, final int bx, final int by, final int bz) {
++        set(level, bx, by, bz, REDBLOCK);                       // toggled source (west end)
++        for (int k = 1; k <= TRAIL; k++) {
++            set(level, bx + k, by - 1, bz, STONE);
++            set(level, bx + k, by, bz, WIRE);
++        }
++        final int rep = bx + TRAIL + 1;
++        set(level, rep, by - 1, bz, STONE);
++        set(level, rep, by, bz, REPEATER_E);                   // input west (wire), output east
++        set(level, rep + 1, by - 1, bz, STONE);
++        set(level, rep + 1, by, bz, WIRE);
++        set(level, rep + 2, by - 1, bz, STONE);
++        set(level, rep + 2, by, bz, LAMP);                     // display load
++    }
++
++    private static void set(final ServerLevel level, final int x, final int y, final int z, final BlockState s) {
++        level.setBlockAndUpdate(new BlockPos(x, y, z), s);
++    }
++
++    // ---- scripted input ----
++
++    private static void applyScript(final ServerLevel level, final int rel, final boolean silent) {
++        if (rel % (PERIOD / 2) != 0) {
++            return;
++        }
++        final boolean on = (rel % PERIOD) < (PERIOD / 2);
++        final BlockState want = on ? REDBLOCK : AIR;
++        final int flags = silent ? SILENT : Block.UPDATE_ALL;
++        for (final BlockPos src : SOURCES) {
++            if (level.getBlockState(src) != want) {
++                level.setBlock(src, want, flags);
++            }
++        }
++    }
++
++    private static void sourcesConstant(final ServerLevel level, final boolean silent) {
++        final int flags = silent ? SILENT : Block.UPDATE_ALL;
++        for (final BlockPos src : SOURCES) {
++            if (level.getBlockState(src) != REDBLOCK) {
++                level.setBlock(src, REDBLOCK, flags);
++            }
++        }
++    }
++
++    // ---- validation (lockstep compiled clone vs vanilla) ----
++
++    private static void validateStep(final ServerLevel level, final int rel) {
++        for (int i = 0; i < NETS.size(); i++) {
++            final RedstoneNetwork net = NETS.get(i);
++            final CompiledNetwork clone = CLONES.get(i);
++            clone.setSource(SOURCES.get(i), level.getBlockState(SOURCES.get(i)));
++            clone.step(rel);
++            if (!bitIdentical[i]) {
++                continue; // already diverged
++            }
++            for (final long packed : net.footprint()) {
++                if (RedstoneDiffTestHarness.cellDivergence(level, clone, packed) != null) {
++                    bitIdentical[i] = false;
++                    break;
++                }
++            }
++        }
++    }
++
++    // ---- enable drive ----
++
++    private static void enableDrive(final ServerLevel level) {
++        drivenCount = 0;
++        for (int i = 0; i < NETS.size(); i++) {
++            final RedstoneNetwork net = NETS.get(i);
++            if (!bitIdentical[i] || !RedstoneDriveManager.isDriveSupported(level, net)) {
++                continue;
++            }
++            RedstoneDriveManager.registerDriven(level, net, CompiledNetwork.compile(level, net));
++            drivenCount++;
++        }
++    }
++
++    // ---- world checksum (observable-equality proof) ----
++
++    private static long worldChecksum(final ServerLevel level) {
++        long h = 1125899906842597L;
++        final BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
++        for (final RedstoneNetwork net : NETS) {
++            for (final long packed : net.footprint()) {
++                m.set(packed);
++                h = 31 * h + packed;
++                h = 31 * h + Block.getId(level.getBlockState(m)); // full block-state id
++            }
++        }
++        return h;
++    }
++
++    // ---- report ----
++
++    private static void report() {
++        final double vanMs = vanillaTicks == 0 ? 0 : (vanillaNanos / 1_000_000.0) / vanillaTicks;
++        final double drvMs = driveTicks == 0 ? 0 : (driveNanos / 1_000_000.0) / driveTicks;
++        final double speedup = drvMs <= 0 ? 0 : vanMs / drvMs;
++        final boolean identical = vanillaChecksum == driveChecksum;
++        LOG.info("[redstone-drive] ================= MSPT BENCHMARK RESULT =================");
++        LOG.info("[redstone-drive]   tiles built              : {}", SOURCES.size());
++        LOG.info("[redstone-drive]   total redstone components: {}", totalComponents());
++        LOG.info("[redstone-drive]   tiles drive-safe (difftest BIT-IDENTICAL): {}", passCount);
++        LOG.info("[redstone-drive]   networks driven (compiler-authoritative) : {}", drivenCount);
++        LOG.info("[redstone-drive]   measure window           : {} ticks each", MEASURE_TICKS);
++        LOG.info("[redstone-drive]   VANILLA MSPT (avg tick compute): {} ms", String.format("%.4f", vanMs));
++        LOG.info("[redstone-drive]   DRIVEN  MSPT (avg tick compute): {} ms", String.format("%.4f", drvMs));
++        LOG.info("[redstone-drive]   SPEEDUP (vanilla / driven): {}x", String.format("%.2f", speedup));
++        LOG.info("[redstone-drive]   CORRECTNESS (vanilla world == driven world): {} (checksum {} vs {})",
++            identical ? "IDENTICAL" : "*** MISMATCH ***", vanillaChecksum, driveChecksum);
++        LOG.info("[redstone-drive] =========================================================");
++    }
++
++    private static boolean areaLoaded(final ServerLevel level) {
++        for (int cx = 0; cx <= CHUNK_X1; cx++) {
++            for (int cz = 0; cz <= CHUNK_Z1; cz++) {
++                if (!level.getChunkSource().hasChunk(cx, cz)) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    }
++}
+diff --git a/com/coderyo/redstone/RedstoneDriveManager.java b/com/coderyo/redstone/RedstoneDriveManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3f01ec9c94bc2daeed55124eac1469b13ebab75
+--- /dev/null
++++ b/com/coderyo/redstone/RedstoneDriveManager.java
+@@ -0,0 +1,240 @@
++/*
++ * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
++ * MCHPRS studied as concept only (compile redstone to a logic graph, drive the world from
++ * the compiled model); never copied.
++ */
++package com.coderyo.redstone;
++
++import com.mojang.logging.LogUtils;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.longs.LongSet;
++import java.util.ArrayList;
++import java.util.List;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.block.BasePressurePlateBlock;
++import net.minecraft.world.level.block.BellBlock;
++import net.minecraft.world.level.block.Block;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.ButtonBlock;
++import net.minecraft.world.level.block.ComparatorBlock;
++import net.minecraft.world.level.block.CopperBulbBlock;
++import net.minecraft.world.level.block.DaylightDetectorBlock;
++import net.minecraft.world.level.block.DetectorRailBlock;
++import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.LeverBlock;
++import net.minecraft.world.level.block.LightningRodBlock;
++import net.minecraft.world.level.block.NoteBlock;
++import net.minecraft.world.level.block.ObserverBlock;
++import net.minecraft.world.level.block.RedStoneWireBlock;
++import net.minecraft.world.level.block.RedstoneLampBlock;
++import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.SculkSensorBlock;
++import net.minecraft.world.level.block.TargetBlock;
++import net.minecraft.world.level.block.TripWireBlock;
++import net.minecraft.world.level.block.TripWireHookBlock;
++import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
++import net.minecraft.world.level.block.state.BlockState;
++import org.slf4j.Logger;
++
++/**
++ * DRIVE-THE-WORLD: the MSPT payoff for the redstone HDL-compiler.
++ *
++ * <p>The differential validator ({@link RedstoneDiffTestHarness}) proves the compiled model
++ * ({@link CompiledNetwork}) reaches a world state bit-identical to vanilla every tick. This
++ * manager turns that read-only oracle into the <strong>authoritative</strong> writer for a
++ * validated network: each server tick it re-reads the network's external inputs from the
++ * world, advances the compiled model one tick, and APPLIES the resulting block states
++ * (+ comparator analog outputs) back to the world with a client-only, no-neighbour-update
++ * write — while vanilla's scheduled redstone ticks for those cells are SUPPRESSED (see
++ * {@code ServerLevel.tickBlock}'s {@link #isDriven} guard). Doing the whole network's logic
++ * in one compiled pass and skipping vanilla's per-block neighbour-update / scheduled-tick
++ * churn is where the MSPT win comes from (the MCHPRS-style result).
++ *
++ * <p><b>Correctness gate (non-negotiable).</b> A network is driven only if (a) every component
++ * is a pure-logic kind this increment can losslessly apply to the live world — wire / torch /
++ * repeater / comparator / lever / redstone-block / lamp / button / target / observer / note /
++ * copper-bulb / bell / lightning-rod and the read-live input sources — and (b) the differential
++ * validator confirmed it BIT-IDENTICAL. Item/movement layers (piston, hopper, dropper,
++ * dispenser, crafter, containers) are intentionally NOT driven (applying item movement +
++ * moving-piston block entities to the live world is out of scope); those networks fall back to
++ * vanilla untouched.
++ *
++ * <p>Gated behind {@link RedstoneCompileConfig#isDrive()} (default OFF). With drive OFF this
++ * class is inert and the compiler is the prior increment's read-only validator.
++ */
++public final class RedstoneDriveManager {
++
++    private static final Logger LOG = LogUtils.getLogger();
++
++    /** No-neighbour-update, client-visible write: vanilla never re-cascades from a driven write. */
++    private static final int SILENT = Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE;
++
++    /** One network the compiler authoritatively drives. */
++    private static final class Driven {
++        final ServerLevel level;
++        final RedstoneNetwork net;
++        final CompiledNetwork compiled;
++        final LongSet inputCells = new LongOpenHashSet();
++        final LongSet comparatorCells = new LongOpenHashSet();
++        int rel;
++
++        Driven(final ServerLevel level, final RedstoneNetwork net, final CompiledNetwork compiled) {
++            this.level = level;
++            this.net = net;
++            this.compiled = compiled;
++            final BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
++            for (final long packed : net.footprint()) {
++                m.set(packed);
++                final BlockState s = level.getBlockState(m);
++                if (s.getBlock() instanceof LeverBlock || s.getBlock() instanceof ButtonBlock
++                    || s.is(Blocks.REDSTONE_BLOCK)) {
++                    this.inputCells.add(packed);
++                } else if (s.getBlock() instanceof ComparatorBlock) {
++                    this.comparatorCells.add(packed);
++                }
++            }
++        }
++
++        void tickAndApply() {
++            final BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
++            // INPUT BOUNDARY: vanilla owns lever/button/redstone-block + detection inputs; re-read
++            // the live block state into the compiled grid before stepping (exactly the difftest path).
++            for (final long packed : this.inputCells) {
++                m.set(packed);
++                this.compiled.setSource(m.immutable(), this.level.getBlockState(m));
++            }
++            this.compiled.step(this.rel);
++            // APPLY: write the compiled next-state back to the world for every footprint cell that
++            // changed, with no neighbour update (the compiled model already accounts for the whole
++            // network's propagation, and vanilla scheduled ticks for these cells are suppressed).
++            for (final long packed : this.net.footprint()) {
++                m.set(packed);
++                final BlockState want = this.compiled.state(packed);
++                final BlockState have = this.level.getBlockState(m);
++                if (have != want) {
++                    this.level.setBlock(m.immutable(), want, SILENT);
++                }
++            }
++            // Comparator analog output lives in the block entity; vanilla won't update it (suppressed),
++            // so push the compiled value so a downstream comparator/redstone read stays authoritative.
++            for (final long packed : this.comparatorCells) {
++                m.set(packed);
++                if (this.level.getBlockEntity(m) instanceof ComparatorBlockEntity be) {
++                    final int out = this.compiled.comparatorOutputSignal(packed);
++                    if (out >= 0 && be.getOutputSignal() != out) {
++                        be.setOutputSignal(out);
++                    }
++                }
++            }
++            this.rel++;
++        }
++    }
++
++    private static final List<Driven> DRIVEN = new ArrayList<>();
++
++    /** Suppression registry, published as an immutable snapshot read lock-free from tick threads. */
++    private static volatile ServerLevel drivenLevel;
++    private static volatile LongSet drivenCells = new LongOpenHashSet();
++
++    private RedstoneDriveManager() {
++    }
++
++    /**
++     * True iff the compiler is the authoritative writer for {@code pos} in {@code level} — vanilla's
++     * scheduled redstone tick for that cell must be skipped. Hot path (every scheduled block tick);
++     * a lock-free read of a volatile immutable snapshot, safe from region worker threads.
++     */
++    public static boolean isDriven(final ServerLevel level, final BlockPos pos) {
++        if (drivenLevel != level) { // null when nothing is driven → fast reject
++            return false;
++        }
++        return drivenCells.contains(pos.asLong());
++    }
++
++    /** Every component of {@code net} is a pure-logic kind this increment can losslessly drive. */
++    public static boolean isDriveSupported(final ServerLevel level, final RedstoneNetwork net) {
++        final BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
++        for (final long packed : net.components()) {
++            m.set(packed);
++            if (!supportedKind(level.getBlockState(m))) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static boolean supportedKind(final BlockState s) {
++        return s.is(Blocks.REDSTONE_WIRE)
++            || s.getBlock() instanceof RedstoneTorchBlock
++            || s.getBlock() instanceof DiodeBlock
++            || s.getBlock() instanceof ComparatorBlock
++            || s.getBlock() instanceof ObserverBlock
++            || s.getBlock() instanceof RedstoneLampBlock
++            || s.getBlock() instanceof LeverBlock
++            || s.getBlock() instanceof ButtonBlock
++            || s.getBlock() instanceof TargetBlock
++            || s.getBlock() instanceof CopperBulbBlock
++            || s.getBlock() instanceof NoteBlock
++            || s.getBlock() instanceof BellBlock
++            || s.getBlock() instanceof LightningRodBlock
++            || s.getBlock() instanceof DaylightDetectorBlock
++            || s.getBlock() instanceof SculkSensorBlock
++            || s.getBlock() instanceof BasePressurePlateBlock
++            || s.getBlock() instanceof TripWireHookBlock
++            || s.getBlock() instanceof TripWireBlock
++            || s.getBlock() instanceof DetectorRailBlock
++            || s.is(Blocks.REDSTONE_BLOCK);
++        // INTENTIONALLY NOT driven: piston, hopper, dispenser/dropper, crafter, containers.
++    }
++
++    /**
++     * Make {@code net} compiler-authoritative. Caller MUST have confirmed the network BIT-IDENTICAL
++     * via the differential validator first (the drive-safety law) and that {@link #isDriveSupported}.
++     */
++    public static void registerDriven(final ServerLevel level, final RedstoneNetwork net,
++                                      final CompiledNetwork compiled) {
++        DRIVEN.add(new Driven(level, net, compiled));
++        rebuildSuppressionSnapshot();
++    }
++
++    /** Stop driving every network and hand world authority back to vanilla. */
++    public static void clear() {
++        DRIVEN.clear();
++        drivenLevel = null;
++        drivenCells = new LongOpenHashSet();
++    }
++
++    public static int drivenNetworkCount() {
++        return DRIVEN.size();
++    }
++
++    private static void rebuildSuppressionSnapshot() {
++        final LongSet cells = new LongOpenHashSet();
++        ServerLevel lvl = null;
++        for (final Driven d : DRIVEN) {
++            lvl = d.level;
++            cells.addAll(d.net.footprint());
++        }
++        drivenLevel = lvl;
++        drivenCells = cells; // publish AFTER fully built (volatile write = happens-before for readers)
++    }
++
++    /** Advance + apply every driven network. Runs on the main thread at server-tick end. */
++    public static void onServerTickEnd(final MinecraftServer server) {
++        if (RedstoneCompileConfig.isDriveBenchmark()) {
++            RedstoneDriveBenchmark.onServerTickEnd(server);
++        }
++        driveAll();
++    }
++
++    static void driveAll() {
++        if (DRIVEN.isEmpty()) {
++            return;
++        }
++        for (final Driven d : DRIVEN) {
++            d.tickAndApply();
++        }
++    }
++}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
 index 0000000000000000000000000000000000000000..fd499c4aaf72e84527ee085be5257ff7deb35a66
@@ -4946,7 +5623,7 @@ index d3ee7323e3e7ff4dd163e4b5bf552df10de77476..ffaa36c66d2614b385e64a448d42f2cc
          for (final CommandNode<CommandSourceStack> node : this.dispatcher.getRoot().getChildren()) {
              if (node.getRequirement() == com.mojang.brigadier.builder.ArgumentBuilder.<CommandSourceStack>defaultRequirement()) {
 diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
-index 5f34b66f8fef34431e2e0efe7ad7e787206c6046..05e877c93d771a3c47c7fc6f11fd661f7c1b403a 100644
+index 5f34b66f8fef34431e2e0efe7ad7e787206c6046..84dca60fa68c5e96431562f99d44c24049257ddd 100644
 --- a/net/minecraft/server/MinecraftServer.java
 +++ b/net/minecraft/server/MinecraftServer.java
 @@ -1628,6 +1628,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
@@ -4957,3 +5634,47 @@ index 5f34b66f8fef34431e2e0efe7ad7e787206c6046..05e877c93d771a3c47c7fc6f11fd661f
          if (nano - this.lastServerStatus >= STATUS_EXPIRE_TIME_NANOS) {
              this.lastServerStatus = nano;
              this.status = this.buildServerStatus();
+@@ -2649,6 +2650,14 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         return this.aggregatedTickTimesNanos / Math.min(100, Math.max(this.tickCount, 1));
+     }
+ 
++    // coderyo start - redstone drive MSPT benchmark: nanoTime the current tick started, so the
++    // tick-end harness can measure per-tick COMPUTE time (excludes the inter-tick sleep) for the
++    // vanilla-vs-compiler-driven MSPT comparison.
++    public long coderyoCurrentTickStartNanos() {
++        return this.currentTickStart;
++    }
++    // coderyo end
++
+     public long[] getTickTimesNanos() {
+         return this.tickTimesNanos;
+     }
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 96f05dc98609a614380fb56da3a6760bfeb25859..33eb6f6cb9effa1a73dd93a36c93756779a64de9 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -1123,6 +1123,9 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     /** Exact vanilla {@link #tickBlock} body, but with a region-supplied RNG (no shared
+      *  {@code Level.random}) and without the shared mid-tick-task counter. */
+     private void coderyoTickBlock(final BlockPos pos, final Block type, final net.minecraft.util.RandomSource regionRandom) {
++        if (com.coderyo.redstone.RedstoneDriveManager.isDriven(this, pos)) { // coderyo - redstone drive: compiler-authoritative cell; suppress vanilla scheduled tick
++            return;
++        }
+         BlockState state = this.getBlockState(pos);
+         if (state.is(type)) {
+             state.tick(this, pos, regionRandom);
+@@ -1723,6 +1726,14 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     }
+ 
+     private void tickBlock(final BlockPos pos, final Block type) {
++        // coderyo start - redstone drive: the compiler is the authoritative writer for a driven
++        // network's cells (it computes + applies their next state each tick). Suppress vanilla's
++        // scheduled redstone tick for those cells so vanilla does not also compute them — the
++        // suppression + whole-network compiled compute is the MSPT win. Flag-gated, lock-free read.
++        if (com.coderyo.redstone.RedstoneDriveManager.isDriven(this, pos)) {
++            return;
++        }
++        // coderyo end
+         BlockState state = this.getBlockState(pos);
+         if (state.is(type)) {
+             state.tick(this, pos, this.random);
