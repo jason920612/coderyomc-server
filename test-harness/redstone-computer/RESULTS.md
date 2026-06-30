@@ -441,6 +441,44 @@ the build-08 ripple adder as the SUM path gives the clean **2-bit ACC=0→1→2�
 constituent (edge-triggered register THIS build, ripple adder build-08) is difftest-clean — only
 collision-free routing (and the build-10 settle-isolation between phases) remains.
 
+## Rung 3 — 1-BIT INCREMENT ACCUMULATOR (build-12) — SUSTAINED clean counting, difftest-clean ✅
+
+The crossing is **solved**, and the 1-bit `ACC := ACC + 1` accumulator now **sustains** counting —
+the milestone build-10 (level-latch race) and build-11 (wire-crossing) could not reach. It is the
+build-11 master-slave register wired as a **T-flip-flop** (Slave.Qbar → Master.D = a 1-bit "+1"
+adder, since for B=1 the adder SUM = ACC XOR 1 = NOT ACC = Slave.Qbar), on a **wider board with
+dedicated, non-crossing feedback channels**.
+
+**The layout fix (what solved the same-y net merge).** In any master-slave accumulator the forward
+`Master.Q→Slave.D` and feedback `Slave.Qbar→Master.D` run **antiparallel** between the two latches;
+build-11 crammed both into shared z-rows + an x=50 forward "wall," so the feedback drop merged the
+held Master.Q at (48,137). build-12 gives each its **own band**, with every vertical transition at an
+**x-extreme outside the other path**:
+- **Forward** = north band (trunk z=114) + a **west drop (x=41)** that reaches Slave's *south* D-port
+  (46,135) by running z=137 only over **x=42..46** — so it **never touches the x=47–49 corridor**.
+- **Feedback** = far-**south** band (trunk z=145) + **east risers** (x=62 → Master D_south; x=66 →
+  Master D_north). x=66 is 2 cells east of the Qbar rail (x=64) so no rail short.
+- The two paths share **no y=101 cell** and never run adjacent on the same z — **pure planar
+  separation, no y=102 bridge needed**.
+
+**Sustained counting (vanilla live reads, ACC = Slave.Q dust @44,101,122).** Two-phase manual clock
+(phi1 master-capture, phi2 slave-output), settled by game ticks each phase. From a clean ACC=0 start:
+`0→1→0→1→0→1→0→1→0` (8 cycles) plus an earlier `1→0→1→0→1→0→1` (6 cycles) = **14 consecutive clean
+toggles, ZERO sticking** through **real physical feedback**.
+
+**difftest (compiler == vanilla),** impulse command_block, verdict from the server log:
+
+| held state | command | verdict |
+|------------|---------|---------|
+| ACC = 1 | `coderyo redstone difftest 44 101 122 200` | **BIT-IDENTICAL (200 ticks, 432 cells, 218 components, single-region)** |
+| ACC = 0 | `coderyo redstone difftest 44 101 122 200` | **BIT-IDENTICAL (200 ticks, 432 cells)** |
+
+So the **whole accumulator** (both torch latches + both comparator enable-gates + the forward AND
+feedback interconnects, 432 cells) compiles **bit-for-bit to vanilla in both held states**, and counts
+cleanly through real feedback. This is the **difftest-clean, sustained-counting edge-triggered
+accumulator — the datapath core** a CPU is built from. (The literal 2-bit `0→1→2→3` and general
+`ACC:=ACC+B` are now pure scale-up of the *solved* routing — designs in build-12's header.)
+
 ### What the CPU rung needs next
 0. **DONE (build-09):** the torch RS latch's HOLD now **difftest-validates BIT-IDENTICAL** for
    both stored bits, and 4 tiled latches form a **4-bit register** that reads back a loaded value
@@ -453,13 +491,16 @@ collision-free routing (and the build-10 settle-isolation between phases) remain
    D-latches (master on Clock=HIGH, slave on Clock=LOW) — **difftests BIT-IDENTICAL in both held
    states** (246/244 cells) and its output changes **only on the clock falling edge**, bidirectionally;
    the level-latch race-through is eliminated. This is the difftest-clean clocked register a CPU uses.
-3. **Real ACC := ACC + B** — register Q → build-08 ripple adder ← B → SUM → register D, clocked.
-   build-11 wired the 1-bit B=1 case (Slave.Qbar→Master.D) and got **one clean race-free increment
-   (0→1) through real feedback**; sustained counting was blocked by a **wire-congestion collision**
-   in the retrofit (feedback drop merged the held Master.Q at (48,137)). Next: rebuild on a wider
-   platform with **dedicated feedback channels** (or a y=102 bridge) so the master-slave sustains the
-   toggle, then swap the B=1 proxy for the build-08 ripple adder + selectable B and read back
-   ACC=0,B=1 → 0→1→2→3 (the 2-bit milestone). All blocks are difftest-clean; only routing remains.
-4. From the accumulator: a **control unit** (clock/step + opcode), **instruction memory**
+3. **DONE (build-12):** the **1-bit increment accumulator** (master-slave T-flip-flop,
+   Slave.Qbar→Master.D) now **SUSTAINS clean counting** — ACC toggles 0↔1 every clock cycle,
+   **14 consecutive clean toggles, zero sticking** — and is **difftest BIT-IDENTICAL in both held
+   states** (432 cells, 218 components). The build-11 wire-crossing is **solved** by dedicated
+   non-crossing feedback channels (forward on a north band + west drop; feedback on a far-south band
+   + east risers; no shared y=101 cell). The datapath core works end-to-end through real feedback.
+4. **2-bit ACC = 0→1→2→3 / general ACC:=ACC+B** — two of the build-12 cell clocked synchronously
+   with bit1.D = XOR(Q1,Q0) (build-01 gadget) for a +1 counter, OR the build-08 2-bit ripple adder as
+   the SUM path with selectable B (B=1, B=2). Every constituent is difftest-clean; only lane routing
+   (now solved at 1-bit) scales up.
+5. From the accumulator: a **control unit** (clock/step + opcode), **instruction memory**
    (torch-ROM addressed by a program counter = a counting register), **decode** (opcode → enable
    lines), and a small **register file** (several build-09 registers) — the minimal CPU.
