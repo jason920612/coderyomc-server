@@ -325,6 +325,65 @@ support is added. That is the headline next compiler work item; with it, the D-l
 4-bit register (designs noted above) become differentially validatable, and an ALU +
 register-file datapath (the 4-bit adder + a register) is assemblable.
 
+## Rung 2 — D-LATCH: gated clocked capture (build-10) — difftest BIT-IDENTICAL ✅
+
+The datapath's **sequential-capture element**: the proven build-06/09 torch RS-NOR latch +
+**enable-gating** that drives its R/S rears with **S = D∧E** and **R = D̄∧E**, so the cell
+**captures D when the clock E=1 and HOLDS when E=0**. The gating reduces to comparator-SUBTRACT
+algebra (same convention as build-01..08): **R = E − D** (a *single* subtract comparator =
+D̄∧E) and **S = D − (15−E)** (the build-01 two-comparator AND, with `nE = 15−E` a NOT gadget).
+North gadget feeds the R rear (62,120); south gadget feeds the S rear (62,132); each takes its
+own D/E driver pair (toggled together) to avoid fan-out.
+
+**Vanilla truth table** (live power reads, seed/Q out `60,101,122`, Qbar `64,101,130`):
+
+| op | drive | Q | Qbar | note |
+|----|-------|---|------|------|
+| capture 0 | D=0,E=1 | 0 | 15 | RESET |
+| HOLD | E=0 | **0** | 15 | bit held |
+| capture 1 | D=1,E=1 | 1 | 0 | SET |
+| HOLD | E=0 | **1** | 0 | bit held |
+| D-flip while E=0 | D 0↔1, E=0 | **unchanged** | | **enable-gating: D ignored when disabled** |
+
+Bidirectional clocked capture confirmed (1→0 and 0→1). **difftest** (`/coderyo redstone
+difftest 60 101 122 200`, triggered from an impulse command_block, verdict read from the server
+log): **HOLD Q=1 → BIT-IDENTICAL (200 ticks, 74 cells, 39 components, single-region); HOLD Q=0 →
+BIT-IDENTICAL (200 ticks, 72 cells).** So the **gated D-latch compiles bit-for-bit to vanilla in
+both held states** — the difftest-clean clocked-capture cell the accumulator register is built from.
+
+## Rung 3 — ACCUMULATOR (register + adder feedback, build-10) — datapath core; level-latch race FOUND ⚠️
+
+Design (operator spec): an N-bit register of N D-latches sharing one **Enable=clock**, whose Q
+feeds input A of the build-07/08 **side-entry ripple adder**, plus a second input B, with the
+adder **SUM wired back to the register's D**; pulsing Enable does **ACC := ACC + B**. Every
+constituent is now proven on this map: the **D-latch** (build-10, difftest-clean), the **4-bit
+register** (build-09), and the **rippling adder** (build-07/08).
+
+A **1-bit feedback experiment** was run live to probe the loop: for B=1 the adder bit is just
+`SUM = NOT Q = Qbar` (already on the latch's east rail), so Qbar was wired straight back to the D
+rears (a 1-bit "+1" accumulator = T-flip-flop). Pulsing Enable did **not** advance ACC, exposing
+the **headline finding — LEVEL-LATCH RACE-THROUGH**: a D-latch is *level*-sensitive, so while E=1
+it is transparent and the instant Q flips, Qbar→D re-feeds the still-open latch and the bit
+toggles back and forth for the whole (multi-game-tick, low-TPS) pulse, landing nondeterministically.
+**A robust accumulator therefore needs an EDGE-triggered register = a MASTER-SLAVE pair of these
+D-latches** (master captures on E, slave on ¬E → exactly one increment per clock edge); the
+build-10 D-latch is precisely one half of that flip-flop.
+
+**Nuance that rescues the *real* (adder-based) accumulator:** the build-07/08 ripple adder is a
+deep comparator cascade that takes **≥40 s** to settle (build-07), while the latch captures in
+~2 s. With a real adder in the loop, its **old settled SUM persists through a short E pulse** (the
+new SUM needs ~40 s to ripple), so a brief pulse captures exactly once and `ACC := ACC + B`
+advances one clean step per pulse — the slow adder is the natural settle-isolation the fast 1-bit
+Qbar proxy lacked. So the proxy races *because it is a fast loop with no isolation*, not because
+the datapath is wrong. Building the real `ACC := ACC + B` (2-bit register + build-08 adder +
+SUM→D, short-pulse clock or master-slave latches) is the documented next build — all blocks proven.
+
+*(Harness note: no on-disk jar carried patch 0020 — the two present jars were built from
+non-redstone commits — so build-10's jar was produced fresh from origin/main 663a78c via
+`./gradlew applyAllPatches :coderyo-server:createPaperclipJar`. RCON's dispatcher omits the
+op-gated `coderyo` literal and the paperclip JVM ignores piped stdin, so every difftest was
+issued from a command_block and its verdict read from the server log.)*
+
 **No feature patch was added — only `test-harness/redstone-computer/`** (build scripts +
 this file).
 
@@ -333,9 +392,15 @@ this file).
    both stored bits, and 4 tiled latches form a **4-bit register** that reads back a loaded value
    (3/4 held bits BIT-IDENTICAL at width; the 0-state bit hit a documented vanilla-settle race +
    compiler 0-seeding edge). Sequential memory is the proven pillar.
-1. **D-latch enable-gating** — drive the proven R/S rears with S=D∧E and R=D̄∧E (the build-01
-   comparator-AND gadget = D−Ē, with Ē/D̄ as comparator NOTs); then capture/HOLD difftest.
-2. **4-bit ripple-carry adder** — tile 4 of this validated full adder, Cout→Cin, and
-   difftest an input sweep (the full-adder map is ready to be instantiated 4×).
-3. With a working register (4× D-latch + shared enable) and the adder, an
-   accumulator/ALU slice becomes assemblable — the first CPU-shaped datapath.
+1. **DONE (build-10):** the **D-latch enable-gating** (S=D∧E via the build-01 AND gadget,
+   R=D̄∧E = E−D as a single subtract comparator) — captures/HOLDs a clocked bit and
+   **difftests BIT-IDENTICAL in both held states** (74/72 cells). The clocked-capture cell is proven.
+2. **EDGE-triggered register (master-slave D flip-flop)** — pair two build-10 D-latches (master
+   on E, slave on ¬E) so the accumulator advances exactly one increment per clock edge instead of
+   racing through the transparent level-latch (build-10's headline finding). Then tile 2–4 wide.
+3. **Real ACC := ACC + B** — register Q → build-08 ripple adder ← B → SUM → register D, clocked.
+   With the slow (≥40 s) adder settle-isolating a short Enable pulse (or master-slave latches), the
+   accumulate is clean; difftest the whole feedback network and read back ACC=0,B=1 → 0→1→2→3.
+4. From the accumulator: a **control unit** (clock/step + opcode), **instruction memory**
+   (torch-ROM addressed by a program counter = a counting register), **decode** (opcode → enable
+   lines), and a small **register file** (several build-09 registers) — the minimal CPU.

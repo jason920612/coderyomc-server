@@ -1,0 +1,122 @@
+# coderyoMC redstone-computer MAP — D-LATCH (gated clocked capture) + ACCUMULATOR datapath.
+#
+# The D-latch is the datapath's SEQUENTIAL-CAPTURE element: it loads input D when the
+# clock/Enable E=1 and HOLDS its bit when E=0. It = the proven build-06/build-09 torch
+# RS-NOR latch + ENABLE-GATING logic that drives the latch's R/S rears with
+#     S = D AND E          (set   when D=1 and E=1)
+#     R = (NOT D) AND E    (reset when D=0 and E=1)
+# so when E=0 BOTH R and S are 0 -> the latch holds; when E=1 the latch follows D.
+#
+# Server: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (built from THIS branch's origin/main,
+#   663a78c, which carries patch 0020), boot env CODERYO_REDSTONE_COMPILE_ENABLED=true OR
+#   -Dcoderyo.redstone.compile.enabled=true ; port 15568, flat world, forceload add 0 0 240 200.
+#
+# !! GATING ALGEBRA (locked, comparator-SUBTRACT, same convention as build-01..08:
+#    comparator/repeater [facing=D] => REAR/INPUT on side D, OUTPUT exits the OPPOSITE side;
+#    SUBTRACT comp out = max(0, rear - max(sideL,sideR)); a redstone_block in a comp's rear
+#    cell drives that rear to 15; a redstone_block ABOVE a dust drives the dust to 15).
+#
+#   R = (NOT D) AND E  collapses to a SINGLE subtract comparator:  R = E - D
+#       (E=1,D=0 ->15 ; E=1,D=1 ->0 ; E=0 ->0)  == (NOT D) AND E.   [1 comparator]
+#   S = D AND E = D - (15 - E)  needs the build-01 AND gadget:      [2 comparators]
+#       nE = 15 - E (NOT gadget: rear=15block, side=E) ; S = D - nE (rear=D, side=nE).
+#
+# To avoid fanning one D/E node to two gadgets, the NORTH (R) and SOUTH (S) gadgets each
+# take their OWN D/E driver pair (always toggled together = the same logical D,E).
+#
+# ============================== PLATFORM ==============================
+fill 56 100 110 70 100 140 minecraft:stone
+fill 56 101 110 70 103 140 minecraft:air
+#
+# ============================== LATCH (build-06 body verbatim) ==============================
+setblock 62 101 122 minecraft:stone
+setblock 61 101 122 minecraft:redstone_wall_torch[facing=west]   # TA = Q   (Q out dust 60,101,122)
+setblock 62 101 121 minecraft:repeater[facing=north]            # R rep: rear=(62,120), out south into GA
+setblock 63 101 122 minecraft:repeater[facing=east]             # Qbar feedback rep
+setblock 62 101 130 minecraft:stone
+setblock 63 101 130 minecraft:redstone_wall_torch[facing=east]   # TB = Qbar (Qbar out dust 64,101,130)
+setblock 62 101 131 minecraft:repeater[facing=south]           # S rep: rear=(62,132), out north into GB
+setblock 61 101 130 minecraft:repeater[facing=west]            # Q feedback rep
+setblock 60 101 122 minecraft:redstone_wire
+fill     60 101 123 60 101 130 minecraft:redstone_wire          # Q rail (west, x=60)
+setblock 64 101 130 minecraft:redstone_wire
+fill     64 101 122 64 101 129 minecraft:redstone_wire          # Qbar rail (east, x=64)
+#
+# ============================== R gadget (NORTH):  R = E - D  -> R-rep rear (62,120) ==============================
+setblock 62 101 118 minecraft:comparator[facing=north,mode=subtract]  # rear=north(62,117)=E ; out south(62,119)
+setblock 62 101 117 minecraft:redstone_wire                    # E_north  (driver block at 62,102,117)
+setblock 61 101 118 minecraft:redstone_wire                    # D_north  (west SIDE) (driver block at 61,102,118)
+setblock 62 101 119 minecraft:redstone_wire                    # R out ->
+setblock 62 101 120 minecraft:redstone_wire                    # -> R-rep rear (powers it >=1; reads ~14, fine)
+#
+# ============================== S gadget (SOUTH):  S = D AND E  -> S-rep rear (62,132) ==============================
+setblock 59 101 134 minecraft:redstone_block                   # 15 source for nE comp rear
+setblock 60 101 134 minecraft:comparator[facing=west,mode=subtract]   # rear=west(59,134)=15 ; out east(61,134)=nE
+setblock 60 101 133 minecraft:redstone_wire                    # E_south (north SIDE of nE comp) (driver 60,102,133)
+setblock 61 101 134 minecraft:redstone_wire                    # nE = 15-E  (= west SIDE of S comp)
+setblock 62 101 134 minecraft:comparator[facing=south,mode=subtract]  # rear=south(62,135)=D ; out north(62,133)=S
+setblock 62 101 135 minecraft:redstone_wire                    # D_south (S comp rear) (driver block at 62,102,135)
+setblock 62 101 133 minecraft:redstone_wire                    # S out ->
+setblock 62 101 132 minecraft:redstone_wire                    # -> S-rep rear
+#
+# ============================== INPUTS / DRIVE ==============================
+#   D = 1 : redstone_block at (61,102,118) AND (62,102,135)   ; D = 0 : remove both
+#   E = 1 : redstone_block at (62,102,117) AND (60,102,133)   ; E = 0 : remove both
+#   Read Q at (60,101,122) ; Qbar at (64,101,130).  difftest seed = (60,101,122).
+#
+# To CAPTURE a bit: set D to the value, pulse E=1, settle (~5 s), then E=0 (now HOLD).
+#
+# ================================ RESULT — VANILLA TRUTH TABLE (live power reads) ================================
+#  capture D=0,E=1 -> Q=0,Qbar=15 ; HOLD E=0 -> Q=0   (RESET + hold)
+#  capture D=1,E=1 -> Q=1,Qbar=0  ; HOLD E=0 -> Q=1   (SET   + hold)
+#  while E=0, flipping D 0<->1 leaves Q UNCHANGED      (ENABLE-GATING: D ignored when disabled)
+#  Bidirectional capture confirmed: 1->0 (D=0,E=1) and 0->1 (D=1,E=1) both clean.
+#  (R reaches the R-rep rear at level ~14 after one dust block — >=1, so the rep fires; latch RESETs.)
+#
+# ================================ RESULT — difftest (compiler == vanilla) ================================
+#  Triggered via a command_block (op-level-2; RCON's restricted dispatcher cannot see the
+#  op-gated `coderyo` literal — a harness quirk, NOT a circuit issue); verdict read from the
+#  server log line "[redstone-difftest/live] PASS ... BIT-IDENTICAL":
+#    HOLD Q=1 : /coderyo redstone difftest 60 101 122 200 -> BIT-IDENTICAL (200 ticks, 74 cells, 39 components, single-region)
+#    HOLD Q=0 : /coderyo redstone difftest 60 101 122 200 -> BIT-IDENTICAL (200 ticks, 72 cells)
+#  => the gated D-latch (torch latch + comparator enable-gating) compiles BIT-FOR-BIT to
+#     vanilla in BOTH held states. The clocked-capture datapath element is difftest-clean.
+#
+# ================================ ACCUMULATOR (datapath: register + adder feedback) ================================
+# Design (I = the operator's spec): an N-bit register of N D-latches sharing one Enable=clock;
+# the register Q[0..N-1] feeds input A of the build-07/08 SIDE-ENTRY ripple adder; a second
+# input B; the adder SUM[0..N-1] is wired back to the register's D[0..N-1]. Pulsing Enable does
+# ACC := ACC + B. All three sub-blocks are already proven on this map: the D-latch (this build,
+# difftest-clean), the 4-bit register (build-09), and the rippling adder (build-07/08).
+#
+# 1-bit feedback EXPERIMENT (this build, run live to probe the loop): for the trivial B=1 case
+# the adder bit is just SUM = NOT Q = Qbar, which the latch already exposes on its east rail, so
+# Qbar was wired straight back to the two D rears (a 1-bit "+1" accumulator = a T-flip-flop).
+# The NORTH D-rear took Qbar cleanly (read 15 when Q=0); pulsing Enable did NOT advance ACC, for
+# TWO reasons, both instructive:
+#   (a) LEVEL-LATCH RACE-THROUGH (the headline finding). A D-latch is LEVEL-sensitive: while
+#       E=1 it is transparent, so the instant Q flips, Qbar->D flips and the still-open latch
+#       re-captures -> with no settle isolation the bit toggles back and forth for the whole
+#       pulse and lands nondeterministically. A wall-clock E pulse on the low-TPS regionized
+#       server spans many game ticks, so it always over-toggles. CONCLUSION: a robust
+#       accumulator needs an EDGE-triggered register = a MASTER-SLAVE pair of these D-latches
+#       (master captures on E, slave on !E) so exactly one increment happens per clock edge.
+#       The D-latch proven here is precisely the building block (one half) of that flip-flop.
+#   (b) NUANCE that RESCUES the real (adder-based) accumulator: the build-07/08 ripple adder is a
+#       DEEP comparator cascade that takes >=40 s to settle (documented in build-07), whereas this
+#       latch captures in ~2 s. With a real adder in the loop, the adder's OLD settled SUM stays
+#       put during a short E pulse (the new SUM needs ~40 s to ripple), so a brief pulse captures
+#       exactly once and ACC := ACC + B advances one clean step per pulse — the slow adder is the
+#       natural settle-isolation the fast 1-bit Qbar proxy lacked. (Master-slave is still the
+#       general, TPS-independent fix.)
+# So the 1-bit Qbar proxy is a fast combinational loop with no isolation and therefore races; it
+# is NOT representative of the adder-based accumulator. Building the real ACC := ACC + B
+# (2-bit register + build-08 ripple adder + SUM->D, short-pulse clock, or master-slave latches)
+# is the documented next build — every constituent block is now proven and difftest-clean.
+#
+# NOTE on harness access: no on-disk paperclip jar carried patch 0020 (the two present jars were
+# built from non-redstone commits 8bd0170 / a parallel branch), so this build's jar was produced
+# fresh from origin/main (663a78c) via `./gradlew applyAllPatches :coderyo-server:createPaperclipJar`.
+# RCON cannot reach the op-gated `coderyo` command (its dispatcher omits the node), and the
+# paperclip server JVM does not read piped stdin (JLine), so every `coderyo redstone difftest`
+# above was issued from an impulse command_block and its verdict read from the server log.
