@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc90749d870b1
+index 0000000000000000000000000000000000000000..0f2f56bb8ef6c9dd175ebc20d6389146d406227f
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,660 @@
+@@ -0,0 +1,714 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -36,10 +36,12 @@ index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc907
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.ComparatorBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
 +import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.TargetBlock;
 +import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
 +import net.minecraft.world.level.block.state.BlockState;
 +import net.minecraft.world.level.block.state.properties.BlockStateProperties;
@@ -77,7 +79,7 @@ index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc907
 + */
 +final class CompiledNetwork {
 +
-+    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP }
++    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP, BUTTON, TARGET }
 +
 +    /** Mirrors {@code TickPriority} ordinals: lower drains earlier. */
 +    private static final int P_EXTREMELY_HIGH = -3;
@@ -102,6 +104,8 @@ index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc907
 +    private final LongSet comparators = new LongOpenHashSet();
 +    private final LongSet observers = new LongOpenHashSet();
 +    private final LongSet lamps = new LongOpenHashSet();
++    private final LongSet buttons = new LongOpenHashSet();
++    private final LongSet targets = new LongOpenHashSet();
 +
 +    /** The last observed {@link BlockState} of each observer's FACING target (change detector). */
 +    private final Long2ObjectMap<BlockState> lastObserved = new Long2ObjectOpenHashMap<>();
@@ -150,6 +154,10 @@ index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc907
 +                c.observers.add(packed);
 +            } else if (state.getBlock() instanceof RedstoneLampBlock) {
 +                c.lamps.add(packed);
++            } else if (state.getBlock() instanceof ButtonBlock) {
++                c.buttons.add(packed);
++            } else if (state.getBlock() instanceof TargetBlock) {
++                c.targets.add(packed);
 +            }
 +        }
 +        // Auxiliary external inputs that live OUTSIDE the redstone footprint: a comparator's
@@ -199,6 +207,28 @@ index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc907
 +        this.vw.set(pos, state);
 +    }
 +
++    /**
++     * Press a button (I/O input source): set its POWERED state into the grid and schedule
++     * the self-timed un-press exactly like {@code ButtonBlock.press} (which calls
++     * {@code scheduleTick(pos, this, ticksToStayPressed)} — 20 ticks stone / 30 wood). The
++     * un-press lands on {@code nowRel + ticks}, matching the real button's scheduled tick.
++     */
++    void pressButton(final BlockPos pos, final BlockState pressed, final int ticks, final long nowRel) {
++        this.vw.set(pos, pressed);
++        this.schedule(pos.asLong(), Kind.BUTTON, ticks, P_NORMAL, nowRel);
++    }
++
++    /**
++     * Apply a target-block hit (analog I/O input source): set its OUTPUT_POWER (BlockState
++     * POWER, 0-15) into the grid and schedule the decay-to-zero exactly like
++     * {@code TargetBlock.setOutputPower} ({@code scheduleTick(pos, this, duration)} —
++     * 20 ticks for arrows / 8 for other projectiles).
++     */
++    void hitTarget(final BlockPos pos, final BlockState hit, final int duration, final long nowRel) {
++        this.vw.set(pos, hit);
++        this.schedule(pos.asLong(), Kind.TARGET, duration, P_NORMAL, nowRel);
++    }
++
 +    // ----------------------------------------------------------------- stepping
 +
 +    /** Advance the compiled model by exactly one game tick. */
@@ -236,6 +266,8 @@ index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc907
 +            case COMPARATOR -> this.runComparator(e.pos());
 +            case OBSERVER -> this.runObserver(e.pos());
 +            case LAMP -> this.runLamp(e.pos());
++            case BUTTON -> this.runButton(e.pos());
++            case TARGET -> this.runTarget(e.pos());
 +        }
 +    }
 +
@@ -650,6 +682,28 @@ index 0000000000000000000000000000000000000000..20c800fccb7614a8a7c8810b8a8fc907
 +        }
 +    }
 +
++    // ---------------------------------------------------------------- button
++
++    // Transcribed from ButtonBlock.tick -> checkPressed: with no arrow present the button
++    // un-presses (POWERED -> false) when its scheduled tick fires.
++    private void runButton(final long pos) {
++        final BlockState state = this.state(pos);
++        if (state.getValue(BlockStateProperties.POWERED)) {
++            this.vw.set(pos, state.setValue(BlockStateProperties.POWERED, false));
++        }
++    }
++
++    // ---------------------------------------------------------------- target
++
++    // Transcribed from TargetBlock.tick: the analog OUTPUT_POWER decays back to 0 when the
++    // scheduled tick fires.
++    private void runTarget(final long pos) {
++        final BlockState state = this.state(pos);
++        if (state.getValue(BlockStateProperties.POWER) != 0) {
++            this.vw.set(pos, state.setValue(BlockStateProperties.POWER, 0));
++        }
++    }
++
 +    // -------------------------------------------------------------- scheduling
 +
 +    private boolean willTick(final long pos, final Kind kind) {
@@ -768,10 +822,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633d83a1b43
+index 0000000000000000000000000000000000000000..50c29a593423dddda78f0fdd7bb3d9e3ea038aa4
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,638 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -790,9 +844,11 @@ index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.ComparatorBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.TargetBlock;
 +import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
 +import net.minecraft.world.level.block.state.BlockState;
 +import net.minecraft.world.level.block.state.properties.AttachFace;
@@ -843,8 +899,8 @@ index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633
 +            case PHASE_WAIT -> {
 +                if (!forced) {
 +                    forced = true;
-+                    for (int cx = -1; cx <= 3; cx++) {
-+                        for (int cz = -1; cz <= 1; cz++) {
++                    for (int cx = -1; cx <= 5; cx++) {
++                        for (int cz = -1; cz <= 3; cz++) {
 +                            level.setChunkForced(cx, cz, true);
 +                        }
 +                    }
@@ -883,9 +939,11 @@ index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633
 +    }
 +
 +    private static boolean areaLoaded(final ServerLevel level) {
-+        for (int cx = 0; cx <= 3; cx++) {
-+            if (!level.getChunkSource().hasChunk(cx, 0)) {
-+                return false;
++        for (int cx = 0; cx <= 5; cx++) {
++            for (int cz = 0; cz <= 3; cz++) {
++                if (!level.getChunkSource().hasChunk(cx, cz)) {
++                    return false;
++                }
 +            }
 +            if (!level.getChunkSource().hasChunk(cx, -1)) {
 +                return false;
@@ -934,6 +992,20 @@ index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633
 +    private static final BlockState LAMP = Blocks.REDSTONE_LAMP.defaultBlockState();
 +    private static final BlockState OBS_W =
 +        Blocks.OBSERVER.defaultBlockState().setValue(BlockStateProperties.FACING, Direction.WEST);
++    private static final BlockState REPEATER_E =
++        Blocks.REPEATER.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST);
++    /** Wall lever attached (on its EAST face) to the block immediately to its east. */
++    private static final BlockState LEVER_W_OFF = Blocks.LEVER.defaultBlockState()
++        .setValue(BlockStateProperties.ATTACH_FACE, AttachFace.WALL)
++        .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.WEST)
++        .setValue(BlockStateProperties.POWERED, false);
++    /** Floor-mounted stone button (strongly powers the support block below; 20-tick stay). */
++    private static final BlockState STONE_BUTTON_OFF = Blocks.STONE_BUTTON.defaultBlockState()
++        .setValue(BlockStateProperties.ATTACH_FACE, AttachFace.FLOOR)
++        .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.NORTH)
++        .setValue(BlockStateProperties.POWERED, false);
++    private static final int STONE_BUTTON_TICKS = 20;  // vanilla BlockSetType.STONE
++    private static final BlockState TARGET = Blocks.TARGET.defaultBlockState();
 +
 +    private static void put(final ServerLevel level, final int x, final int y, final int z, final BlockState state) {
 +        level.setBlockAndUpdate(new BlockPos(x, y, z), state);
@@ -1069,7 +1141,161 @@ index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633
 +                setBoth(lvl, c, new BlockPos(51, 101, 15), stone ? AIR : STONE);
 +            }
 +        }));
++
++        // =================================================================
++        //  POWER-CARRYING-BLOCK COMPLETENESS (the classic redstone-sim trap)
++        // =================================================================
++
++        // ---- Circuit 8: power relayed THROUGH a solid block ----
++        // A repeater STRONGLY charges the solid block it faces; redstone dust on the FAR
++        // side of that block reads the strong charge (15) — power relayed through a block
++        // that is itself a node on the network. Exercises detection of the charged conductor.
++        put(level, 70, 100, 18, STONE);
++        put(level, 70, 101, 18, WIRE);             // repeater rear-input wire (west)
++        put(level, 71, 100, 18, STONE);
++        put(level, 71, 101, 18, REPEATER_E);       // repeater faces EAST -> charges block @72
++        put(level, 72, 100, 18, STONE);
++        put(level, 72, 101, 18, STONE);            // SOLID block strongly charged by repeater
++        put(level, 73, 100, 18, STONE);
++        put(level, 73, 101, 18, WIRE);             // far-side dust reads the charged block (15)
++        put(level, 74, 100, 18, STONE);
++        put(level, 74, 101, 18, WIRE);             // decays onward (14)
++        SCENARIOS.add(new Scenario("power-through-block", new BlockPos(71, 101, 18), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(69, 101, 18), REDBLOCK); // energise repeater rear
++            } else if (rel == 110) {
++                setBoth(lvl, c, new BlockPos(69, 101, 18), AIR);      // de-energise
++            }
++        }));
++
++        // ---- Circuit 9: redstone torch ATTACHED to a block, powering through/around it ----
++        // Floor torch sits on host block B (charged by a lever); the lit torch STRONGLY
++        // charges the block ABOVE it (-> top dust) and weakly powers the dust beside it.
++        // Charging B (the torch's host) inverts the torch, dropping both outputs. TWO
++        // power-carrying blocks: B below (lever->B->torch) and the block above (torch->dust).
++        put(level, 76, 100, 21, STONE);            // host block B (charged by lever)
++        put(level, 75, 100, 21, LEVER_W_OFF);      // wall lever attached to B's west face
++        put(level, 76, 101, 21, TORCH);            // floor torch on B
++        put(level, 76, 102, 21, STONE);            // block above torch (strongly charged when lit)
++        put(level, 76, 103, 21, WIRE);             // top dust reads the charged block above
++        put(level, 77, 100, 21, STONE);
++        put(level, 77, 101, 21, WIRE);             // side dust reads the torch weakly
++        SCENARIOS.add(new Scenario("torch-host-block", new BlockPos(76, 101, 21), (lvl, c, rel) -> {
++            if (rel == 40) {
++                setLeverS(lvl, c, LEVER_W_OFF, new BlockPos(75, 100, 21), new BlockPos(76, 100, 21), true);
++            } else if (rel == 120) {
++                setLeverS(lvl, c, LEVER_W_OFF, new BlockPos(75, 100, 21), new BlockPos(76, 100, 21), false);
++            }
++        }));
++
++        // ---- Circuit 10: a COMPONENT sitting on a block that is itself being charged ----
++        // A lever STRONGLY charges block B; redstone dust sitting ON TOP of B reads the
++        // support block's charge (15) and relays it to a redstone lamp. Proves the SUPPORT
++        // block a component sits on carries signal and is detected as a net node.
++        put(level, 80, 100, 24, STONE);            // charged support block B
++        put(level, 79, 100, 24, LEVER_W_OFF);      // wall lever attached to B's west face
++        put(level, 80, 101, 24, WIRE);             // dust ON TOP of charged B (reads it)
++        put(level, 81, 100, 24, STONE);
++        put(level, 81, 101, 24, WIRE);             // relay dust
++        put(level, 82, 100, 24, STONE);
++        put(level, 82, 101, 24, LAMP);             // display load
++        SCENARIOS.add(new Scenario("component-on-charged-block", new BlockPos(80, 101, 24), (lvl, c, rel) -> {
++            if (rel == 35) {
++                setLeverS(lvl, c, LEVER_W_OFF, new BlockPos(79, 100, 24), new BlockPos(80, 100, 24), true);
++            } else if (rel == 110) {
++                setLeverS(lvl, c, LEVER_W_OFF, new BlockPos(79, 100, 24), new BlockPos(80, 100, 24), false);
++            }
++        }));
++
++        // =================================================================
++        //  SIMPLE I/O COMPONENTS (inputs / display for the eventual computer)
++        // =================================================================
++
++        // ---- Circuit 11: stone BUTTON (10/20-tick pulse) -> wire -> lamp ----
++        // Floor stone button strongly charges its support and weakly powers adjacent dust;
++        // vanilla un-presses after exactly 20 ticks (BlockSetType.STONE). Exercises the
++        // self-timed pulse source against a lamp display.
++        put(level, 60, 100, 27, STONE);            // button support
++        put(level, 60, 101, 27, STONE_BUTTON_OFF); // floor stone button
++        put(level, 61, 100, 27, STONE);
++        put(level, 61, 101, 27, WIRE);             // dust reads button weakly
++        put(level, 62, 100, 27, STONE);
++        put(level, 62, 101, 27, LAMP);             // display load
++        SCENARIOS.add(new Scenario("button-pulse", new BlockPos(60, 101, 27), (lvl, c, rel) -> {
++            if (rel == 30 || rel == 120) {
++                pressButton(lvl, c, new BlockPos(60, 101, 27), STONE_BUTTON_TICKS, rel);
++            }
++        }));
++
++        // ---- Circuit 12: TARGET block analog output (hit -> decay) ----
++        // A "hit" sets the target's analog OUTPUT_POWER (0-15) and vanilla decays it to 0
++        // after a fixed duration (8 ticks non-arrow / 20 ticks arrow). Drives adjacent dust
++        // at the hit strength; exercises an analog input source + scheduled decay.
++        put(level, 65, 100, 30, STONE);
++        put(level, 65, 101, 30, TARGET);           // analog source
++        put(level, 66, 100, 30, STONE);
++        put(level, 66, 101, 30, WIRE);             // reads target weakly
++        put(level, 67, 100, 30, STONE);
++        put(level, 67, 101, 30, WIRE);
++        SCENARIOS.add(new Scenario("target-analog", new BlockPos(65, 101, 30), (lvl, c, rel) -> {
++            if (rel == 30) {
++                hitTarget(lvl, c, new BlockPos(65, 101, 30), 7, 8, rel);   // non-arrow: strength 7, 8t
++            } else if (rel == 90) {
++                hitTarget(lvl, c, new BlockPos(65, 101, 30), 13, 20, rel); // arrow: strength 13, 20t
++            }
++        }));
++
++        // =================================================================
++        //  FIRST ANALOG-TRACK CIRCUIT: comparator SUBTRACT as an analog ALU
++        // =================================================================
++
++        // ---- Circuit 13: analog subtractor sweep  out = max(0, rear - side) ----
++        // Both rear and side are driven by a movable redstone-block source placed on top of
++        // a graded wire trail, so each port can be set to ANY 0-15 strength (cell-N reads
++        // 15-N). Sweeping rear and side across the analog range and asserting the comparator
++        // analog output (block-entity, 0-15) bit-identical every tick validates the
++        // comparator-as-analog-ALU primitive end-to-end.
++        put(level, 60, 100, 34, STONE);
++        put(level, 60, 101, 34, COMP_SUB_W);       // comparator faces WEST (rear=east, side=N/S)
++        put(level, 59, 100, 34, STONE);
++        put(level, 59, 101, 34, WIRE);             // output wire (west)
++        for (int x = 61; x <= 74; x++) {           // rear trail (east): cell r=x-61 reads 15-r
++            put(level, x, 100, 34, STONE);
++            put(level, x, 101, 34, WIRE);
++        }
++        for (int z = 35; z <= 48; z++) {           // side trail (south): cell s=z-35 reads 15-s
++            put(level, 60, 100, z, STONE);
++            put(level, 60, 101, z, WIRE);
++        }
++        SCENARIOS.add(new Scenario("analog-subtractor-sweep", new BlockPos(60, 101, 34), (lvl, c, rel) -> {
++            if (rel < 24 || (rel - 24) % 14 != 0) {
++                return;
++            }
++            final int i = (rel - 24) / 14;
++            if (i >= ANALOG_STEPS.length) {
++                return;
++            }
++            // Clear every source position, then place this step's rear + side sources.
++            for (int x = 61; x <= 74; x++) {
++                setBoth(lvl, c, new BlockPos(x, 102, 34), AIR);
++            }
++            for (int z = 35; z <= 48; z++) {
++                setBoth(lvl, c, new BlockPos(60, 102, z), AIR);
++            }
++            final int rearV = ANALOG_STEPS[i][0];
++            final int sideW = ANALOG_STEPS[i][1];
++            setBoth(lvl, c, new BlockPos(61 + (15 - rearV), 102, 34), REDBLOCK);
++            if (sideW > 0) {
++                setBoth(lvl, c, new BlockPos(60, 102, 35 + (15 - sideW)), REDBLOCK);
++            }
++        }));
 +    }
++
++    /** (rear, side) strength pairs swept across the analog range for the subtractor. */
++    private static final int[][] ANALOG_STEPS = {
++        {15, 0}, {15, 4}, {15, 8}, {15, 12}, {12, 0}, {12, 6}, {10, 0},
++        {10, 5}, {10, 10}, {8, 2}, {6, 0}, {6, 3}, {4, 0}, {3, 1},
++    };
 +
 +    /** Fill several slots of a barrel so its comparator (analog) output is a stable mid value. */
 +    private static void fillBarrel(final ServerLevel level, final BlockPos pos) {
@@ -1093,6 +1319,41 @@ index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633
 +        level.setBlockAndUpdate(leverPos, state);
 +        level.updateNeighborsAt(supportPos, Blocks.LEVER, null);
 +        c.setSource(leverPos, state);
++    }
++
++    /** Toggle a wall lever (given base orientation) in both worlds; notify its support block. */
++    private static void setLeverS(final ServerLevel level, final CompiledNetwork c, final BlockState base,
++                                  final BlockPos leverPos, final BlockPos supportPos, final boolean on) {
++        final BlockState state = base.setValue(BlockStateProperties.POWERED, on);
++        level.setBlockAndUpdate(leverPos, state);
++        level.updateNeighborsAt(supportPos, Blocks.LEVER, null);
++        c.setSource(leverPos, state);
++    }
++
++    /**
++     * Press a button in BOTH worlds: the real one via {@code ButtonBlock.press} (which sets
++     * POWERED, notifies neighbours and schedules its own {@code ticksToStayPressed} un-press),
++     * and the compiled model via {@link CompiledNetwork#pressButton} with the same duration.
++     */
++    private static void pressButton(final ServerLevel level, final CompiledNetwork c,
++                                    final BlockPos pos, final int ticks, final int rel) {
++        final BlockState cur = level.getBlockState(pos);
++        if (cur.getBlock() instanceof ButtonBlock btn && !cur.getValue(BlockStateProperties.POWERED)) {
++            btn.press(cur, level, pos, null);
++            c.pressButton(pos, cur.setValue(BlockStateProperties.POWERED, true), ticks, rel);
++        }
++    }
++
++    /**
++     * Apply a target-block hit in BOTH worlds: set the analog OUTPUT_POWER (BlockState POWER)
++     * and schedule the decay-to-zero, mirroring {@code TargetBlock.setOutputPower}.
++     */
++    private static void hitTarget(final ServerLevel level, final CompiledNetwork c,
++                                  final BlockPos pos, final int power, final int duration, final int rel) {
++        final BlockState on = level.getBlockState(pos).setValue(BlockStateProperties.POWER, power);
++        level.setBlockAndUpdate(pos, on);
++        level.scheduleTick(pos, on.getBlock(), duration);
++        c.hitTarget(pos, on, duration, rel);
 +    }
 +
 +    // -------------------------------------------------------------- scenario
@@ -1195,15 +1456,20 @@ index 0000000000000000000000000000000000000000..17cc36b183a987db18992d2f34f0f633
 +            final boolean s = sim.getValue(BlockStateProperties.LIT);
 +            return r == s ? null : pos.toShortString() + " LIT real=" + r + " sim=" + s;
 +        }
++        if (real.getBlock() instanceof ButtonBlock) {
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            return r == s ? null : pos.toShortString() + " POWERED real=" + r + " sim=" + s;
++        }
 +        return null;
 +    }
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..438ee7c432d2b30db1e358fab344e20f7239595e
+index 0000000000000000000000000000000000000000..aaed5bd7c97e787cee9d7a5bbbdf27869419608e
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,189 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -1220,11 +1486,13 @@ index 0000000000000000000000000000000000000000..438ee7c432d2b30db1e358fab344e20f
 +import net.minecraft.server.level.ServerLevel;
 +import net.minecraft.world.level.Level;
 +import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
 +import net.minecraft.world.level.block.LeverBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.TargetBlock;
 +import net.minecraft.world.level.ChunkPos;
 +import net.minecraft.world.level.block.state.BlockState;
 +
@@ -1289,6 +1557,8 @@ index 0000000000000000000000000000000000000000..438ee7c432d2b30db1e358fab344e20f
 +            || state.getBlock() instanceof DiodeBlock
 +            || state.getBlock() instanceof ObserverBlock
 +            || state.getBlock() instanceof LeverBlock
++            || state.getBlock() instanceof ButtonBlock
++            || state.getBlock() instanceof TargetBlock
 +            || state.is(Blocks.REDSTONE_BLOCK);
 +    }
 +
