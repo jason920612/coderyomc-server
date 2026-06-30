@@ -1,0 +1,924 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 30 Jun 2026 13:22:47 +0800
+Subject: [PATCH] =?UTF-8?q?pathfinding=20L3:=20shared=20per-goal=20flow-fi?=
+ =?UTF-8?q?eld=20A*=20elision=20(flag-gated,=20A*=20fallback)=20=E2=80=94?=
+ =?UTF-8?q?=20N=20A*=20->=201=20Dijkstra=20field=20+=20gradient=20descent?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+
+diff --git a/com/coderyo/pathfinding/flowfield/FlowField.java b/com/coderyo/pathfinding/flowfield/FlowField.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3fe5a0f3fe77ed11033fd0ae0c0192bf75009801
+--- /dev/null
++++ b/com/coderyo/pathfinding/flowfield/FlowField.java
+@@ -0,0 +1,380 @@
++/*
++ * coderyoMC — pathfinding A* elision (L3: shared per-goal FLOW-FIELD).
++ *
++ * The integration (distance) field itself: ONE Dijkstra outward from a goal over the local
++ * walkable grid, plus a per-mob gradient-descent that reads the field to synthesize a Path. Built
++ * once per (goal, mob-shape) group and reused by every grouped mob for a few ticks — the N A* ->
++ * 1 field win (design §2.4). Walkability mirrors L1 / WalkNodeEvaluator's notion of a plainly
++ * walkable cell so the field's passable set is a conservative subset of A*'s; anything outside it
++ * (the descent hits a wall / local minimum / the mob is off-field) returns null -> the caller runs
++ * the real A* (design §8: "any mob the field would push into a wall ... must fall back").
++ */
++package com.coderyo.pathfinding.flowfield;
++
++import com.google.common.collect.Lists;
++import java.util.List;
++import java.util.PriorityQueue;
++import net.minecraft.core.BlockPos;
++import net.minecraft.util.Mth;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.pathfinder.Node;
++import net.minecraft.world.level.pathfinder.Path;
++import net.minecraft.world.level.pathfinder.PathType;
++import net.minecraft.world.level.pathfinder.PathfindingContext;
++import net.minecraft.world.level.pathfinder.WalkNodeEvaluator;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * A single shared distance/integration field anchored at a goal cell.
++ *
++ * <p><b>Build</b> ({@link #build}) runs ONE Dijkstra from the goal's standable surface over a
++ * bounded XZ window, expanding to the 8 neighbours of each column when the neighbour has a
++ * {@link PathType#WALKABLE plainly-walkable} surface within the mob's step-up / 1-block-drop
++ * envelope and a clear body corridor (the exact predicate L1 uses), with diagonal moves gated on
++ * both orthogonal neighbours being walkable (no corner-cutting through walls). The result is a cost
++ * grid: {@code cost[cell]} = approximate walk-distance from that cell to the goal.
++ *
++ * <p><b>Follow</b> ({@link #descend}) is O(path): from the mob's cell, repeatedly step to the
++ * lowest-cost in-field neighbour (gradient descent) until the goal cell (reached) or a local
++ * minimum (partial progress), synthesizing a {@link Path} the navigation follows exactly like an
++ * A* path. PathFinder is never touched.
++ *
++ * <p><b>Concurrency.</b> A {@code FlowField} is created and consumed entirely on ONE region-worker
++ * thread (it lives in a {@link ThreadLocal} {@link FlowFieldRouter}); it holds no reference to any
++ * cross-thread mutable structure. World block-state reads are side-effect-free.
++ */
++public final class FlowField {
++
++    /** Cardinal step cost (scaled int; matches A*'s 1.0 unit ~= 10). */
++    private static final int COST_CARD = 10;
++    /** Diagonal step cost (scaled int; ~= 1.41). */
++    private static final int COST_DIAG = 14;
++    /** Unreached / wall sentinel. */
++    private static final int UNSET = Integer.MAX_VALUE;
++    /** Max drop (blocks) between adjacent columns — conservative, mirrors L1. */
++    private static final int MAX_DROP = 1;
++    /** Surface-Y sentinel for an unset column. */
++    private static final int NO_SURFACE = Integer.MIN_VALUE;
++    /** Memo sentinel: this column's surface has not been resolved yet (distinct from NO_SURFACE). */
++    private static final int UNKNOWN = Integer.MIN_VALUE + 1;
++
++    private final int side;
++    private final int originX;
++    private final int originZ;
++    private final int goalX;
++    private final int goalY;
++    private final int goalZ;
++    private final long buildTick;
++    private final int shapeBucket;
++    private final int[] cost;
++    private final int[] surfaceY;
++
++    private FlowField(final int side, final int originX, final int originZ, final int goalX, final int goalY,
++                      final int goalZ, final long buildTick, final int shapeBucket, final int[] cost, final int[] surfaceY) {
++        this.side = side;
++        this.originX = originX;
++        this.originZ = originZ;
++        this.goalX = goalX;
++        this.goalY = goalY;
++        this.goalZ = goalZ;
++        this.buildTick = buildTick;
++        this.shapeBucket = shapeBucket;
++        this.cost = cost;
++        this.surfaceY = surfaceY;
++    }
++
++    public long buildTick() {
++        return this.buildTick;
++    }
++
++    public int goalX() {
++        return this.goalX;
++    }
++
++    public int goalY() {
++        return this.goalY;
++    }
++
++    public int goalZ() {
++        return this.goalZ;
++    }
++
++    public int shapeBucket() {
++        return this.shapeBucket;
++    }
++
++    /**
++     * The pathfinding-relevant shape signature of a mob (step-up, body height). Same-signature mobs
++     * may share one field; different shapes get their own (a field built for a 1-block-step mob is
++     * not valid for a taller / higher-stepping one).
++     */
++    public static int shapeBucketOf(final Mob mob) {
++        final int stepUp = Math.max(1, Mth.floor(mob.maxUpStep()));
++        final int headCells = Math.max(1, Mth.ceil(mob.getBbHeight()));
++        final int widthCells = Math.max(1, Mth.ceil(mob.getBbWidth()));
++        return (widthCells & 0xFF) | ((headCells & 0xFF) << 8) | ((stepUp & 0xFF) << 16);
++    }
++
++    private int idx(final int x, final int z) {
++        final int lx = x - this.originX;
++        final int lz = z - this.originZ;
++        if (lx < 0 || lz < 0 || lx >= this.side || lz >= this.side) {
++            return -1;
++        }
++        return lx * this.side + lz;
++    }
++
++    /**
++     * Build a flow field from {@code goalPos} for a mob of the given shape. Returns {@code null} if
++     * the goal has no standable surface (nothing to integrate from) — caller falls back to A*.
++     */
++    public static @Nullable FlowField build(final Mob mob, final Level level, final BlockPos goalPos,
++                                            final int radius, final int maxCells, final int shapeBucket, final long tick) {
++        final PathfindingContext context = new PathfindingContext(level, mob);
++        final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
++        final int stepUp = Math.max(1, Mth.floor(mob.maxUpStep()));
++        final int headCells = Math.max(1, Mth.ceil(mob.getBbHeight()));
++
++        // Find the goal's standable surface (player feet may float a hair; scan a small envelope).
++        final int gSurface = findSurfaceY(mob, context, cursor, goalPos.getX(), goalPos.getZ(), goalPos.getY(), stepUp, 2, headCells);
++        if (gSurface == NO_SURFACE) {
++            return null;
++        }
++
++        final int side = 2 * radius + 1;
++        final int originX = goalPos.getX() - radius;
++        final int originZ = goalPos.getZ() - radius;
++        final int n = side * side;
++        final int[] cost = new int[n];
++        final int[] surfaceY = new int[n];
++        // Per-build column-surface memo: each column's standable surface is resolved at most ONCE
++        // (then re-validated against the step envelope on later approaches by a cheap int compare).
++        // Without this the Dijkstra flood re-probes every column ~12x per neighbour-visit (block
++        // path-type + body-corridor reads) and the build cost dwarfs the A* it replaces. (UNKNOWN
++        // sentinel is distinct from NO_SURFACE so a known-wall is cached too.)
++        final int[] colSurf = new int[n];
++        java.util.Arrays.fill(cost, UNSET);
++        java.util.Arrays.fill(surfaceY, NO_SURFACE);
++        java.util.Arrays.fill(colSurf, UNKNOWN);
++
++        final FlowField field = new FlowField(side, originX, originZ, goalPos.getX(), gSurface, goalPos.getZ(),
++            tick, shapeBucket, cost, surfaceY);
++
++        final int gi = field.idx(goalPos.getX(), goalPos.getZ());
++        cost[gi] = 0;
++        surfaceY[gi] = gSurface;
++        colSurf[gi] = gSurface;
++
++        // Dijkstra: min-heap of (cost<<shift | idx). cost and idx both fit comfortably in a long.
++        final PriorityQueue<Long> heap = new PriorityQueue<>();
++        heap.add(encode(0, gi));
++        int finalized = 0;
++
++        while (!heap.isEmpty() && finalized < maxCells) {
++            final long top = heap.poll();
++            final int ci = decodeIdx(top);
++            final int cc = decodeCost(top);
++            if (cc > cost[ci]) {
++                continue; // stale heap entry
++            }
++            finalized++;
++            final int cx = originX + ci / side;
++            final int cz = originZ + ci % side;
++            final int cy = surfaceY[ci];
++
++            for (int dir = 0; dir < 8; dir++) {
++                final int dx = DX[dir];
++                final int dz = DZ[dir];
++                final int nx = cx + dx;
++                final int nz = cz + dz;
++                final int ni = field.idx(nx, nz);
++                if (ni < 0) {
++                    continue;
++                }
++                final boolean diag = dx != 0 && dz != 0;
++                // Resolve the neighbour's surface within the step envelope of the current cell.
++                final int ny = cachedSurface(mob, context, cursor, colSurf, ni, nx, nz, cy, stepUp, MAX_DROP, headCells);
++                if (ny == NO_SURFACE) {
++                    continue; // wall / hazard / no safe floor -> not in field
++                }
++                if (diag) {
++                    // No corner-cutting: both orthogonally-adjacent columns must also be walkable.
++                    final int oi1 = field.idx(cx + dx, cz);
++                    final int oi2 = field.idx(cx, cz + dz);
++                    final int oy1 = oi1 < 0 ? NO_SURFACE : cachedSurface(mob, context, cursor, colSurf, oi1, cx + dx, cz, cy, stepUp, MAX_DROP, headCells);
++                    final int oy2 = oi2 < 0 ? NO_SURFACE : cachedSurface(mob, context, cursor, colSurf, oi2, cx, cz + dz, cy, stepUp, MAX_DROP, headCells);
++                    if (oy1 == NO_SURFACE || oy2 == NO_SURFACE) {
++                        continue;
++                    }
++                }
++                final int step = diag ? COST_DIAG : COST_CARD;
++                final int nc = cc + step;
++                if (nc < cost[ni]) {
++                    cost[ni] = nc;
++                    surfaceY[ni] = ny;
++                    heap.add(encode(nc, ni));
++                }
++            }
++        }
++        return field;
++    }
++
++    /**
++     * Gradient-descend the field from the mob's current cell to the goal, synthesizing a Path.
++     * Returns {@code null} when the mob is off-field, its cell is unreachable in the field, or the
++     * descent makes no progress from the start (a local minimum) — all "let A* handle it" cases.
++     */
++    public @Nullable Path descend(final Mob mob, final Level level, final int reachRange) {
++        if (!mob.onGround()) {
++            return null;
++        }
++        final int sx = Mth.floor(mob.getX());
++        final int sz = Mth.floor(mob.getZ());
++        int ci = this.idx(sx, sz);
++        if (ci < 0 || this.cost[ci] == UNSET) {
++            return null; // mob outside the field window or on a non-integrated cell -> A*
++        }
++
++        final List<Node> nodes = Lists.newArrayList();
++        int cx = sx;
++        int cz = sz;
++        int steps = 0;
++        final int maxSteps = this.side * 3;
++        nodes.add(makeNode(mob, cx, this.surfaceY[ci], cz));
++
++        while (this.cost[ci] != 0 && steps < maxSteps) {
++            final int curCost = this.cost[ci];
++            int bestIdx = -1;
++            int bestCost = curCost;
++            int bestX = cx;
++            int bestZ = cz;
++            boolean bestDiag = false;
++            for (int dir = 0; dir < 8; dir++) {
++                final int nx = cx + DX[dir];
++                final int nz = cz + DZ[dir];
++                final int ni = this.idx(nx, nz);
++                if (ni < 0) {
++                    continue;
++                }
++                final int nc = this.cost[ni];
++                if (nc == UNSET) {
++                    continue;
++                }
++                final boolean diag = DX[dir] != 0 && DZ[dir] != 0;
++                // Prefer strictly-lower cost; on ties prefer a cardinal step (straighter, matches A*).
++                if (nc < bestCost || (nc == bestCost && bestDiag && !diag)) {
++                    bestCost = nc;
++                    bestIdx = ni;
++                    bestX = nx;
++                    bestZ = nz;
++                    bestDiag = diag;
++                }
++            }
++            if (bestIdx < 0 || bestCost >= curCost) {
++                break; // local minimum: no neighbour closer to the goal -> stop (partial path)
++            }
++            cx = bestX;
++            cz = bestZ;
++            ci = bestIdx;
++            nodes.add(makeNode(mob, cx, this.surfaceY[ci], cz));
++            steps++;
++        }
++
++        if (nodes.size() < 2) {
++            return null; // no progress from the start cell -> A*
++        }
++        final boolean reached = this.cost[ci] == 0;
++        final BlockPos target = new BlockPos(this.goalX, this.goalY, this.goalZ);
++        return new Path(nodes, target, reached);
++    }
++
++    private static Node makeNode(final Mob mob, final int x, final int y, final int z) {
++        final Node node = new Node(x, y, z);
++        node.type = WalkNodeEvaluator.getPathTypeStatic(mob, new BlockPos(x, y, z));
++        node.costMalus = mob.getPathfindingMalus(node.type);
++        return node;
++    }
++
++    /**
++     * Standable-surface Y at column (x,z) within {@code [refY - downScan, refY + stepUp]}, preferring
++     * the cell closest to {@code refY}. A cell qualifies only if it is {@link PathType#WALKABLE} with
++     * non-negative malus AND has a clear {@link PathType#OPEN} body corridor. {@link #NO_SURFACE} if
++     * none qualifies (treated as a wall by the field).
++     */
++    private static int findSurfaceY(final Mob mob, final PathfindingContext context, final BlockPos.MutableBlockPos cursor,
++                                    final int x, final int z, final int refY, final int stepUp, final int downScan, final int headCells) {
++        if (walkableColumn(mob, context, cursor, x, refY, z, headCells)) {
++            return refY;
++        }
++        for (int up = 1; up <= stepUp; up++) {
++            if (walkableColumn(mob, context, cursor, x, refY + up, z, headCells)) {
++                return refY + up;
++            }
++        }
++        for (int down = 1; down <= downScan; down++) {
++            if (walkableColumn(mob, context, cursor, x, refY - down, z, headCells)) {
++                return refY - down;
++            }
++        }
++        return NO_SURFACE;
++    }
++
++    /**
++     * Per-build memoized surface lookup. A column's surface is fully resolved (block path-type +
++     * body-corridor reads) at most once; subsequent visits re-validate the cached surface against
++     * this approach's step envelope with a cheap integer compare. On flat terrain the cached surface
++     * is identical for every approach (exact); on slopes the envelope re-check keeps it conservative
++     * (an out-of-envelope column is treated as a wall from this cell — no illegal step).
++     */
++    private static int cachedSurface(final Mob mob, final PathfindingContext context, final BlockPos.MutableBlockPos cursor,
++                                     final int[] colSurf, final int idx, final int x, final int z, final int refY,
++                                     final int stepUp, final int downScan, final int headCells) {
++        final int cached = colSurf[idx];
++        if (cached == UNKNOWN) {
++            final int s = findSurfaceY(mob, context, cursor, x, z, refY, stepUp, downScan, headCells);
++            colSurf[idx] = s;
++            return s;
++        }
++        if (cached == NO_SURFACE) {
++            return NO_SURFACE;
++        }
++        return (cached >= refY - downScan && cached <= refY + stepUp) ? cached : NO_SURFACE;
++    }
++
++    /** True iff the mob can plainly stand at (x,y,z) with a clear body corridor (mirrors L1). */
++    private static boolean walkableColumn(final Mob mob, final PathfindingContext context, final BlockPos.MutableBlockPos cursor,
++                                          final int x, final int y, final int z, final int headCells) {
++        final PathType floor = WalkNodeEvaluator.getPathTypeStatic(context, cursor.set(x, y, z));
++        if (floor != PathType.WALKABLE || mob.getPathfindingMalus(floor) < 0.0F) {
++            return false;
++        }
++        for (int h = 1; h <= headCells; h++) {
++            final BlockState state = context.level().getBlockStateIfLoaded(cursor.set(x, y + h, z));
++            if (state == null) {
++                return false; // unloaded -> don't risk it
++            }
++            final PathType above = WalkNodeEvaluator.getPathTypeStatic(context, cursor.set(x, y + h, z));
++            if (above != PathType.OPEN) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static final int[] DX = {1, -1, 0, 0, 1, 1, -1, -1};
++    private static final int[] DZ = {0, 0, 1, -1, 1, -1, 1, -1};
++
++    private static long encode(final int cost, final int idx) {
++        return ((long) cost << 24) | (idx & 0xFFFFFFL);
++    }
++
++    private static int decodeCost(final long e) {
++        return (int) (e >>> 24);
++    }
++
++    private static int decodeIdx(final long e) {
++        return (int) (e & 0xFFFFFFL);
++    }
++}
+diff --git a/com/coderyo/pathfinding/flowfield/FlowFieldConfig.java b/com/coderyo/pathfinding/flowfield/FlowFieldConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..674969ad54d915094392f5c0b1592a4b5db8bf6b
+--- /dev/null
++++ b/com/coderyo/pathfinding/flowfield/FlowFieldConfig.java
+@@ -0,0 +1,252 @@
++/*
++ * coderyoMC — pathfinding A* elision (L3: shared per-goal FLOW-FIELD).
++ *
++ * Independent implementation. See pathfinding-elision-design.md §2.4 / §5 (#4 — "Flow-field /
++ * vector-field for shared targets, the horde tail"). The profiled hot load is a crowd of mobs
++ * chasing ONE target (a player) and each running its own redundant A* every few ticks. L3 collapses
++ * that N-A*-searches workload into ONE shared distance field: a single Dijkstra/BFS integration
++ * field is built outward from the goal over the local walkable grid, and every grouped mob just
++ * gradient-descends it (O(path) per mob, no search). PathFinder itself stays byte-for-byte vanilla;
++ * anything the field can't safely answer (no shared goal, mob outside the field, a local minimum /
++ * no-progress stall) falls back to the real A*.
++ */
++package com.coderyo.pathfinding.flowfield;
++
++import java.util.concurrent.atomic.LongAdder;
++
++/**
++ * Flag + tunables + counters for the L3 shared-goal flow-field A* elision
++ * (pathfinding-elision-design.md §2.4, §5 #4). The acceptance gate is the project pathfinding
++ * error standard (Tier-1 aggro 100% / reach &ge;99% / no permanent stuck; Tier-2 distance-banded
++ * route fidelity 90/80/70/60/50). L3 is the loosest-fidelity layer, so it is opt-in and MUST keep
++ * an aggressive A* fallback.
++ *
++ * <p><strong>Default OFF.</strong> When off — the default — {@code PathNavigation.createPath} runs
++ * the stock A* search (or L1 / async, themselves flag-gated) byte-for-byte identical to vanilla.
++ * Turn it on:
++ * <pre>
++ *   -Dcoderyo.pathfinding.flowfield.enabled=true   (system property, takes precedence)
++ *   CODERYO_PATHFINDING_FLOWFIELD_ENABLED=true       (environment variable, fallback)
++ *   -Dcoderyo.pathfinding.flowfield.debug=true       (group/build/elide counters; default false)
++ *   -Dcoderyo.pathfinding.flowfield.group=4          (min mobs sharing a goal to build a field)
++ *   -Dcoderyo.pathfinding.flowfield.radius=24        (field half-extent in XZ blocks)
++ *   -Dcoderyo.pathfinding.flowfield.ttl=8            (ticks a built field is reused before rebuild)
++ *   -Dcoderyo.pathfinding.flowfield.maxCells=4096    (cap on Dijkstra-expanded columns per build)
++ *   -Dcoderyo.pathfinding.flowfield.stall=4          (no-progress flow requests -> blacklist to A*)
++ * </pre>
++ *
++ * <p>Resolved once at class-load from a system property / environment variable, mirroring
++ * {@link com.coderyo.pathfinding.LosElisionConfig} and {@link com.coderyo.region.RegionConfig}.
++ *
++ * <p><b>Concurrency.</b> This config is immutable after class-load. The only shared mutable state
++ * L3 introduces is the {@link LongAdder} debug counters here (lock-free, contention-friendly) — the
++ * field cache and per-mob stall tracking live in a {@link FlowFieldRouter} that is
++ * <em>thread-confined via {@link ThreadLocal}</em> (one registry per region-worker thread), so no
++ * cross-region shared mutable structure is created (avoids the issue #24 shared-queue race class).
++ */
++public final class FlowFieldConfig {
++
++    /** System property key for the L3 flow-field elision flag. */
++    public static final String PROPERTY = "coderyo.pathfinding.flowfield.enabled";
++    /** Environment variable key for the L3 flow-field elision flag. */
++    public static final String ENV = "CODERYO_PATHFINDING_FLOWFIELD_ENABLED";
++
++    /** System property key for the flow-field debug counters flag. */
++    public static final String DEBUG_PROPERTY = "coderyo.pathfinding.flowfield.debug";
++    /** Environment variable key for the flow-field debug counters flag. */
++    public static final String DEBUG_ENV = "CODERYO_PATHFINDING_FLOWFIELD_DEBUG";
++
++    /** System property key for the minimum group size to build/share a field. */
++    public static final String GROUP_PROPERTY = "coderyo.pathfinding.flowfield.group";
++    /** Environment variable key for the minimum group size. */
++    public static final String GROUP_ENV = "CODERYO_PATHFINDING_FLOWFIELD_GROUP";
++
++    /** System property key for the field half-extent (blocks) in XZ. */
++    public static final String RADIUS_PROPERTY = "coderyo.pathfinding.flowfield.radius";
++    /** Environment variable key for the field half-extent. */
++    public static final String RADIUS_ENV = "CODERYO_PATHFINDING_FLOWFIELD_RADIUS";
++
++    /** System property key for the field reuse TTL (ticks). */
++    public static final String TTL_PROPERTY = "coderyo.pathfinding.flowfield.ttl";
++    /** Environment variable key for the field TTL. */
++    public static final String TTL_ENV = "CODERYO_PATHFINDING_FLOWFIELD_TTL";
++
++    /** System property key for the per-build expanded-column cap. */
++    public static final String MAXCELLS_PROPERTY = "coderyo.pathfinding.flowfield.maxCells";
++    /** Environment variable key for the per-build expanded-column cap. */
++    public static final String MAXCELLS_ENV = "CODERYO_PATHFINDING_FLOWFIELD_MAXCELLS";
++
++    /** System property key for the no-progress stall threshold (flow requests). */
++    public static final String STALL_PROPERTY = "coderyo.pathfinding.flowfield.stall";
++    /** Environment variable key for the stall threshold. */
++    public static final String STALL_ENV = "CODERYO_PATHFINDING_FLOWFIELD_STALL";
++
++    /** {@code flowfield.enabled} default — OFF (vanilla / L1 / async path runs). */
++    public static final boolean DEFAULT_ENABLED = false;
++    /** {@code flowfield.debug} default — quiet. */
++    public static final boolean DEFAULT_DEBUG = false;
++    /** Default minimum group size to justify building a shared field (design §2.4: "&ge; N mobs"). */
++    public static final int DEFAULT_GROUP = 4;
++    /** Default field half-extent (blocks) — covers a typical follow-range chase window. */
++    public static final int DEFAULT_RADIUS = 24;
++    /** Default field reuse TTL (ticks) — short, &le; vanilla 20-tick recompute throttle. */
++    public static final int DEFAULT_TTL = 8;
++    /** Default cap on Dijkstra-expanded columns per build (bounds field-build cost). */
++    public static final int DEFAULT_MAXCELLS = 4096;
++    /** Default no-progress flow requests before a mob is blacklisted to A* for a cooldown. */
++    public static final int DEFAULT_STALL = 4;
++
++    private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
++    private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, DEFAULT_DEBUG);
++    private static final int GROUP = Math.max(1, resolveInt(GROUP_PROPERTY, GROUP_ENV, DEFAULT_GROUP));
++    private static final int RADIUS = Math.max(4, resolveInt(RADIUS_PROPERTY, RADIUS_ENV, DEFAULT_RADIUS));
++    private static final int TTL = Math.max(1, resolveInt(TTL_PROPERTY, TTL_ENV, DEFAULT_TTL));
++    private static final int MAXCELLS = Math.max(64, resolveInt(MAXCELLS_PROPERTY, MAXCELLS_ENV, DEFAULT_MAXCELLS));
++    private static final int STALL = Math.max(1, resolveInt(STALL_PROPERTY, STALL_ENV, DEFAULT_STALL));
++
++    /** Count of repath requests where L3 served a path from a shared flow-field (A* SKIPPED). */
++    private static final LongAdder ELIDED = new LongAdder();
++    /** Count of repath requests where L3 declined and the real A* (or L1/async/sync) ran. */
++    private static final LongAdder RAN = new LongAdder();
++    /** Count of flow-field BUILDS (one Dijkstra each) — the amortized cost shared across a group. */
++    private static final LongAdder BUILDS = new LongAdder();
++
++    static {
++        if (ENABLED && DEBUG) {
++            Runtime.getRuntime().addShutdownHook(new Thread(() -> System.out.println(tallyLine()), "coderyo-l3-tally"));
++        }
++    }
++
++    private FlowFieldConfig() {
++    }
++
++    /** Whether the L3 flow-field elision is enabled. Resolved once at class-load. Default false. */
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++
++    /** Whether group/build/elide counters are recorded. Only consulted when {@link #isEnabled()}. */
++    public static boolean isDebug() {
++        return DEBUG;
++    }
++
++    /** Minimum number of mobs sharing one goal before a field is built/served. */
++    public static int groupSize() {
++        return GROUP;
++    }
++
++    /** Field half-extent (blocks) in XZ around the goal. */
++    public static int radius() {
++        return RADIUS;
++    }
++
++    /** Ticks a built field is reused before it must be rebuilt (also re-checked on goal move). */
++    public static int ttlTicks() {
++        return TTL;
++    }
++
++    /** Cap on Dijkstra-expanded columns per field build (bounds build cost). */
++    public static int maxCells() {
++        return MAXCELLS;
++    }
++
++    /** Consecutive no-progress flow requests before a mob falls back to A* for a cooldown. */
++    public static int stallThreshold() {
++        return STALL;
++    }
++
++    /** Record that L3 served a flow-field path and SKIPPED A* (debug only). */
++    public static void recordElided() {
++        if (DEBUG) {
++            ELIDED.increment();
++            maybeLog();
++        }
++    }
++
++    /** Record that L3 declined and a real search ran (debug only). */
++    public static void recordRan() {
++        if (DEBUG) {
++            RAN.increment();
++            maybeLog();
++        }
++    }
++
++    /** Record one field build (one Dijkstra integration field) — debug only. */
++    public static void recordBuild() {
++        if (DEBUG) {
++            BUILDS.increment();
++        }
++    }
++
++    private static volatile long lastLogMs = 0L;
++
++    private static void maybeLog() {
++        final long now = System.currentTimeMillis();
++        if (now - lastLogMs >= 2000L) {
++            lastLogMs = now;
++            System.out.println(tallyLine());
++        }
++    }
++
++    private static String tallyLine() {
++        final long elided = ELIDED.sum();
++        final long ran = RAN.sum();
++        final long builds = BUILDS.sum();
++        final long total = elided + ran;
++        final double rate = total == 0L ? 0.0 : (double) elided / (double) total;
++        final double amort = builds == 0L ? 0.0 : (double) elided / (double) builds;
++        return "[coderyo-l3] flow-field tally: elided=" + elided + " ran=" + ran + " total=" + total
++            + " builds=" + builds
++            + " elisionRate=" + String.format(java.util.Locale.ROOT, "%.4f", rate)
++            + " pathsPerBuild=" + String.format(java.util.Locale.ROOT, "%.2f", amort);
++    }
++
++    /** Total A* searches elided by L3 since boot (0 unless debug). */
++    public static long elidedCount() {
++        return ELIDED.sum();
++    }
++
++    /** Total searches that ran (L3 declined) since boot (0 unless debug). */
++    public static long ranCount() {
++        return RAN.sum();
++    }
++
++    /** Total field builds (Dijkstra integration fields) since boot (0 unless debug). */
++    public static long buildCount() {
++        return BUILDS.sum();
++    }
++
++    /** Elision rate = elided / (elided + ran). 0 if nothing recorded. */
++    public static double elisionRate() {
++        final long elided = ELIDED.sum();
++        final long total = elided + RAN.sum();
++        return total == 0L ? 0.0 : (double) elided / (double) total;
++    }
++
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
++        }
++        return fallback;
++    }
++
++    private static int resolveInt(final String property, final String env, final int fallback) {
++        String raw = System.getProperty(property);
++        if (raw == null) {
++            raw = System.getenv(env);
++        }
++        if (raw == null) {
++            return fallback;
++        }
++        try {
++            return Integer.parseInt(raw.trim());
++        } catch (final NumberFormatException ex) {
++            return fallback;
++        }
++    }
++}
+diff --git a/com/coderyo/pathfinding/flowfield/FlowFieldRouter.java b/com/coderyo/pathfinding/flowfield/FlowFieldRouter.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d1127eea7ab635263d58989c1ad4635deb5d522
+--- /dev/null
++++ b/com/coderyo/pathfinding/flowfield/FlowFieldRouter.java
+@@ -0,0 +1,231 @@
++/*
++ * coderyoMC — pathfinding A* elision (L3: shared per-goal FLOW-FIELD).
++ *
++ * The per-region-worker registry that turns N redundant A* searches into 1 shared field: it groups
++ * mobs heading to the SAME goal (same target entity, or same goal block), builds/reuses ONE
++ * {@link FlowField} per group, serves each grouped mob a gradient-descent path, and falls back to
++ * A* for ungrouped mobs, off-field mobs, and no-progress stalls (the correctness floor, design §8).
++ */
++package com.coderyo.pathfinding.flowfield;
++
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.Set;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.util.Mth;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.pathfinder.Path;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * Thread-confined flow-field registry (one instance per region-worker thread via {@link #INSTANCE}).
++ *
++ * <p><b>Why ThreadLocal.</b> Each region is ticked single-threaded on one worker, and all of a
++ * region's mobs request paths on that worker's thread, so a per-thread registry naturally scopes
++ * "mobs in a region sharing a goal" with ZERO cross-region shared mutable state — exactly the
++ * invariant that keeps L3 clear of the issue #24 mid-tick race class. Field keys are world-unique
++ * (entity id, or world goal cell), so a worker that ticks several regions in turn never confuses
++ * their fields, and validation (shape + goal-proximity + TTL) rejects any stale/foreign entry.
++ *
++ * <p><b>Grouping.</b> A field is only built once at least {@link FlowFieldConfig#groupSize()}
++ * distinct mobs have requested the same goal within a recent tick window — so a lone mob never pays
++ * to build a field, and the build cost is amortized across the whole crowd (the N->1 win).
++ *
++ * <p><b>Fallback (correctness floor).</b> {@link #tryFlowPath} returns {@code null} (caller runs the
++ * real A*) when: the group is too small, the goal has no standable surface, the mob is off-field /
++ * on a non-integrated cell, or the mob has made no progress for {@link FlowFieldConfig#stallThreshold()}
++ * consecutive flow serves (stuck-detector -> blacklist to A* for a cooldown). Aggro/target selection
++ * is never touched — only the PATH changes.
++ */
++public final class FlowFieldRouter {
++
++    /** Ticks a mob is forced onto A* after a no-progress stall (matches Paper's pathfind-fail window). */
++    private static final long STALL_COOLDOWN = 40L;
++    /** Demand window (ticks): a mob counts toward a goal's group if it requested within this window. */
++    private static final long DEMAND_WINDOW = 20L;
++    /** Allowed goal drift (blocks, XZ Manhattan + Y) before a cached field is rebuilt. */
++    private static final int GOAL_MOVE_TOL = 4;
++    /** Evict a field whose demand is empty this long after build. */
++    private static final long FIELD_EVICT = 80L;
++
++    private static final ThreadLocal<FlowFieldRouter> INSTANCE = ThreadLocal.withInitial(FlowFieldRouter::new);
++
++    private final Map<Long, Entry> fields = new HashMap<>();
++    private final Map<Integer, Stall> stalls = new HashMap<>();
++    private long lastPruneTick = Long.MIN_VALUE;
++
++    private FlowFieldRouter() {
++    }
++
++    /** Per-goal cache + demand record. */
++    private static final class Entry {
++        @Nullable FlowField field;
++        final Map<Integer, Long> demand = new HashMap<>();
++
++        void recordDemand(final int mobId, final long tick) {
++            this.demand.put(mobId, tick);
++        }
++
++        int distinctDemand(final long tick) {
++            int n = 0;
++            final Iterator<Map.Entry<Integer, Long>> it = this.demand.entrySet().iterator();
++            while (it.hasNext()) {
++                final long last = it.next().getValue();
++                if (tick - last > DEMAND_WINDOW) {
++                    it.remove();
++                } else {
++                    n++;
++                }
++            }
++            return n;
++        }
++    }
++
++    /** Per-mob stall / blacklist state (stuck-detector -> A* fallback). */
++    private static final class Stall {
++        int lastX = Integer.MIN_VALUE;
++        int lastZ = Integer.MIN_VALUE;
++        int count;
++        long blacklistUntil = Long.MIN_VALUE;
++    }
++
++    /**
++     * Try to serve a shared flow-field path for {@code mob} toward {@code target} (or the
++     * representative of {@code targets}). Returns {@code null} to fall back to the real A*.
++     */
++    public static @Nullable Path tryFlowPath(final Mob mob, final Level level, final Set<BlockPos> targets,
++                                             final @Nullable Entity target, final int reachRange) {
++        if (targets.isEmpty()) {
++            return null;
++        }
++        final FlowFieldRouter reg = INSTANCE.get();
++        final long tick = MinecraftServer.currentTick;
++        reg.maybePrune(tick);
++
++        final int shape = FlowField.shapeBucketOf(mob);
++        final BlockPos goal;
++        final long key;
++        if (target != null) {
++            goal = target.blockPosition();
++            key = entityKey(target.getId(), shape);
++        } else {
++            final BlockPos rep = representative(targets);
++            if (rep == null) {
++                return null;
++            }
++            goal = rep;
++            key = blockKey(rep, shape);
++        }
++
++        final int mobId = mob.getId();
++        // Stuck-detector blacklist gate: a recently-stalled mob runs the real A*.
++        final Stall stall = reg.stalls.get(mobId);
++        if (stall != null && stall.blacklistUntil > tick) {
++            return null;
++        }
++
++        final Entry e = reg.fields.computeIfAbsent(key, k -> new Entry());
++        e.recordDemand(mobId, tick);
++        final int distinct = e.distinctDemand(tick);
++
++        final boolean valid = e.field != null
++            && (tick - e.field.buildTick()) <= FlowFieldConfig.ttlTicks()
++            && e.field.shapeBucket() == shape
++            && near(e.field, goal);
++
++        if (!valid) {
++            if (distinct < FlowFieldConfig.groupSize()) {
++                return null; // group too small -> A* (demand recorded; the K-th request builds)
++            }
++            final FlowField built = FlowField.build(mob, level, goal,
++                FlowFieldConfig.radius(), FlowFieldConfig.maxCells(), shape, tick);
++            if (built == null) {
++                return null; // goal not standable -> A*
++            }
++            e.field = built;
++            FlowFieldConfig.recordBuild();
++        }
++
++        final FlowField field = e.field;
++        final Path path = field.descend(mob, level, reachRange);
++        if (path == null) {
++            return null; // mob off-field / local min at start -> A*
++        }
++
++        // Progress / stall accounting (stuck-detector). Compare the mob's cell to the last serve.
++        final Stall st = reg.stalls.computeIfAbsent(mobId, k -> new Stall());
++        final int bx = Mth.floor(mob.getX());
++        final int bz = Mth.floor(mob.getZ());
++        if (st.lastX == bx && st.lastZ == bz) {
++            st.count++;
++        } else {
++            st.count = 0;
++        }
++        st.lastX = bx;
++        st.lastZ = bz;
++        if (st.count >= FlowFieldConfig.stallThreshold()) {
++            st.blacklistUntil = tick + STALL_COOLDOWN;
++            st.count = 0;
++            return null; // no progress on the flow path -> hand this mob to A*
++        }
++        return path;
++    }
++
++    private static boolean near(final FlowField field, final BlockPos goal) {
++        return Math.abs(field.goalX() - goal.getX()) + Math.abs(field.goalZ() - goal.getZ()) <= GOAL_MOVE_TOL
++            && Math.abs(field.goalY() - goal.getY()) <= GOAL_MOVE_TOL;
++    }
++
++    private static @Nullable BlockPos representative(final Set<BlockPos> targets) {
++        BlockPos best = null;
++        long bestKey = Long.MAX_VALUE;
++        for (final BlockPos p : targets) {
++            final long k = p.asLong();
++            if (k < bestKey) {
++                bestKey = k;
++                best = p;
++            }
++        }
++        return best == null ? null : best.immutable();
++    }
++
++    private static long entityKey(final int entityId, final int shape) {
++        return (1L << 62) | ((long) entityId << 24) | (shape & 0xFFFFFFL);
++    }
++
++    private static long blockKey(final BlockPos goal, final int shape) {
++        // Quantize the goal cell lightly so small target drift reuses one field (still validated by near()).
++        final long qx = (goal.getX() >> 1) & 0x3FFFFFFL;
++        final long qz = (goal.getZ() >> 1) & 0x3FFFFFFL;
++        return (qx << 36) ^ (qz << 10) ^ (shape & 0x3FFL);
++    }
++
++    private void maybePrune(final long tick) {
++        if (tick == this.lastPruneTick) {
++            return;
++        }
++        this.lastPruneTick = tick;
++        // Evict stale fields (built long ago with no live demand) to bound memory.
++        final Iterator<Map.Entry<Long, Entry>> fit = this.fields.entrySet().iterator();
++        while (fit.hasNext()) {
++            final Entry e = fit.next().getValue();
++            final int live = e.distinctDemand(tick);
++            final boolean fieldStale = e.field == null || (tick - e.field.buildTick()) > FIELD_EVICT;
++            if (live == 0 && fieldStale) {
++                fit.remove();
++            }
++        }
++        // Drop stall records whose blacklist has long expired.
++        final Iterator<Map.Entry<Integer, Stall>> sit = this.stalls.entrySet().iterator();
++        while (sit.hasNext()) {
++            final Stall s = sit.next().getValue();
++            if (s.blacklistUntil < tick - FIELD_EVICT && s.count == 0) {
++                sit.remove();
++            }
++        }
++    }
++}
+diff --git a/net/minecraft/world/entity/ai/navigation/PathNavigation.java b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+index bc72869223352e4e5ebc185b90587098b5df2f50..1c32616475e1524877a205839eb15fdb6858d8d3 100644
+--- a/net/minecraft/world/entity/ai/navigation/PathNavigation.java
++++ b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+@@ -224,6 +224,27 @@ public abstract class PathNavigation {
+             com.coderyo.pathfinding.LosElisionConfig.recordRan();
+         }
+         // coderyo end - L1 LOS / direct-walk A* elision
++        // coderyo start - L3 shared per-goal FLOW-FIELD A* elision (flag-gated, default-off; design §2.4).
++        // The crowd-to-one-target case: when >= K ground mobs in this region navigate to the SAME goal
++        // (same target entity, or same goal block), ONE Dijkstra integration field is built/reused and
++        // each mob gradient-descends it instead of running its own A* (N searches -> 1 field). Runs
++        // AFTER L1 so the near-exact straight-walk wins first; this handles the obstacle/crowd tail L1
++        // declines. Conservative: ungrouped mobs, off-field mobs and no-progress stalls fall back to A*.
++        // Region.enabled=false AND flag-off both stay byte-for-byte vanilla (this branch is skipped).
++        if (com.coderyo.pathfinding.flowfield.FlowFieldConfig.isEnabled() && this.canNavigateGround()) {
++            final Path flowPath = com.coderyo.pathfinding.flowfield.FlowFieldRouter.tryFlowPath(this.mob, this.level, targets, target, reachRange);
++            if (flowPath != null) {
++                com.coderyo.pathfinding.flowfield.FlowFieldConfig.recordElided();
++                if (flowPath.getTarget() != null) {
++                    this.targetPos = flowPath.getTarget();
++                    this.reachRange = reachRange;
++                    this.resetStuckTimeout();
++                }
++                return flowPath;
++            }
++            com.coderyo.pathfinding.flowfield.FlowFieldConfig.recordRan();
++        }
++        // coderyo end - L3 shared per-goal FLOW-FIELD A* elision
+         ProfilerFiller profiler = Profiler.get();
+         profiler.push("pathfind");
+         BlockPos fromPos = above ? this.mob.blockPosition().above() : this.mob.blockPosition();
