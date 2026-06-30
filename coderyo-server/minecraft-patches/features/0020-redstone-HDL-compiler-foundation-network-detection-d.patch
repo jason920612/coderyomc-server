@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..7ae4052c24aef4e152e311af88fdb8a6d7710ec8
+index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be24b48bc2c
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,2290 @@
+@@ -0,0 +1,2306 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -62,6 +62,7 @@ index 0000000000000000000000000000000000000000..7ae4052c24aef4e152e311af88fdb8a6
 +import net.minecraft.world.level.block.RedStoneWireBlock;
 +import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.RedstoneWallTorchBlock;
 +import net.minecraft.world.level.block.SculkSensorBlock;
 +import net.minecraft.world.level.block.TargetBlock;
 +import net.minecraft.world.level.block.TripWireBlock;
@@ -812,8 +813,23 @@ index 0000000000000000000000000000000000000000..7ae4052c24aef4e152e311af88fdb8a6
 +
 +    // ------------------------------------------------------------------ torch
 +
++    // Transcribed from RedstoneTorchBlock.hasNeighbourSignal and its RedstoneWallTorchBlock
++    // override: a torch is OFF iff its ATTACHMENT block carries a signal. A floor/standing torch
++    // reads the block BELOW it ({@code hasSignal(below, DOWN)}); a WALL torch reads the block
++    // OPPOSITE its FACING — the wall it is mounted on ({@code hasSignal(pos.relative(opp), opp)}).
++    // The previous version always read 'below', so a wall-mounted torch (the form used by every
++    // top-/side-fed inverter and by cross-coupled torch latches) never observed its real input: it
++    // stayed lit while vanilla inverted it (sim=15 vs vanilla out=0 on input ON), and a torch RS
++    // latch collapsed to an analog wire fixed point instead of holding its stored bit. Reading the
++    // correct attachment cell makes the inverter bit-identical in BOTH input states and lets a
++    // bistable loop HOLD its seeded state (a torch only toggles on a real attachment-signal edge).
 +    private boolean torchInput(final long pos) {
 +        this.m.set(pos);
++        final BlockState state = this.vw.getBlockState(this.m);
++        if (state.getBlock() instanceof RedstoneWallTorchBlock) {
++            final Direction opposite = state.getValue(RedstoneWallTorchBlock.FACING).getOpposite();
++            return this.vw.hasSignal(this.m.relative(opposite), opposite);
++        }
 +        return this.vw.hasSignal(this.m.below(), Direction.DOWN);
 +    }
 +
