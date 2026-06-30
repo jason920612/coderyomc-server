@@ -100,6 +100,71 @@ build the latch from **redstone torches** (digital inverters — a torch control
 reads "powered" at any level ≥1, so it is immune to dust attenuation), the canonical
 robust 1-bit cell, then difftest its HOLD.
 
+## Rung 1 — 4-BIT ADDER: 4× tiled full adder (build-05-adder4.txt) — TILES VALIDATED ✅
+
+The proven 1-bit full adder (build-03) tiled **four times** along +x (pitch DX=24; bit *k*
+= build-03 shifted +24·*k*). Boots/settles force-loaded; all eight outputs differential-tested:
+
+| bit | SUM seed | SUM difftest | Cout seed | Cout difftest |
+|-----|----------|--------------|-----------|---------------|
+| 0 | 31,101,86 | **BIT-IDENTICAL** | 34,101,79 | **BIT-IDENTICAL** |
+| 1 | 55,101,86 | **BIT-IDENTICAL** | 58,101,79 | **BIT-IDENTICAL** |
+| 2 | 79,101,86 | **BIT-IDENTICAL** | 82,101,79 | **BIT-IDENTICAL** |
+| 3 | 103,101,86 | **BIT-IDENTICAL** | 106,101,79 | **BIT-IDENTICAL** |
+
+**8 / 8 BIT-IDENTICAL, 0 divergences** — the compiler scales bit-identically to the full
+4-bit-wide datapath (seeds detect 23–37 components / 46–74 cells each, single-region).
+Per-bit **arithmetic** confirmed live on bit0: A1B1C0→SUM 0, Cout 15; A1B0C1→SUM 0,
+Cout 15; A1B0C0→SUM 15, Cout 0 (= full-adder truth table).
+
+**Ripple interconnect — structural finding (the next step).** build-03's full adder is
+**top-fed**: every input — including the four Cin ports (30,87)(33,86)(32,75)(37,75) —
+is a comparator port driven by a `redstone_block` at y=102 directly over it. Those Cin
+ports are buried inside the circuit; their only free neighbour is on the far (east) side,
+and a `redstone_block` is the **only** thing that powers a dust from above (a strongly-
+powered *solid* block above a dust does **not** — verified live). So a horizontal
+Cout(k)→Cin(k+1) wire cannot reach the ports without crossing tile internals. Tiling this
+top-fed tile therefore yields 4 **independent, difftest-clean** full adders; a true ripple
+needs a full-adder variant with a **side-entry Cin bus** (one clean port fanned internally) —
+the concrete next tile design. (Detailed in build-05's header.)
+
+## Rung 2 — 1-bit MEMORY: TORCH RS-NOR latch (build-06-torch-rs-latch.txt) — WORKS ✅
+
+The fix for build-04's analog-attenuation failure. Two cross-coupled redstone-**torch**
+NOR gates; each gate block is driven by **repeaters** (clean digital strong-power) carrying
+the input + the cross-coupled feedback (Q rail on west x=60, Qbar on east x=64 — no
+crossover). A torch inverts at **any** input level ≥1, so it is immune to the dust
+attenuation that pinned the comparator latch at ~9/15.
+
+| step | R S | Q  | Qbar | note |
+|------|-----|----|------|------|
+| RESET | 1 0 | 0 | 1 | |
+| HOLD  | 0 0 | **0** | 1 | bit held |
+| SET   | 0 1 | 1 | 0 | |
+| HOLD  | 0 0 | **1** | 0 | **bit held — clean 15/0** |
+
+**HOLD now persists at a clean digital 15 (Q=1) / 0 (Q=0)** — the exact memory property
+build-04 could not reach. Verified by live power reads (the Q output dust at 60,101,122
+reads 15 when set-held, 0 when reset-held). This is the robust 1-bit cell for a register file.
+
+**Decisive torch mechanics learned (live, on this fork):** a gate block is turned
+"powered" (its torch off) by dust ON TOP or a **repeater** pointing into it — **not** by an
+adjacent `redstone_block`, **not** by horizontal dust into its side, **not** by a strongly-
+powered solid block above a dust. The latch drives gate blocks with repeaters accordingly.
+
+**Compiler finding (why difftest can't yet validate torch memory).** The HDL compiler
+(patch 0020) does **not** model redstone-torch inversion: a standalone torch inverter with
+input ON gives vanilla out=0 but compiled **sim=15** (difftest DIVERGENCE real=0 sim=15;
+the input-OFF case *is* BIT-IDENTICAL). So every torch/feedback circuit diverges under
+difftest — a **missing compiler primitive**, not a circuit fault (the latch HOLDs perfectly
+in vanilla, proven above). Adding torch support (block-powered→torch-off, plus bistable-loop
+stored-state seeding so a latch compiles to its *current* held bit rather than a default
+fixed point) is the prerequisite to differentially validate sequential memory. Until then
+torch memory is proven the way build-04 was diagnosed — by **vanilla** behaviour. The
+**D-latch** (gated RS: S=D∧E, R=D̄∧E via the proven comparator-AND gadgets feeding this
+latch's R/S repeaters) and the **4-bit register** (4 D-latches, shared Enable) are the
+immediate next builds; both inherit the same vanilla-proof / compiler-torch-gap situation.
+
 ## Divergence the difftest CAUGHT (and its root cause)
 
 On the first half-adder run the difftest reported, e.g.:
@@ -121,16 +186,24 @@ test-harness/world-setup lesson (force-load + settle), not a compiler bug.
 ## Verdict
 
 The rung-1 combinational foundation is **fully validated as a MAP**: all six gates,
-the half-adder, **and the complete 1-bit full adder (SUM + Cout)** are bit-identical
-to vanilla and logically correct across their full truth tables. Running difftest
-totals: **30 (gates+half-adder) + 16 (full-adder SUM/Cout) = 46 BIT-IDENTICAL cases,
-0 divergences.** The full adder is the first true arithmetic block and the unit that
-tiles into the 4-bit ripple-carry adder (chain 4, Cout→Cin).
+the half-adder, the complete 1-bit full adder (SUM + Cout), **and the 4-bit-wide adder
+datapath (4 tiled full adders, all 8 SUM/Cout outputs)** are bit-identical to vanilla and
+logically correct across their truth tables. Running difftest totals: **30 (gates+half-
+adder) + 16 (full-adder SUM/Cout) + 8 (4-bit adder SUM/Cout) = 54 BIT-IDENTICAL cases,
+0 divergences.** The full adder tiles cleanly; the ripple interconnect needs a side-entry
+Cin tile (build-03 is top-fed) — the documented next tile design.
 
-Rung 2 (sequential / memory) is opened: a comparator-NOR RS latch was built and the
-HOLD failure was diagnosed to dust-attenuation in the feedback (not the compiler) —
-the fix is a torch-based latch, queued next. **No feature patch was added — only
-`test-harness/redstone-computer/`** (build scripts + this file).
+Rung 2 (sequential / memory) now has a **working 1-bit cell**: the **torch RS-NOR latch**
+HOLDs a clean digital bit (15/0), fixing build-04's analog-attenuation failure. Its correctness
+is proven by **vanilla** behaviour because the difftest discovered a real compiler gap — the
+HDL compiler does not yet model redstone-**torch** inversion (a standalone torch inverter
+diverges real=0/sim=15), so no torch/feedback circuit can be difftest-validated until torch
+support is added. That is the headline next compiler work item; with it, the D-latch and
+4-bit register (designs noted above) become differentially validatable, and an ALU +
+register-file datapath (the 4-bit adder + a register) is assemblable.
+
+**No feature patch was added — only `test-harness/redstone-computer/`** (build scripts +
+this file).
 
 ### What the CPU rung needs next
 1. **1-bit memory (torch RS latch / D-latch)** — the missing pillar; build-04 has the

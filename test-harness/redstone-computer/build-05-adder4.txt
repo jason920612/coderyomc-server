@@ -1,0 +1,246 @@
+# coderyoMC redstone-computer MAP — 4-BIT ADDER (4x tiled 1-bit full adder), VALIDATED tiles.
+#
+# Built by tiling the PROVEN build-03 full adder (SUM=A^B^Cin, Cout=majority(A,B,Cin))
+# FOUR times along +x with pitch DX=24 (bit k has all x-coords of build-03 shifted +24*k).
+# Bit bases: bit0 x+0, bit1 x+24, bit2 x+48, bit3 x+72.
+#
+# STATUS (difftest, /coderyo redstone difftest, port 15568, compiler ON):
+#   ALL 8 outputs BIT-IDENTICAL to vanilla (steady state, inputs=0):
+#     bit0 SUM(31,101,86) PASS   bit0 Cout(34,101,79) PASS
+#     bit1 SUM(55,101,86) PASS   bit1 Cout(58,101,79) PASS
+#     bit2 SUM(79,101,86) PASS   bit2 Cout(82,101,79) PASS
+#     bit3 SUM(103,101,86) PASS  bit3 Cout(106,101,79) PASS
+#   Per-bit arithmetic verified live (bit0): A1B1C0->SUM0 Cout15; A1B0C1->SUM0 Cout15;
+#   A1B0C0->SUM15 Cout0. The compiler scales bit-identically to the full 4-bit-wide
+#   datapath (each seed detects ~23-37 components / 46-74 cells, single-region).
+#
+# RIPPLE-CARRY INTERCONNECT — STRUCTURAL FINDING (the next step):
+#   build-03's full-adder takes its inputs from ABOVE: each input cell (incl. the four
+#   Cin cells (30,87)(33,86)(32,75)(37,75)) is a comparator PORT driven by a redstone_block
+#   placed at y=102 directly over it (the toggler). Those Cin cells are buried INSIDE the
+#   circuit — their only free neighbour is on the far (east) side, and a redstone_block is
+#   the ONLY thing that powers a dust from above (a strongly-powered solid block above a
+#   dust does NOT power it — verified live). So a horizontal Cout(k)->Cin(k+1) wire cannot
+#   reach the Cin ports without crossing tile internals. Tiling this top-fed tile gives 4
+#   independent, difftest-clean full adders; a true ripple needs a full-adder variant with
+#   a SIDE-ENTRY Cin bus (one clean port fanned internally), which is the next tile design.
+#
+# Boot -Dcoderyo.redstone.compile.enabled=true ; forceload the build area & settle.
+# Drive A[k],B[k],Cin[k] with redstone_block togglers at y=102 over the cells below.
+
+# ============================ TILED LOGIC (bit0..bit3) ============================
+fill 24 100 70 116 100 100 minecraft:stone
+fill 24 101 70 116 103 100 minecraft:air
+# --- BIT 0 (x+0) ---
+setblock 30 101 92 minecraft:comparator[facing=west,mode=subtract]
+setblock 29 101 92 minecraft:redstone_wire
+setblock 30 101 93 minecraft:redstone_wire
+setblock 31 101 92 minecraft:redstone_wire
+setblock 32 101 92 minecraft:comparator[facing=east,mode=subtract]
+setblock 33 101 92 minecraft:redstone_wire
+setblock 32 101 93 minecraft:redstone_wire
+setblock 31 101 91 minecraft:redstone_wire
+setblock 31 101 90 minecraft:repeater[facing=south]
+setblock 31 101 89 minecraft:redstone_wire
+setblock 30 101 89 minecraft:redstone_wire
+setblock 29 101 89 minecraft:redstone_wire
+setblock 29 101 88 minecraft:redstone_wire
+setblock 29 101 87 minecraft:repeater[facing=south]
+setblock 29 101 86 minecraft:redstone_wire
+setblock 32 101 89 minecraft:redstone_wire
+setblock 32 101 88 minecraft:repeater[facing=south]
+setblock 32 101 87 minecraft:redstone_wire
+setblock 30 101 86 minecraft:comparator[facing=west,mode=subtract]
+setblock 30 101 87 minecraft:redstone_wire
+setblock 31 101 86 minecraft:redstone_wire
+setblock 32 101 86 minecraft:comparator[facing=east,mode=subtract]
+setblock 33 101 86 minecraft:redstone_wire
+setblock 26 101 74 minecraft:redstone_block
+setblock 27 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 27 101 75 minecraft:redstone_wire
+setblock 28 101 74 minecraft:redstone_wire
+setblock 29 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 29 101 73 minecraft:redstone_wire
+setblock 29 101 75 minecraft:redstone_wire
+setblock 31 101 74 minecraft:redstone_block
+setblock 32 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 32 101 75 minecraft:redstone_wire
+setblock 33 101 74 minecraft:redstone_wire
+setblock 34 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 34 101 73 minecraft:redstone_wire
+setblock 34 101 75 minecraft:redstone_wire
+setblock 36 101 74 minecraft:redstone_block
+setblock 37 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 37 101 75 minecraft:redstone_wire
+setblock 38 101 74 minecraft:redstone_wire
+setblock 39 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 39 101 73 minecraft:redstone_wire
+setblock 39 101 75 minecraft:redstone_wire
+setblock 29 101 76 minecraft:redstone_wire
+setblock 34 101 76 minecraft:redstone_wire
+setblock 39 101 76 minecraft:redstone_wire
+fill 29 101 77 39 101 77 minecraft:redstone_wire
+setblock 34 101 78 minecraft:repeater[facing=north]
+setblock 34 101 79 minecraft:redstone_wire
+# --- BIT 1 (x+24) ---
+setblock 54 101 92 minecraft:comparator[facing=west,mode=subtract]
+setblock 53 101 92 minecraft:redstone_wire
+setblock 54 101 93 minecraft:redstone_wire
+setblock 55 101 92 minecraft:redstone_wire
+setblock 56 101 92 minecraft:comparator[facing=east,mode=subtract]
+setblock 57 101 92 minecraft:redstone_wire
+setblock 56 101 93 minecraft:redstone_wire
+setblock 55 101 91 minecraft:redstone_wire
+setblock 55 101 90 minecraft:repeater[facing=south]
+setblock 55 101 89 minecraft:redstone_wire
+setblock 54 101 89 minecraft:redstone_wire
+setblock 53 101 89 minecraft:redstone_wire
+setblock 53 101 88 minecraft:redstone_wire
+setblock 53 101 87 minecraft:repeater[facing=south]
+setblock 53 101 86 minecraft:redstone_wire
+setblock 56 101 89 minecraft:redstone_wire
+setblock 56 101 88 minecraft:repeater[facing=south]
+setblock 56 101 87 minecraft:redstone_wire
+setblock 54 101 86 minecraft:comparator[facing=west,mode=subtract]
+setblock 54 101 87 minecraft:redstone_wire
+setblock 55 101 86 minecraft:redstone_wire
+setblock 56 101 86 minecraft:comparator[facing=east,mode=subtract]
+setblock 57 101 86 minecraft:redstone_wire
+setblock 50 101 74 minecraft:redstone_block
+setblock 51 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 51 101 75 minecraft:redstone_wire
+setblock 52 101 74 minecraft:redstone_wire
+setblock 53 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 53 101 73 minecraft:redstone_wire
+setblock 53 101 75 minecraft:redstone_wire
+setblock 55 101 74 minecraft:redstone_block
+setblock 56 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 56 101 75 minecraft:redstone_wire
+setblock 57 101 74 minecraft:redstone_wire
+setblock 58 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 58 101 73 minecraft:redstone_wire
+setblock 58 101 75 minecraft:redstone_wire
+setblock 60 101 74 minecraft:redstone_block
+setblock 61 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 61 101 75 minecraft:redstone_wire
+setblock 62 101 74 minecraft:redstone_wire
+setblock 63 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 63 101 73 minecraft:redstone_wire
+setblock 63 101 75 minecraft:redstone_wire
+setblock 53 101 76 minecraft:redstone_wire
+setblock 58 101 76 minecraft:redstone_wire
+setblock 63 101 76 minecraft:redstone_wire
+fill 53 101 77 63 101 77 minecraft:redstone_wire
+setblock 58 101 78 minecraft:repeater[facing=north]
+setblock 58 101 79 minecraft:redstone_wire
+# --- BIT 2 (x+48) ---
+setblock 78 101 92 minecraft:comparator[facing=west,mode=subtract]
+setblock 77 101 92 minecraft:redstone_wire
+setblock 78 101 93 minecraft:redstone_wire
+setblock 79 101 92 minecraft:redstone_wire
+setblock 80 101 92 minecraft:comparator[facing=east,mode=subtract]
+setblock 81 101 92 minecraft:redstone_wire
+setblock 80 101 93 minecraft:redstone_wire
+setblock 79 101 91 minecraft:redstone_wire
+setblock 79 101 90 minecraft:repeater[facing=south]
+setblock 79 101 89 minecraft:redstone_wire
+setblock 78 101 89 minecraft:redstone_wire
+setblock 77 101 89 minecraft:redstone_wire
+setblock 77 101 88 minecraft:redstone_wire
+setblock 77 101 87 minecraft:repeater[facing=south]
+setblock 77 101 86 minecraft:redstone_wire
+setblock 80 101 89 minecraft:redstone_wire
+setblock 80 101 88 minecraft:repeater[facing=south]
+setblock 80 101 87 minecraft:redstone_wire
+setblock 78 101 86 minecraft:comparator[facing=west,mode=subtract]
+setblock 78 101 87 minecraft:redstone_wire
+setblock 79 101 86 minecraft:redstone_wire
+setblock 80 101 86 minecraft:comparator[facing=east,mode=subtract]
+setblock 81 101 86 minecraft:redstone_wire
+setblock 74 101 74 minecraft:redstone_block
+setblock 75 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 75 101 75 minecraft:redstone_wire
+setblock 76 101 74 minecraft:redstone_wire
+setblock 77 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 77 101 73 minecraft:redstone_wire
+setblock 77 101 75 minecraft:redstone_wire
+setblock 79 101 74 minecraft:redstone_block
+setblock 80 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 80 101 75 minecraft:redstone_wire
+setblock 81 101 74 minecraft:redstone_wire
+setblock 82 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 82 101 73 minecraft:redstone_wire
+setblock 82 101 75 minecraft:redstone_wire
+setblock 84 101 74 minecraft:redstone_block
+setblock 85 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 85 101 75 minecraft:redstone_wire
+setblock 86 101 74 minecraft:redstone_wire
+setblock 87 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 87 101 73 minecraft:redstone_wire
+setblock 87 101 75 minecraft:redstone_wire
+setblock 77 101 76 minecraft:redstone_wire
+setblock 82 101 76 minecraft:redstone_wire
+setblock 87 101 76 minecraft:redstone_wire
+fill 77 101 77 87 101 77 minecraft:redstone_wire
+setblock 82 101 78 minecraft:repeater[facing=north]
+setblock 82 101 79 minecraft:redstone_wire
+# --- BIT 3 (x+72) ---
+setblock 102 101 92 minecraft:comparator[facing=west,mode=subtract]
+setblock 101 101 92 minecraft:redstone_wire
+setblock 102 101 93 minecraft:redstone_wire
+setblock 103 101 92 minecraft:redstone_wire
+setblock 104 101 92 minecraft:comparator[facing=east,mode=subtract]
+setblock 105 101 92 minecraft:redstone_wire
+setblock 104 101 93 minecraft:redstone_wire
+setblock 103 101 91 minecraft:redstone_wire
+setblock 103 101 90 minecraft:repeater[facing=south]
+setblock 103 101 89 minecraft:redstone_wire
+setblock 102 101 89 minecraft:redstone_wire
+setblock 101 101 89 minecraft:redstone_wire
+setblock 101 101 88 minecraft:redstone_wire
+setblock 101 101 87 minecraft:repeater[facing=south]
+setblock 101 101 86 minecraft:redstone_wire
+setblock 104 101 89 minecraft:redstone_wire
+setblock 104 101 88 minecraft:repeater[facing=south]
+setblock 104 101 87 minecraft:redstone_wire
+setblock 102 101 86 minecraft:comparator[facing=west,mode=subtract]
+setblock 102 101 87 minecraft:redstone_wire
+setblock 103 101 86 minecraft:redstone_wire
+setblock 104 101 86 minecraft:comparator[facing=east,mode=subtract]
+setblock 105 101 86 minecraft:redstone_wire
+setblock 98 101 74 minecraft:redstone_block
+setblock 99 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 99 101 75 minecraft:redstone_wire
+setblock 100 101 74 minecraft:redstone_wire
+setblock 101 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 101 101 73 minecraft:redstone_wire
+setblock 101 101 75 minecraft:redstone_wire
+setblock 103 101 74 minecraft:redstone_block
+setblock 104 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 104 101 75 minecraft:redstone_wire
+setblock 105 101 74 minecraft:redstone_wire
+setblock 106 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 106 101 73 minecraft:redstone_wire
+setblock 106 101 75 minecraft:redstone_wire
+setblock 108 101 74 minecraft:redstone_block
+setblock 109 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 109 101 75 minecraft:redstone_wire
+setblock 110 101 74 minecraft:redstone_wire
+setblock 111 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 111 101 73 minecraft:redstone_wire
+setblock 111 101 75 minecraft:redstone_wire
+setblock 101 101 76 minecraft:redstone_wire
+setblock 106 101 76 minecraft:redstone_wire
+setblock 111 101 76 minecraft:redstone_wire
+fill 101 101 77 111 101 77 minecraft:redstone_wire
+setblock 106 101 78 minecraft:repeater[facing=north]
+setblock 106 101 79 minecraft:redstone_wire
+
+# ================================ DRIVER / INPUTS ================================
+# For bit k (x-shift s=24*k), place redstone_block at y=102 over each cell (drive=1):
+#   A[k]   : (29+s,92) (32+s,93) (29+s,73) (39+s,73)
+#   B[k]   : (33+s,92) (30+s,93) (27+s,75) (34+s,73)
+#   Cin[k] : (30+s,87) (33+s,86) (32+s,75) (37+s,75)
+# Read / difftest seeds (y=101):
+#   SUM[k]  = (31+s, 86)   Cout[k] = (34+s, 79)
+# Settle ~2s after each toggle. difftest:  /coderyo redstone difftest <seed> 20
