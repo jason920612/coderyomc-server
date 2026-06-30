@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae6490499538e
+index 0000000000000000000000000000000000000000..339f3ccddf616a4ffd5a9d7af67ee74ffd0b19cf
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,1930 @@
+@@ -0,0 +1,2114 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -51,6 +51,7 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +import net.minecraft.world.level.block.ChiseledBookShelfBlock;
 +import net.minecraft.world.level.block.ComposterBlock;
 +import net.minecraft.world.level.block.CopperBulbBlock;
++import net.minecraft.world.level.block.CrafterBlock;
 +import net.minecraft.world.level.block.DaylightDetectorBlock;
 +import net.minecraft.world.level.block.JukeboxBlock;
 +import net.minecraft.world.level.block.LecternBlock;
@@ -67,6 +68,7 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +import net.minecraft.world.level.block.piston.PistonHeadBlock;
 +import net.minecraft.world.level.block.entity.BlockEntity;
 +import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
++import net.minecraft.world.level.block.entity.CrafterBlockEntity;
 +import net.minecraft.world.level.block.entity.DispenserBlockEntity;
 +import net.minecraft.world.level.block.entity.HopperBlockEntity;
 +import net.minecraft.world.level.block.state.BlockState;
@@ -114,7 +116,7 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 + */
 +final class CompiledNetwork {
 +
-+    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP, BUTTON, TARGET, PISTON, DISPENSER }
++    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP, BUTTON, TARGET, PISTON, DISPENSER, CRAFTER }
 +
 +    /**
 +     * One cell of an in-flight piston contraption — the compiled analogue of a vanilla
@@ -211,6 +213,21 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +    private final LongSet hoppers = new it.unimi.dsi.fastutil.longs.LongLinkedOpenHashSet();
 +    /** Dispensers + droppers (a dropper is a {@code DispenserBlock} subclass). */
 +    private final LongSet dispensers = new LongOpenHashSet();
++
++    /**
++     * Crafters ({@code 1.21}): an auto-crafter that, on a RISING power edge, attempts a craft from
++     * its 3x3 grid (vanilla {@code CrafterBlock.dispenseFrom}). A rising edge sets {@code TRIGGERED}
++     * and schedules the craft 4 ticks later; the craft (when a valid recipe exists) enters
++     * {@code CRAFTING} for {@code MAX_CRAFTING_TICKS}, decrements every non-empty slot by one, then
++     * exits {@code CRAFTING} via the block-entity {@code serverTick} countdown. A comparator reads
++     * the crafter's analog = the count of slots that are non-empty OR disabled
++     * ({@code CrafterBlockEntity.getRedstoneSignal}). Each crafter owns a PRIVATE
++     * {@link CrafterBlockEntity} (seeded with a COPY of the live grid + disabled-slot states), so the
++     * comparator output and the slot decrement are read from the compiled inventory — a true oracle.
++     * The result-item ENTITY physics (the ejected/inserted item) is DEFERRED — only the inventory
++     * decrement + craft success/fail + {@code CRAFTING}/{@code TRIGGERED} states are modelled.
++     */
++    private final LongSet crafters = new LongOpenHashSet();
 +    /** Every cell holding a compiled (privately-owned, independently-evolving) container BE. */
 +    private final LongSet containers = new LongOpenHashSet();
 +
@@ -234,6 +251,10 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +    private static final int HOPPER_AMOUNT = 1;
 +    /** {@code DispenserBlock.TRIGGER_DURATION}: fire 4 ticks after the rising power edge. */
 +    private static final int DISPENSER_TRIGGER_DELAY = 4;
++    /** {@code CrafterBlock.CRAFTING_TICK_DELAY}: attempt the craft 4 ticks after the rising edge. */
++    private static final int CRAFTER_TRIGGER_DELAY = 4;
++    /** {@code CrafterBlock.MAX_CRAFTING_TICKS}: the {@code CRAFTING} state lasts this many ticks. */
++    private static final int CRAFTER_MAX_CRAFTING_TICKS = 6;
 +
 +    /** A throwaway RNG for {@code getRandomSlot}; deterministic when exactly one slot is occupied. */
 +    private final RandomSource slotRng = RandomSource.create(0L);
@@ -298,6 +319,8 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +                c.hoppers.add(packed);
 +            } else if (state.getBlock() instanceof DispenserBlock) {
 +                c.dispensers.add(packed); // covers DropperBlock (a DispenserBlock subclass)
++            } else if (state.getBlock() instanceof CrafterBlock) {
++                c.crafters.add(packed); // 1.21 auto-crafter (BE seeded below, after snapshotExternal)
 +            } else if (state.getBlock() instanceof CopperBulbBlock) {
 +                c.copperBulbs.add(packed); // 1-bit memory: rising-edge LIT toggle
 +            } else if (state.getBlock() instanceof NoteBlock) {
@@ -353,6 +376,13 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +        for (final long packed : network.footprint()) {
 +            c.createContainer(level, packed);
 +        }
++        // CRAFTER (1.21): seed each crafter's PRIVATE block entity (items + disabled slots +
++        // crafting-tick countdown + triggered) AFTER snapshotExternal — a comparator facing a crafter
++        // snapshots the crafter cell with the LIVE block entity above, so seeding the compiled copy
++        // here makes the compiled inventory (not the live world) the comparator's analog oracle.
++        for (final long packed : c.crafters) {
++            c.createCrafter(level, packed);
++        }
 +        c.recomputeWires();
 +        return c;
 +    }
@@ -374,7 +404,11 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +            || state.getBlock() instanceof ComposterBlock
 +            || state.getBlock() instanceof LecternBlock
 +            || state.getBlock() instanceof JukeboxBlock
-+            || state.getBlock() instanceof ChiseledBookShelfBlock) {
++            || state.getBlock() instanceof ChiseledBookShelfBlock
++            // A CRAFTER is a Container but its analog is a custom slot COUNT (incl. disabled slots),
++            // not getRedstoneSignalFromContainer; it owns a dedicated compiled BE (see createCrafter)
++            // and is NEVER a generic item-layer container (hopper-into-crafter auto-fill is deferred).
++            || state.getBlock() instanceof CrafterBlock) {
 +            return;
 +        }
 +        if (!(level.getBlockEntity(pos) instanceof Container liveContainer)) {
@@ -399,6 +433,34 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +            this.hopperEnabledLatched.put(packed,
 +                state.hasProperty(HopperBlock.ENABLED) ? state.getValue(HopperBlock.ENABLED) : Boolean.TRUE);
 +        }
++    }
++
++    /**
++     * Seed a crafter's PRIVATE {@link CrafterBlockEntity} from the live world: a COPY of the 3x3
++     * inventory, the disabled-slot flags, the in-flight {@code craftingTicksRemaining} countdown and
++     * the {@code triggered} flag. Items are written straight into the backing list (not via
++     * {@code setItem}, which would auto-RE-ENABLE a disabled slot); disabled slots are set AFTER the
++     * items so {@code slotCanBeDisabled} (empty-slot check) holds. The compiled BE then evolves
++     * independently so the comparator output + slot decrement are a true oracle, not the live world.
++     */
++    private void createCrafter(final ServerLevel level, final long packed) {
++        final BlockPos pos = BlockPos.of(packed);
++        final BlockState state = this.vw.getBlockState(pos);
++        if (!(level.getBlockEntity(pos) instanceof CrafterBlockEntity live)) {
++            return;
++        }
++        final CrafterBlockEntity copy = new CrafterBlockEntity(pos, state);
++        for (int i = 0; i < copy.getContainerSize(); i++) {
++            copy.getItems().set(i, live.getItem(i).copy());
++        }
++        for (int i = 0; i < copy.getContainerSize(); i++) {
++            if (live.isSlotDisabled(i)) {
++                copy.setSlotState(i, false); // enabled=false -> disabled
++            }
++        }
++        copy.craftingTicksRemaining = live.craftingTicksRemaining;
++        copy.setTriggered(state.hasProperty(CrafterBlock.TRIGGERED) && state.getValue(CrafterBlock.TRIGGERED));
++        this.vw.setBlockEntity(packed, copy);
 +    }
 +
 +    /** Snapshot an external input cell (block state + live block entity) if not already present. */
@@ -517,6 +579,10 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +        // the comparator re-scan below (anchored at THIS tick, exactly like vanilla's setChanged ->
 +        // updateNeighbourForOutputSignal -> comparator checkTickOnNeighbor schedule).
 +        this.tickHoppers(tick);
++        // CRAFTER block-entity ticker (serverTick): advance the CRAFTING countdown. Vanilla ticks
++        // block entities AFTER scheduled block ticks within one ServerLevel.tick, so a craft that set
++        // craftingTicksRemaining in the scheduled tick above gets its first decrement THIS same tick.
++        this.tickCrafters();
 +        this.recomputeWires();
 +        this.syncObservers();
 +        this.rescanContainers(tick);
@@ -533,6 +599,7 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +            case TARGET -> this.runTarget(e.pos());
 +            case PISTON -> this.runPistonEvent(e.pos());
 +            case DISPENSER -> this.runDispenser(e.pos());
++            case CRAFTER -> this.runCrafter(e.pos());
 +        }
 +    }
 +
@@ -564,6 +631,9 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +        }
 +        for (final long pos : this.dispensers) {
 +            this.scheduleDispenserIfNeeded(pos, tick);
++        }
++        for (final long pos : this.crafters) {
++            this.scheduleCrafterIfNeeded(pos, tick);
 +        }
 +    }
 +
@@ -847,6 +917,14 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +        // must read the GRID LIT instead to keep the comparator a true compiled oracle (15/0).
 +        if (state.getBlock() instanceof CopperBulbBlock) {
 +            return state.getValue(CopperBulbBlock.LIT) ? Redstone.SIGNAL_MAX : Redstone.SIGNAL_MIN;
++        }
++        // A CRAFTER's analog is NOT container fullness: it is the count of slots that are non-empty
++        // OR disabled (vanilla CrafterBlockEntity.getRedstoneSignal). Read it from the compiled BE
++        // so the comparator tracks the simulated slot decrement + disabled-slot state, not the live
++        // world — a true compiled oracle (0..9).
++        if (state.getBlock() instanceof CrafterBlock) {
++            final CrafterBlockEntity be = this.crafterBE(pos.asLong());
++            return be == null ? 0 : be.getRedstoneSignal();
 +        }
 +        // Comparator SOURCE blocks whose analog output is a SPECIAL state read (NOT container
 +        // fullness): composter fill (0-8), lectern page progress, jukebox disc, chiseled-bookshelf
@@ -1899,7 +1977,113 @@ index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae649
 +        }
 +    }
 +
++    // ------------------------------------------------------------------- crafter
++    //
++    // CRAFTER (1.21). A rising power edge sets TRIGGERED and schedules the craft 4 ticks later
++    // (CrafterBlock.neighborChanged); a falling edge clears TRIGGERED + CRAFTING. The scheduled
++    // craft (CrafterBlock.dispenseFrom) checks the 3x3 grid against the recipe book: on success it
++    // enters CRAFTING for MAX_CRAFTING_TICKS and decrements every non-empty slot by one; on failure
++    // (no recipe / empty result) nothing is consumed. The CRAFTING state counts down in the
++    // block-entity serverTick. The ejected/inserted RESULT ITEM (entity physics / front-container
++    // insertion) is DEFERRED — only the inventory decrement + craft success/fail + the
++    // TRIGGERED/CRAFTING states + the comparator output (filled-or-disabled slot count) are modelled.
++
++    private CrafterBlockEntity crafterBE(final long pos) {
++        return this.vw.getBlockEntity(BlockPos.of(pos)) instanceof CrafterBlockEntity be ? be : null;
++    }
++
++    // Transcribed from CrafterBlock.neighborChanged.
++    private void scheduleCrafterIfNeeded(final long pos, final long tick) {
++        if (this.willTick(pos, Kind.CRAFTER)) {
++            return;
++        }
++        final BlockState st = this.state(pos);
++        if (!st.hasProperty(CrafterBlock.TRIGGERED)) {
++            return;
++        }
++        final boolean shouldTrigger = this.vw.hasNeighborSignal(BlockPos.of(pos));
++        final boolean isTriggered = st.getValue(CrafterBlock.TRIGGERED);
++        final CrafterBlockEntity be = this.crafterBE(pos);
++        if (shouldTrigger && !isTriggered) {
++            this.vw.set(pos, st.setValue(CrafterBlock.TRIGGERED, true));
++            if (be != null) {
++                be.setTriggered(true);
++            }
++            this.schedule(pos, Kind.CRAFTER, CRAFTER_TRIGGER_DELAY, P_NORMAL, tick);
++        } else if (!shouldTrigger && isTriggered) {
++            this.vw.set(pos, st.setValue(CrafterBlock.TRIGGERED, false).setValue(CrafterBlock.CRAFTING, false));
++            if (be != null) {
++                be.setTriggered(false);
++            }
++        }
++    }
++
++    // Transcribed from CrafterBlock.tick -> dispenseFrom (the craft attempt + inventory decrement).
++    private void runCrafter(final long pos) {
++        final CrafterBlockEntity be = this.crafterBE(pos);
++        if (be == null || this.level == null) {
++            return;
++        }
++        final net.minecraft.world.item.crafting.CraftingInput input = be.asCraftInput();
++        final java.util.Optional<net.minecraft.world.item.crafting.RecipeHolder<net.minecraft.world.item.crafting.CraftingRecipe>> recipe =
++            CrafterBlock.getPotentialResults(this.level, input);
++        if (recipe.isEmpty()) {
++            return; // SOUND_CRAFTER_FAIL — no valid recipe, no inventory change
++        }
++        final ItemStack result = recipe.get().value().assemble(input);
++        if (result.isEmpty()) {
++            return; // empty result — fail, no inventory change
++        }
++        // Craft success: enter CRAFTING and decrement every non-empty slot by one. The result-item
++        // ENTITY / front-container insertion is DEFERRED (not modelled); the comparator-visible
++        // inventory change + the CRAFTING/TRIGGERED states are.
++        be.setCraftingTicksRemaining(CRAFTER_MAX_CRAFTING_TICKS);
++        this.vw.set(pos, this.state(pos).setValue(CrafterBlock.CRAFTING, true));
++        be.getItems().forEach(it -> {
++            if (!it.isEmpty()) {
++                it.shrink(1);
++            }
++        });
++        be.setChanged();
++    }
++
++    // Transcribed from CrafterBlockEntity.serverTick: count CRAFTING down, exit when it reaches 0.
++    private void tickCrafters() {
++        for (final long pos : this.crafters) {
++            final CrafterBlockEntity be = this.crafterBE(pos);
++            if (be == null) {
++                continue;
++            }
++            final int remaining = be.craftingTicksRemaining - 1;
++            if (remaining >= 0) {
++                be.craftingTicksRemaining = remaining;
++                if (remaining == 0) {
++                    this.vw.set(pos, this.state(pos).setValue(CrafterBlock.CRAFTING, false));
++                }
++            }
++        }
++    }
++
 +    // ----------------------------------------------------------- harness probes
++
++    /** A compiled crafter's analog (filled-or-disabled slot count, 0..9); -1 if not a crafter. */
++    int crafterRedstoneSignal(final long packed) {
++        final CrafterBlockEntity be = this.crafterBE(packed);
++        return be == null ? -1 : be.getRedstoneSignal();
++    }
++
++    /** Total item count across a compiled crafter's 3x3 grid; -1 if not a crafter. */
++    int crafterItemCount(final long packed) {
++        final CrafterBlockEntity be = this.crafterBE(packed);
++        if (be == null) {
++            return -1;
++        }
++        int total = 0;
++        for (int i = 0; i < be.getContainerSize(); i++) {
++            total += be.getItem(i).getCount();
++        }
++        return total;
++    }
 +
 +    /** Total item count across a compiled container's slots (-1 if no compiled container). */
 +    int containerItemCount(final long packed) {
@@ -2038,10 +2222,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab7049fbd2
+index 0000000000000000000000000000000000000000..56df0942f34c2c4f2a0e83c506314e03172585ca
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,1427 @@
+@@ -0,0 +1,1553 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -2072,6 +2256,7 @@ index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab
 +import net.minecraft.world.level.block.ComparatorBlock;
 +import net.minecraft.world.level.block.ComposterBlock;
 +import net.minecraft.world.level.block.CopperBulbBlock;
++import net.minecraft.world.level.block.CrafterBlock;
 +import net.minecraft.world.level.block.DetectorRailBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
 +import net.minecraft.world.level.block.DispenserBlock;
@@ -2090,6 +2275,7 @@ index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab
 +import net.minecraft.world.level.block.piston.PistonMovingBlockEntity;
 +import net.minecraft.world.level.block.entity.ChiseledBookShelfBlockEntity;
 +import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
++import net.minecraft.world.level.block.entity.CrafterBlockEntity;
 +import net.minecraft.world.level.block.entity.JukeboxBlockEntity;
 +import net.minecraft.world.level.block.entity.LecternBlockEntity;
 +import net.minecraft.world.level.block.state.BlockState;
@@ -2304,6 +2490,8 @@ index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab
 +    private static final BlockState DAYLIGHT = Blocks.DAYLIGHT_DETECTOR.defaultBlockState();
 +    private static final BlockState COPPER_BULB = Blocks.COPPER_BULB.weathering().unaffected().defaultBlockState();
 +    private static final BlockState NOTEBLOCK = Blocks.NOTE_BLOCK.defaultBlockState();
++    /** Crafter (1.21): default orientation NORTH_UP (ejects the result toward NORTH, into air). */
++    private static final BlockState CRAFTER = Blocks.CRAFTER.defaultBlockState();
 +    private static final BlockState CHISELED_BOOKSHELF = Blocks.CHISELED_BOOKSHELF.defaultBlockState();
 +    private static BlockState composterLevel(final int level) {
 +        return Blocks.COMPOSTER.defaultBlockState().setValue(ComposterBlock.LEVEL, level);
@@ -3145,6 +3333,97 @@ index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab
 +                setBoth(lvl, c, new BlockPos(58, 101, 100), AIR);      // unpower -> POWERED false
 +            }
 +        }));
++
++        // =================================================================
++        //  CRAFTER (1.21) — on a RISING power edge the auto-crafter attempts a craft from its 3x3
++        //  grid (TRIGGERED set immediately, the craft scheduled 4 ticks later); a valid recipe enters
++        //  the CRAFTING state (counted down over 6 ticks in the block-entity serverTick) and
++        //  decrements every non-empty slot by one. A comparator reads the crafter's analog = the count
++        //  of slots that are non-empty OR disabled. The result-item ENTITY is DEFERRED — we
++        //  differential-compare the CRAFTING/TRIGGERED block states, the 3x3 inventory decrement, the
++        //  analog (slot count) and the comparator output, all bit-identical every tick.
++        // =================================================================
++
++        // Geometry (all three): a SURVIVING comparator (faces WEST, on a STONE support) reads the
++        // crafter to its WEST and drives an output wire + lamp to its EAST — so the crafter's analog
++        // (slot count) is proven end-to-end (crafter -> comparator output -> wire POWER -> lamp LIT),
++        // and the comparator's EAST output never powers the crafter (no spurious self-trigger). The
++        // rising-edge stimulus is a redstone block placed to the crafter's WEST; the crafter ejects
++        // its result NORTH (into clear air — the result-item entity is deferred). Sited on z-row 40
++        // (an empty band between the z=34 and z=45 circuits) so no flood footprint overlaps another
++        // circuit and every cell is driven only by this scenario's own stimulus.
++
++        // ---- Circuit 42: CRAFTER crafts a FILLED 3x3 recipe pulsed twice (states + slot decrement) ----
++        // 9 iron nuggets (count 2) -> 1 iron ingot. First pulse @30 crafts (each slot 2->1, analog
++        // stays 9 -> lamp stays lit), second pulse @80 crafts again (each slot 1->0, analog 9->0 ->
++        // lamp drops). The TRIGGERED edge, the transient CRAFTING window, the slot decrement, the
++        // comparator output, the wire power and the lamp are all compared tick-for-tick.
++        put(level, 3, 101, 40, CRAFTER);                     // crafter (ejects result NORTH)
++        put(level, 4, 100, 40, STONE);  put(level, 4, 101, 40, COMP_CMP_W); // comparator reads WEST=crafter
++        put(level, 5, 100, 40, STONE);  put(level, 5, 101, 40, WIRE);       // output wire (EAST)
++        put(level, 6, 101, 40, LAMP);                        // lamp follows the comparator output
++        configureCrafter(level, new BlockPos(3, 101, 40),
++            new int[] {0, 1, 2, 3, 4, 5, 6, 7, 8}, Items.IRON_NUGGET, 2, new int[] {});
++        SCENARIOS.add(new Scenario("crafter-craft", new BlockPos(3, 101, 40), (lvl, c, rel) -> {
++            if (rel == 30 || rel == 80) {
++                setBoth(lvl, c, new BlockPos(2, 101, 40), REDBLOCK); // rising edge (WEST) -> craft @+4
++            } else if (rel == 50 || rel == 100) {
++                setBoth(lvl, c, new BlockPos(2, 101, 40), AIR);      // falling edge -> TRIGGERED off
++            }
++        }));
++
++        // ---- Circuit 43: CRAFTER with DISABLED slots (analog count reflects them) + craft ----
++        // A 2x2 of oak planks (slots 0,1,3,4) -> crafting table; the other 5 slots are DISABLED. The
++        // analog = 4 filled + 5 disabled = 9 before the craft; after the craft the planks are consumed
++        // (analog -> 0 filled + 5 disabled = 5), proving disabled slots are counted and persist — the
++        // comparator output drops 9 -> 5 (lamp stays lit), differential-compared.
++        put(level, 10, 101, 40, CRAFTER);
++        put(level, 11, 100, 40, STONE);  put(level, 11, 101, 40, COMP_CMP_W);
++        put(level, 12, 100, 40, STONE);  put(level, 12, 101, 40, WIRE);
++        put(level, 13, 101, 40, LAMP);
++        configureCrafter(level, new BlockPos(10, 101, 40),
++            new int[] {0, 1, 3, 4}, Items.OAK_PLANKS, 1, new int[] {2, 5, 6, 7, 8});
++        SCENARIOS.add(new Scenario("crafter-disabled", new BlockPos(10, 101, 40), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(9, 101, 40), REDBLOCK); // rising edge -> craft @+4
++            } else if (rel == 60) {
++                setBoth(lvl, c, new BlockPos(9, 101, 40), AIR);      // falling edge -> TRIGGERED off
++            }
++        }));
++
++        // ---- Circuit 44: CRAFTER pulsed with NO valid recipe (no consume, CRAFTING never on) ----
++        // A single stick in slot 0 forms no recipe; each pulse sets/clears TRIGGERED but the scheduled
++        // craft FAILS (SOUND_CRAFTER_FAIL), so the inventory is untouched (analog stays 1) and CRAFTING
++        // stays false — the comparator output / lamp hold steady through both pulses.
++        put(level, 17, 101, 40, CRAFTER);
++        put(level, 18, 100, 40, STONE);  put(level, 18, 101, 40, COMP_CMP_W);
++        put(level, 19, 100, 40, STONE);  put(level, 19, 101, 40, WIRE);
++        put(level, 20, 101, 40, LAMP);
++        configureCrafter(level, new BlockPos(17, 101, 40),
++            new int[] {0}, Items.STICK, 1, new int[] {});
++        SCENARIOS.add(new Scenario("crafter-nocraft", new BlockPos(17, 101, 40), (lvl, c, rel) -> {
++            if (rel == 30 || rel == 80) {
++                setBoth(lvl, c, new BlockPos(16, 101, 40), REDBLOCK); // rising edge -> craft attempt fails
++            } else if (rel == 50 || rel == 100) {
++                setBoth(lvl, c, new BlockPos(16, 101, 40), AIR);      // falling edge -> TRIGGERED off
++            }
++        }));
++    }
++
++    /** Seed a live crafter's 3x3 grid: fill {@code slots} with {@code item} x{@code count}, then
++     *  disable {@code disabled} (empty) slots. Items are set BEFORE disabling so a slot's setItem
++     *  cannot re-enable a slot we mean to disable. */
++    private static void configureCrafter(final ServerLevel level, final BlockPos pos,
++            final int[] slots, final net.minecraft.world.item.Item item, final int count, final int[] disabled) {
++        if (level.getBlockEntity(pos) instanceof CrafterBlockEntity crafter) {
++            for (final int s : slots) {
++                crafter.setItem(s, new ItemStack(item, count));
++            }
++            for (final int d : disabled) {
++                crafter.setSlotState(d, false); // enabled=false -> disabled
++            }
++            crafter.setChanged();
++        }
 +    }
 +
 +    /** Place a 5-page writable book in a lectern and open it to {@code pageIndex} (for the comparator). */
@@ -3331,6 +3610,26 @@ index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab
 +                        }
 +                    }
 +                }
++                // CRAFTER inventory parity: the compiled crafter's 3x3 grid total item count AND its
++                // analog (filled-or-disabled slot count, getRedstoneSignal) must match the live
++                // crafter every tick — so the on-pulse slot decrement, the disabled-slot count and the
++                // craft-fail no-consume are all differential-proven, not just the block state.
++                if (detail == null && level.getBlockEntity(pos) instanceof CrafterBlockEntity liveCrafter) {
++                    int realCount = 0;
++                    for (int i = 0; i < liveCrafter.getContainerSize(); i++) {
++                        realCount += liveCrafter.getItem(i).getCount();
++                    }
++                    final int simCount = this.compiled.crafterItemCount(packed);
++                    if (realCount != simCount) {
++                        detail = pos.toShortString() + " CRAFTER-ITEM-COUNT real=" + realCount + " sim=" + simCount;
++                    } else {
++                        final int realSig = liveCrafter.getRedstoneSignal();
++                        final int simSig = this.compiled.crafterRedstoneSignal(packed);
++                        if (realSig != simSig) {
++                            detail = pos.toShortString() + " CRAFTER-SIGNAL real=" + realSig + " sim=" + simSig;
++                        }
++                    }
++                }
 +                // A MOVING_PISTON cell's animation lives in its PistonMovingBlockEntity: assert the
 +                // compiled mover matches vanilla's progress (0->0.5->1), extending/source flags and
 +                // moved block-state every tick — the transient piston motion, bit-identical.
@@ -3445,6 +3744,17 @@ index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab
 +            final boolean s = sim.getValue(DispenserBlock.TRIGGERED);
 +            return r == s ? null : pos.toShortString() + " TRIGGERED real=" + r + " sim=" + s;
 +        }
++        if (real.getBlock() instanceof CrafterBlock) {
++            // CRAFTER (1.21): assert both the rising-edge TRIGGERED bit and the transient CRAFTING
++            // state (which counts down over MAX_CRAFTING_TICKS in the block-entity serverTick).
++            if (real.getValue(CrafterBlock.TRIGGERED) != sim.getValue(CrafterBlock.TRIGGERED)) {
++                return pos.toShortString() + " CRAFTER-TRIGGERED real=" + real.getValue(CrafterBlock.TRIGGERED)
++                    + " sim=" + sim.getValue(CrafterBlock.TRIGGERED);
++            }
++            final boolean r = real.getValue(CrafterBlock.CRAFTING);
++            final boolean s = sim.getValue(CrafterBlock.CRAFTING);
++            return r == s ? null : pos.toShortString() + " CRAFTER-CRAFTING real=" + r + " sim=" + s;
++        }
 +        // Entity-detection inputs. A weighted plate carries analog POWER (compared above); the
 +        // binary pressure plate / tripwire hook / tripwire string / detector rail carry POWERED.
 +        // These cells are read each tick straight from the live detection (see CompiledNetwork),
@@ -3471,10 +3781,10 @@ index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..ebe205ce0326f652f58a263a9b5bb1facf339297
+index 0000000000000000000000000000000000000000..066e82d18791d07f27223db32427eea65037e14f
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,291 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -3494,6 +3804,7 @@ index 0000000000000000000000000000000000000000..ebe205ce0326f652f58a263a9b5bb1fa
 +import net.minecraft.world.level.block.BasePressurePlateBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.CopperBulbBlock;
++import net.minecraft.world.level.block.CrafterBlock;
 +import net.minecraft.world.level.block.DaylightDetectorBlock;
 +import net.minecraft.world.level.block.DetectorRailBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
@@ -3579,6 +3890,9 @@ index 0000000000000000000000000000000000000000..ebe205ce0326f652f58a263a9b5bb1fa
 +            || state.getBlock() instanceof PistonBaseBlock
 +            || state.getBlock() instanceof HopperBlock
 +            || state.getBlock() instanceof DispenserBlock
++            // Crafter (1.21 auto-crafter): an active node that crafts on a rising power edge and is
++            // comparator-readable (filled-or-disabled slot count) — a first-class network component.
++            || state.getBlock() instanceof CrafterBlock
 +            // Copper bulb (1-bit memory, comparator-readable) and note block (pure load) are
 +            // stateful network nodes the compiler models; a daylight detector is an analog signal
 +            // SOURCE driven by sky light, a boundary input read live each tick (see CompiledNetwork).
