@@ -1,0 +1,1100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: coderyo <actions@coderyo>
+Date: Tue, 30 Jun 2026 13:33:33 +0800
+Subject: [PATCH] =?UTF-8?q?coderyo=20redstone=20HDL-compiler=20foundation?=
+ =?UTF-8?q?=20=E2=80=94=20network=20detection,=20logic-graph=20compiler,?=
+ =?UTF-8?q?=20differential=20parity=20harness=20(flag-gated,=20dormant)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ com/coderyo/redstone/CompiledNetwork.java     | 388 ++++++++++++++++++
+ .../redstone/RedstoneCompileConfig.java       |  85 ++++
+ .../redstone/RedstoneDiffTestHarness.java     | 291 +++++++++++++
+ com/coderyo/redstone/RedstoneNetwork.java     | 183 +++++++++
+ .../redstone/VirtualRedstoneWorld.java        |  84 ++++
+ net/minecraft/server/MinecraftServer.java     |   1 +
+ 6 files changed, 1032 insertions(+)
+ create mode 100644 com/coderyo/redstone/CompiledNetwork.java
+ create mode 100644 com/coderyo/redstone/RedstoneCompileConfig.java
+ create mode 100644 com/coderyo/redstone/RedstoneDiffTestHarness.java
+ create mode 100644 com/coderyo/redstone/RedstoneNetwork.java
+ create mode 100644 com/coderyo/redstone/VirtualRedstoneWorld.java
+
+diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
+new file mode 100644
+index 0000000..0b7393b
+--- /dev/null
++++ b/com/coderyo/redstone/CompiledNetwork.java
+@@ -0,0 +1,388 @@
++/*
++ * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
++ * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
++ */
++package com.coderyo.redstone;
++
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.longs.LongSet;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.Deque;
++import java.util.List;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.Direction;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.RedStoneWireBlock;
++import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.block.state.properties.BlockStateProperties;
++
++/**
++ * The compiled logic graph + discrete-event simulator for one redstone network.
++ *
++ * <p>Design: the network's blocks are snapshotted into a {@link VirtualRedstoneWorld}
++ * grid, so ALL signal propagation (wire connection geometry, strong/weak power,
++ * lever / redstone-block sources, conductor bridging) is evaluated with the EXACT
++ * vanilla {@code BlockState}/{@code SignalGetter} code — bit-identical by construction.
++ * This class only owns the parts vanilla expresses through the scheduled-tick system:
++ * <ul>
++ *   <li><b>Wire fixpoint</b> — vanilla settles wires synchronously via neighbour-update
++ *       recursion within a game tick; we compute the identical converged power field by
++ *       relaxation ({@link #recomputeWires}). Transcribed from
++ *       {@code DefaultRedstoneWireEvaluator.calculateTargetStrength} +
++ *       {@code RedstoneWireEvaluator.getIncomingWireSignal}.</li>
++ *   <li><b>Torch / repeater delayed commits</b> — transcribed from
++ *       {@code RedstoneTorchBlock.tick} (2-tick inversion + 8-toggle/60-tick burnout)
++ *       and {@code DiodeBlock.tick}/{@code checkTickOnNeighbor} (delay 2/4/6/8, locking,
++ *       VERY_HIGH/HIGH/EXTREMELY_HIGH priorities), driven by a {@link ScheduledEntry}
++ *       queue ordered exactly like {@code LevelTicks} (trigger, priority, insertion).</li>
++ * </ul>
++ *
++ * <p>DEFERRED (not modelled — see RedstoneDiffTestHarness for the corpus that avoids
++ * them): comparators, observers, pistons, quasi-connectivity, 0-tick pulses, the
++ * EIGENCRAFT / ALTERNATE_CURRENT wire algorithms and the experimental wire flood.
++ */
++final class CompiledNetwork {
++
++    private enum Kind { TORCH, REPEATER }
++
++    /** Mirrors {@code TickPriority} ordinals: lower drains earlier. */
++    private static final int P_EXTREMELY_HIGH = -3;
++    private static final int P_VERY_HIGH = -2;
++    private static final int P_HIGH = -1;
++    private static final int P_NORMAL = 0;
++
++    private record ScheduledEntry(long pos, Kind kind, long trigger, int priority, long sub) {
++    }
++
++    private static final Comparator<ScheduledEntry> DRAIN_ORDER =
++        Comparator.comparingLong(ScheduledEntry::trigger)
++            .thenComparingInt(ScheduledEntry::priority)
++            .thenComparingLong(ScheduledEntry::sub);
++
++    private final VirtualRedstoneWorld vw = new VirtualRedstoneWorld();
++    private final RedStoneWireBlock wireBlock = (RedStoneWireBlock) Blocks.REDSTONE_WIRE;
++
++    private final LongSet wires = new LongOpenHashSet();
++    private final LongSet torches = new LongOpenHashSet();
++    private final LongSet repeaters = new LongOpenHashSet();
++
++    private final List<ScheduledEntry> queue = new ArrayList<>();
++    private long subCounter;
++
++    /** Burnout history, mirroring {@code Level.redstoneUpdateInfos}. */
++    private final Deque<long[]> toggleLog = new ArrayDeque<>(); // {posLong, gameTime}
++
++    private final BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
++
++    /** Seed the compiled grid from the live (settled) vanilla world. */
++    static CompiledNetwork compile(final ServerLevel level, final RedstoneNetwork network) {
++        final CompiledNetwork c = new CompiledNetwork();
++        for (final long packed : network.footprint()) {
++            final BlockPos pos = BlockPos.of(packed);
++            final BlockState state = level.getBlockState(pos);
++            c.vw.set(packed, state);
++            if (state.is(Blocks.REDSTONE_WIRE)) {
++                c.wires.add(packed);
++            } else if (state.getBlock() instanceof RedstoneTorchBlock) {
++                c.torches.add(packed);
++            } else if (state.getBlock() instanceof DiodeBlock) {
++                c.repeaters.add(packed);
++            }
++        }
++        c.recomputeWires();
++        return c;
++    }
++
++    BlockState state(final long packed) {
++        return this.vw.getBlockState(BlockPos.of(packed));
++    }
++
++    /** Apply an external source change (lever toggle / redstone-block placement). */
++    void setSource(final BlockPos pos, final BlockState state) {
++        this.vw.set(pos, state);
++    }
++
++    // ----------------------------------------------------------------- stepping
++
++    /** Advance the compiled model by exactly one game tick. */
++    void step(final long tick) {
++        this.currentTick = tick;
++        // Settle wires from any source change applied since the previous step.
++        this.recomputeWires();
++
++        // Collect-then-run, exactly like LevelTicks.tick: gather everything due this
++        // tick first, then run in drain order. Ticks scheduled during a run get a
++        // future trigger so they land in a later step.
++        final List<ScheduledEntry> due = new ArrayList<>();
++        for (int i = this.queue.size() - 1; i >= 0; i--) {
++            if (this.queue.get(i).trigger() <= tick) {
++                due.add(this.queue.remove(i));
++            }
++        }
++        due.sort(DRAIN_ORDER);
++        for (final ScheduledEntry e : due) {
++            this.run(e, tick);
++            this.recomputeWires(); // vanilla notifies neighbours synchronously per commit
++        }
++
++        // Re-evaluate downstream scheduling (mirrors neighborChanged / checkTickOnNeighbor).
++        this.rescan(tick);
++    }
++
++    private void run(final ScheduledEntry e, final long tick) {
++        if (e.kind() == Kind.TORCH) {
++            this.runTorch(e.pos(), tick);
++        } else {
++            this.runRepeater(e.pos());
++        }
++    }
++
++    private void rescan(final long tick) {
++        for (final long pos : this.torches) {
++            this.scheduleTorchIfNeeded(pos, tick);
++        }
++        for (final long pos : this.repeaters) {
++            this.updateRepeaterLock(pos);
++            this.scheduleRepeaterIfNeeded(pos, tick);
++        }
++    }
++
++    // ------------------------------------------------------------------- wires
++
++    /** Iterative relaxation to the same converged power field vanilla recursion reaches. */
++    private void recomputeWires() {
++        boolean changed = true;
++        int guard = 0;
++        while (changed && guard++ < 256) {
++            changed = false;
++            for (final long packed : this.wires) {
++                this.m.set(packed);
++                final BlockState state = this.vw.getBlockState(this.m);
++                if (!state.is(Blocks.REDSTONE_WIRE)) {
++                    continue;
++                }
++                final int current = state.getValue(BlockStateProperties.POWER);
++                final int target = this.calculateTargetStrength(this.m);
++                if (target != current) {
++                    this.vw.set(packed, state.setValue(BlockStateProperties.POWER, target));
++                    changed = true;
++                }
++            }
++        }
++    }
++
++    // Transcribed from DefaultRedstoneWireEvaluator.calculateTargetStrength.
++    private int calculateTargetStrength(final BlockPos pos) {
++        final int blockSignal = this.getBlockSignal(pos);
++        return blockSignal == 15 ? blockSignal : Math.max(blockSignal, this.getIncomingWireSignal(pos));
++    }
++
++    // Transcribed from RedStoneWireBlock.getBlockSignal (self-suppression via shouldSignal).
++    private int getBlockSignal(final BlockPos pos) {
++        this.wireBlock.shouldSignal = false;
++        final int s = this.vw.getBestNeighborSignal(pos);
++        this.wireBlock.shouldSignal = true;
++        return s;
++    }
++
++    // Transcribed from RedstoneWireEvaluator.getIncomingWireSignal (wire-climb geometry).
++    private int getIncomingWireSignal(final BlockPos pos) {
++        int wireSignal = 0;
++        final BlockPos above = pos.above();
++        final boolean aboveConductor = this.vw.getBlockState(above).isRedstoneConductor(this.vw, above);
++        for (final Direction dir : Direction.Plane.HORIZONTAL) {
++            final BlockPos neighbor = pos.relative(dir);
++            wireSignal = Math.max(wireSignal, this.getWireSignal(neighbor));
++            final boolean neighborConductor = this.vw.getBlockState(neighbor).isRedstoneConductor(this.vw, neighbor);
++            if (neighborConductor && !aboveConductor) {
++                wireSignal = Math.max(wireSignal, this.getWireSignal(neighbor.above()));
++            } else if (!neighborConductor) {
++                wireSignal = Math.max(wireSignal, this.getWireSignal(neighbor.below()));
++            }
++        }
++        return Math.max(0, wireSignal - 1);
++    }
++
++    private int getWireSignal(final BlockPos pos) {
++        final BlockState s = this.vw.getBlockState(pos);
++        return s.is(Blocks.REDSTONE_WIRE) ? s.getValue(BlockStateProperties.POWER) : 0;
++    }
++
++    // ------------------------------------------------------------------ torch
++
++    private boolean torchInput(final long pos) {
++        this.m.set(pos);
++        return this.vw.hasSignal(this.m.below(), Direction.DOWN);
++    }
++
++    // Transcribed from RedstoneTorchBlock.neighborChanged.
++    private void scheduleTorchIfNeeded(final long pos, final long tick) {
++        final boolean lit = this.state(pos).getValue(BlockStateProperties.LIT);
++        if (lit == this.torchInput(pos) && !this.willTick(pos, Kind.TORCH)) {
++            this.schedule(pos, Kind.TORCH, 2, P_NORMAL, tick);
++        }
++    }
++
++    // Transcribed from RedstoneTorchBlock.tick (inversion + burnout).
++    private void runTorch(final long pos, final long tick) {
++        final boolean input = this.torchInput(pos);
++        this.pruneToggleLog(tick);
++        final BlockState state = this.state(pos);
++        final boolean lit = state.getValue(BlockStateProperties.LIT);
++        if (lit) {
++            if (input) {
++                this.setLit(pos, false);
++                if (this.toggledTooFrequently(pos, tick, true)) {
++                    this.schedule(pos, Kind.TORCH, 160, P_NORMAL, tick); // burnout restart
++                }
++            }
++        } else if (!input && !this.toggledTooFrequently(pos, tick, false)) {
++            this.setLit(pos, true);
++        }
++    }
++
++    private void setLit(final long pos, final boolean lit) {
++        this.vw.set(pos, this.state(pos).setValue(BlockStateProperties.LIT, lit));
++    }
++
++    private void pruneToggleLog(final long tick) {
++        while (!this.toggleLog.isEmpty() && tick - this.toggleLog.peekFirst()[1] > 60L) {
++            this.toggleLog.removeFirst();
++        }
++    }
++
++    // Transcribed from RedstoneTorchBlock.isToggledTooFrequently.
++    private boolean toggledTooFrequently(final long pos, final long tick, final boolean add) {
++        if (add) {
++            this.toggleLog.addLast(new long[] {pos, tick});
++        }
++        int count = 0;
++        for (final long[] t : this.toggleLog) {
++            if (t[0] == pos && ++count >= 8) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    // --------------------------------------------------------------- repeater
++
++    private Direction repeaterFacing(final long pos) {
++        return this.state(pos).getValue(BlockStateProperties.HORIZONTAL_FACING);
++    }
++
++    private int repeaterDelay(final long pos) {
++        return this.state(pos).getValue(BlockStateProperties.DELAY) * 2;
++    }
++
++    // Transcribed from DiodeBlock.getInputSignal.
++    private boolean repeaterShouldTurnOn(final long pos) {
++        this.m.set(pos);
++        final Direction facing = this.repeaterFacing(pos);
++        final BlockPos back = this.m.relative(facing).immutable();
++        int input = this.vw.getSignal(back, facing);
++        if (input < 15) {
++            final BlockState bs = this.vw.getBlockState(back);
++            if (bs.is(Blocks.REDSTONE_WIRE)) {
++                input = Math.max(input, bs.getValue(BlockStateProperties.POWER));
++            }
++        }
++        return input > 0;
++    }
++
++    // Transcribed from DiodeBlock.getAlternateSignal / RepeaterBlock.isLocked.
++    private boolean repeaterLocked(final long pos) {
++        this.m.set(pos);
++        final Direction facing = this.repeaterFacing(pos);
++        final Direction cw = facing.getClockWise();
++        final Direction ccw = facing.getCounterClockWise();
++        final int alt = Math.max(
++            this.vw.getControlInputSignal(this.m.relative(cw).immutable(), cw, true),
++            this.vw.getControlInputSignal(this.m.relative(ccw).immutable(), ccw, true));
++        return alt > 0;
++    }
++
++    private void updateRepeaterLock(final long pos) {
++        final BlockState state = this.state(pos);
++        if (state.hasProperty(BlockStateProperties.LOCKED)) {
++            final boolean locked = this.repeaterLocked(pos);
++            if (state.getValue(BlockStateProperties.LOCKED) != locked) {
++                this.vw.set(pos, state.setValue(BlockStateProperties.LOCKED, locked));
++            }
++        }
++    }
++
++    private boolean repeaterPrioritize(final long pos) {
++        this.m.set(pos);
++        final Direction facing = this.repeaterFacing(pos);
++        final BlockState behind = this.vw.getBlockState(this.m.relative(facing.getOpposite()));
++        return behind.getBlock() instanceof DiodeBlock
++            && behind.hasProperty(BlockStateProperties.HORIZONTAL_FACING)
++            && behind.getValue(BlockStateProperties.HORIZONTAL_FACING) != facing;
++    }
++
++    // Transcribed from DiodeBlock.checkTickOnNeighbor.
++    private void scheduleRepeaterIfNeeded(final long pos, final long tick) {
++        if (this.repeaterLocked(pos)) {
++            return;
++        }
++        final boolean on = this.state(pos).getValue(BlockStateProperties.POWERED);
++        final boolean shouldOn = this.repeaterShouldTurnOn(pos);
++        if (on != shouldOn && !this.willTick(pos, Kind.REPEATER)) {
++            int priority = P_HIGH;
++            if (this.repeaterPrioritize(pos)) {
++                priority = P_EXTREMELY_HIGH;
++            } else if (on) {
++                priority = P_VERY_HIGH;
++            }
++            this.schedule(pos, Kind.REPEATER, this.repeaterDelay(pos), priority, tick);
++        }
++    }
++
++    // Transcribed from DiodeBlock.tick.
++    private void runRepeater(final long pos) {
++        if (this.repeaterLocked(pos)) {
++            return;
++        }
++        final boolean on = this.state(pos).getValue(BlockStateProperties.POWERED);
++        final boolean shouldOn = this.repeaterShouldTurnOn(pos);
++        if (on && !shouldOn) {
++            this.vw.set(pos, this.state(pos).setValue(BlockStateProperties.POWERED, false));
++        } else if (!on) {
++            this.vw.set(pos, this.state(pos).setValue(BlockStateProperties.POWERED, true));
++            if (!shouldOn) {
++                this.schedule(pos, Kind.REPEATER, this.repeaterDelay(pos), P_VERY_HIGH, /*tick*/ 0);
++            }
++        }
++    }
++
++    // -------------------------------------------------------------- scheduling
++
++    private boolean willTick(final long pos, final Kind kind) {
++        for (final ScheduledEntry e : this.queue) {
++            if (e.pos() == pos && e.kind() == kind) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private void schedule(final long pos, final Kind kind, final int delay, final int priority, final long baseTick) {
++        // de-dupe (UNIQUE_TICK_HASH): one pending tick per (pos, kind)
++        for (final ScheduledEntry e : this.queue) {
++            if (e.pos() == pos && e.kind() == kind) {
++                return;
++            }
++        }
++        final long trigger = (baseTick == 0 ? this.currentTick : baseTick) + delay;
++        this.queue.add(new ScheduledEntry(pos, kind, trigger, priority, this.subCounter++));
++    }
++
++    /** Tracks the tick we are currently stepping, for repeater off-edge reschedules. */
++    private long currentTick;
++}
+diff --git a/com/coderyo/redstone/RedstoneCompileConfig.java b/com/coderyo/redstone/RedstoneCompileConfig.java
+new file mode 100644
+index 0000000..ec9c5d7
+--- /dev/null
++++ b/com/coderyo/redstone/RedstoneCompileConfig.java
+@@ -0,0 +1,85 @@
++/*
++ * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent
++ * implementation. MCHPRS studied as concept only (logic-graph idea), never copied.
++ */
++package com.coderyo.redstone;
++
++/**
++ * Dormancy switch for the redstone logic-graph compiler / differential harness
++ * (feature patch 0020). Mirrors {@code com.coderyo.region.RegionConfig}: the flag
++ * is read from a system property / environment variable and defaults to
++ * <strong>false</strong>, so with it off the server boots byte-for-byte
++ * vanilla-equivalent and NOTHING in this package executes.
++ *
++ * <pre>
++ *   -Dcoderyo.redstone.compile.enabled=true   (master switch; default false)
++ *   -Dcoderyo.redstone.difftest=true          (run the differential parity harness)
++ *   -Dcoderyo.redstone.difftest.maxTicks=400  (ticks to run each scenario; default 300)
++ * </pre>
++ *
++ * <p>The compiler NEVER replaces vanilla redstone in the live world in this
++ * increment. Even with the flag ON, the only effect is that the differential
++ * harness runs a parallel in-memory simulation and asserts bit-parity against the
++ * real vanilla world. Vanilla redstone remains the sole writer of world state.
++ */
++public final class RedstoneCompileConfig {
++
++    public static final String ENABLED_PROPERTY = "coderyo.redstone.compile.enabled";
++    public static final String ENABLED_ENV = "CODERYO_REDSTONE_COMPILE_ENABLED";
++
++    public static final String DIFFTEST_PROPERTY = "coderyo.redstone.difftest";
++    public static final String DIFFTEST_ENV = "CODERYO_REDSTONE_DIFFTEST";
++
++    public static final String MAXTICKS_PROPERTY = "coderyo.redstone.difftest.maxTicks";
++
++    public static final boolean DEFAULT_ENABLED = false;
++    public static final boolean DEFAULT_DIFFTEST = false;
++    public static final int DEFAULT_MAXTICKS = 300;
++
++    private static final boolean ENABLED = resolveBoolean(ENABLED_PROPERTY, ENABLED_ENV, DEFAULT_ENABLED);
++    private static final boolean DIFFTEST = resolveBoolean(DIFFTEST_PROPERTY, DIFFTEST_ENV, DEFAULT_DIFFTEST);
++    private static final int MAXTICKS = resolveInt(MAXTICKS_PROPERTY, DEFAULT_MAXTICKS);
++
++    private RedstoneCompileConfig() {
++    }
++
++    /** Master switch. Default false → whole subsystem dormant. */
++    public static boolean isEnabled() {
++        return ENABLED;
++    }
++
++    /** Whether the differential parity harness should run (requires {@link #isEnabled()}). */
++    public static boolean isDiffTest() {
++        return ENABLED && DIFFTEST;
++    }
++
++    /** Ticks to run each differential scenario before scoring it. */
++    public static int maxTicks() {
++        return MAXTICKS;
++    }
++
++    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
++        final String prop = System.getProperty(property);
++        if (prop != null) {
++            return Boolean.parseBoolean(prop.trim());
++        }
++        final String envValue = System.getenv(env);
++        if (envValue != null) {
++            return Boolean.parseBoolean(envValue.trim());
++        }
++        return fallback;
++    }
++
++    private static int resolveInt(final String property, final int fallback) {
++        final String raw = System.getProperty(property);
++        if (raw == null) {
++            return fallback;
++        }
++        try {
++            final int parsed = Integer.parseInt(raw.trim());
++            return parsed >= 1 ? parsed : fallback;
++        } catch (final NumberFormatException ex) {
++            return fallback;
++        }
++    }
++}
+diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
+new file mode 100644
+index 0000000..c436d6f
+--- /dev/null
++++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
+@@ -0,0 +1,291 @@
++/*
++ * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
++ */
++package com.coderyo.redstone;
++
++import com.mojang.logging.LogUtils;
++import java.util.ArrayList;
++import java.util.List;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.Direction;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.block.state.properties.AttachFace;
++import net.minecraft.world.level.block.state.properties.BlockStateProperties;
++import org.slf4j.Logger;
++
++/**
++ * The differential-testing harness — the safety mechanism for "full parity, no
++ * fallback". For each circuit in the corpus it builds the REAL circuit in the live
++ * world (so genuine vanilla redstone runs), compiles a parallel logic-graph model,
++ * then every server tick applies the same scripted stimulus to BOTH, advances the
++ * compiled model one tick, and asserts bit-identical block states (wire POWER, torch
++ * LIT, repeater POWERED/LOCKED). Any divergence is logged with the exact circuit,
++ * tick and cell — a compiler bug to FIX, never a reason to fall back.
++ *
++ * <p>Driven entirely off a single hook in {@code MinecraftServer.tickServer}; needs
++ * no command wiring. Gated behind {@code coderyo.redstone.difftest} (which itself
++ * requires the master {@code coderyo.redstone.compile.enabled}); with the flag off
++ * this method returns immediately and the server is byte-for-byte vanilla.
++ */
++public final class RedstoneDiffTestHarness {
++
++    private static final Logger LOG = LogUtils.getLogger();
++
++    private static final int PHASE_WAIT = 0;
++    private static final int PHASE_SETTLE = 1;
++    private static final int PHASE_RUN = 2;
++    private static final int PHASE_DONE = 3;
++
++    private static int phase = PHASE_WAIT;
++    private static boolean forced;
++    private static long ticks;
++    private static long settleUntil;
++    private static long runStart;
++    private static final List<Scenario> SCENARIOS = new ArrayList<>();
++
++    private RedstoneDiffTestHarness() {
++    }
++
++    public static void onServerTickEnd(final MinecraftServer server) {
++        if (!RedstoneCompileConfig.isDiffTest()) {
++            return;
++        }
++        ticks++;
++        final ServerLevel level = server.overworld();
++        switch (phase) {
++            case PHASE_WAIT -> {
++                if (!forced) {
++                    forced = true;
++                    for (int cx = -1; cx <= 3; cx++) {
++                        for (int cz = -1; cz <= 1; cz++) {
++                            level.setChunkForced(cx, cz, true);
++                        }
++                    }
++                    LOG.info("[redstone-difftest] forceloaded build-area chunks; waiting for load");
++                }
++                if (ticks > 40 && areaLoaded(level)) {
++                    buildCorpus(level);
++                    phase = PHASE_SETTLE;
++                    settleUntil = ticks + 10;
++                    LOG.info("[redstone-difftest] corpus built; settling vanilla redstone for 10 ticks");
++                }
++            }
++            case PHASE_SETTLE -> {
++                if (ticks >= settleUntil) {
++                    for (final Scenario s : SCENARIOS) {
++                        s.compile(level);
++                    }
++                    phase = PHASE_RUN;
++                    runStart = ticks;
++                    LOG.info("[redstone-difftest] ===== LOCKSTEP PARITY COMPARISON START =====");
++                }
++            }
++            case PHASE_RUN -> {
++                final int rel = (int) (ticks - runStart);
++                for (final Scenario s : SCENARIOS) {
++                    s.tick(level, rel);
++                }
++                if (rel >= RedstoneCompileConfig.maxTicks()) {
++                    phase = PHASE_DONE;
++                    summarize();
++                }
++            }
++            default -> {
++            }
++        }
++    }
++
++    private static boolean areaLoaded(final ServerLevel level) {
++        for (int cx = 0; cx <= 3; cx++) {
++            if (!level.getChunkSource().hasChunk(cx, 0)) {
++                return false;
++            }
++            if (!level.getChunkSource().hasChunk(cx, -1)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static void summarize() {
++        LOG.info("[redstone-difftest] ===== PARITY SUMMARY ({} ticks) =====", RedstoneCompileConfig.maxTicks());
++        boolean allPass = true;
++        for (final Scenario s : SCENARIOS) {
++            if (s.divergences == 0) {
++                LOG.info("[redstone-difftest]   PASS  {}  ({} cells, every tick bit-identical)", s.name, s.net.footprint().size());
++            } else {
++                allPass = false;
++                LOG.warn("[redstone-difftest]   FAIL  {}  ({} divergences; first @rel-tick {}: {})",
++                    s.name, s.divergences, s.firstDivergeTick, s.firstDetail);
++            }
++        }
++        LOG.info("[redstone-difftest] ===== VERDICT: {} =====", allPass ? "ALL CIRCUITS BIT-IDENTICAL" : "DIVERGENCE(S) FOUND");
++    }
++
++    // --------------------------------------------------------------- corpus
++
++    private static final BlockState STONE = Blocks.STONE.defaultBlockState();
++    private static final BlockState WIRE = Blocks.REDSTONE_WIRE.defaultBlockState();
++    private static final BlockState REDBLOCK = Blocks.REDSTONE_BLOCK.defaultBlockState();
++    private static final BlockState AIR = Blocks.AIR.defaultBlockState();
++    private static final BlockState TORCH = Blocks.REDSTONE_TORCH.defaultBlockState();
++    private static final BlockState REPEATER_W =
++        Blocks.REPEATER.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.WEST);
++    private static final BlockState LEVER_OFF = Blocks.LEVER.defaultBlockState()
++        .setValue(BlockStateProperties.ATTACH_FACE, AttachFace.WALL)
++        .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.NORTH)
++        .setValue(BlockStateProperties.POWERED, false);
++
++    private static void put(final ServerLevel level, final int x, final int y, final int z, final BlockState state) {
++        level.setBlockAndUpdate(new BlockPos(x, y, z), state);
++    }
++
++    private static void buildCorpus(final ServerLevel level) {
++        // ---- Circuit 1: wire power decay (15 wires off a redstone-block source) ----
++        for (int x = 1; x <= 15; x++) {
++            put(level, x, 100, 0, STONE);          // support
++            put(level, x, 101, 0, WIRE);
++        }
++        put(level, 0, 101, 0, REDBLOCK);           // constant source feeding wire @1
++        SCENARIOS.add(new Scenario("wire-decay", new BlockPos(8, 101, 0), (lvl, c, rel) -> {
++            if (rel == 40) {
++                setBoth(lvl, c, new BlockPos(0, 101, 0), AIR);       // cut source
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(0, 101, 0), REDBLOCK);  // restore source
++            }
++        }));
++
++        // ---- Circuit 2: redstone-torch inverter, lever source, strong power thru block ----
++        put(level, 26, 100, 0, STONE);             // input block B
++        put(level, 27, 100, 0, STONE);             // output support
++        put(level, 26, 100, -1, LEVER_OFF);        // wall lever on B's north face -> powers B
++        put(level, 26, 101, 0, TORCH);             // floor torch on B -> reads B
++        put(level, 27, 101, 0, WIRE);              // output wire east of torch
++        SCENARIOS.add(new Scenario("torch-inverter", new BlockPos(26, 101, 0), (lvl, c, rel) -> {
++            if (rel == 50) {
++                setLever(lvl, c, new BlockPos(26, 100, -1), new BlockPos(26, 100, 0), true);
++            } else if (rel == 120) {
++                setLever(lvl, c, new BlockPos(26, 100, -1), new BlockPos(26, 100, 0), false);
++            }
++        }));
++
++        // ---- Circuit 3: line of 2 repeaters (delay accumulation, redstone-block source) ----
++        for (int x = 41; x <= 45; x++) {
++            put(level, x, 100, 0, STONE);
++        }
++        put(level, 41, 101, 0, WIRE);
++        put(level, 42, 101, 0, REPEATER_W);        // input west(41), output east(43)
++        put(level, 43, 101, 0, WIRE);
++        put(level, 44, 101, 0, REPEATER_W);        // input west(43), output east(45)
++        put(level, 45, 101, 0, WIRE);
++        SCENARIOS.add(new Scenario("repeater-line", new BlockPos(43, 101, 0), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(40, 101, 0), REDBLOCK); // energise
++            } else if (rel == 110) {
++                setBoth(lvl, c, new BlockPos(40, 101, 0), AIR);      // de-energise
++            }
++        }));
++    }
++
++    private static void setBoth(final ServerLevel level, final CompiledNetwork c, final BlockPos pos, final BlockState state) {
++        level.setBlockAndUpdate(pos, state);
++        c.setSource(pos, state);
++    }
++
++    /** Toggle a wall lever in both worlds, replicating LeverBlock's support-block notify. */
++    private static void setLever(final ServerLevel level, final CompiledNetwork c,
++                                 final BlockPos leverPos, final BlockPos supportPos, final boolean on) {
++        final BlockState state = LEVER_OFF.setValue(BlockStateProperties.POWERED, on);
++        level.setBlockAndUpdate(leverPos, state);
++        level.updateNeighborsAt(supportPos, Blocks.LEVER, null);
++        c.setSource(leverPos, state);
++    }
++
++    // -------------------------------------------------------------- scenario
++
++    private interface Stim {
++        void apply(ServerLevel level, CompiledNetwork compiled, int rel);
++    }
++
++    private static final class Scenario {
++        final String name;
++        final BlockPos seed;
++        final Stim stim;
++        RedstoneNetwork net;
++        CompiledNetwork compiled;
++        int divergences;
++        int firstDivergeTick = -1;
++        String firstDetail = "";
++
++        Scenario(final String name, final BlockPos seed, final Stim stim) {
++            this.name = name;
++            this.seed = seed;
++            this.stim = stim;
++        }
++
++        void compile(final ServerLevel level) {
++            this.net = RedstoneNetwork.detect(level, this.seed);
++            this.compiled = CompiledNetwork.compile(level, this.net);
++            final boolean affinity = this.net.spansSingleRegion(level);
++            LOG.info("[redstone-difftest] compiled '{}': {} components, {} footprint cells, {} chunk(s); single-region affinity={}",
++                this.name, this.net.size(), this.net.footprint().size(), this.net.chunkKeys().size(), affinity);
++        }
++
++        void tick(final ServerLevel level, final int rel) {
++            if (this.stim != null) {
++                this.stim.apply(level, this.compiled, rel);
++            }
++            this.compiled.step(rel);
++            for (final long packed : this.net.footprint()) {
++                final BlockPos pos = BlockPos.of(packed);
++                final String detail = diff(pos, level.getBlockState(pos), this.compiled.state(packed));
++                if (detail != null) {
++                    this.divergences++;
++                    if (this.firstDivergeTick < 0) {
++                        this.firstDivergeTick = rel;
++                        this.firstDetail = detail;
++                    }
++                    if (this.divergences <= 8) {
++                        LOG.warn("[redstone-difftest] DIVERGENCE '{}' @rel-tick {} {}", this.name, rel, detail);
++                    }
++                }
++            }
++        }
++    }
++
++    /** Compare the parity-relevant property of a cell; null when identical. */
++    private static String diff(final BlockPos pos, final BlockState real, final BlockState sim) {
++        if (real.getBlock() != sim.getBlock()) {
++            return pos.toShortString() + " block real=" + real.getBlock() + " sim=" + sim.getBlock();
++        }
++        if (real.hasProperty(BlockStateProperties.POWER)) {
++            final int r = real.getValue(BlockStateProperties.POWER);
++            final int s = sim.getValue(BlockStateProperties.POWER);
++            return r == s ? null : pos.toShortString() + " POWER real=" + r + " sim=" + s;
++        }
++        if (real.getBlock() instanceof RedstoneTorchBlock) {
++            final boolean r = real.getValue(BlockStateProperties.LIT);
++            final boolean s = sim.getValue(BlockStateProperties.LIT);
++            return r == s ? null : pos.toShortString() + " LIT real=" + r + " sim=" + s;
++        }
++        if (real.getBlock() instanceof DiodeBlock) {
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            if (r != s) {
++                return pos.toShortString() + " POWERED real=" + r + " sim=" + s;
++            }
++            if (real.hasProperty(BlockStateProperties.LOCKED)
++                && real.getValue(BlockStateProperties.LOCKED) != sim.getValue(BlockStateProperties.LOCKED)) {
++                return pos.toShortString() + " LOCKED real=" + real.getValue(BlockStateProperties.LOCKED)
++                    + " sim=" + sim.getValue(BlockStateProperties.LOCKED);
++            }
++            return null;
++        }
++        return null;
++    }
++}
+diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
+new file mode 100644
+index 0000000..2ffc157
+--- /dev/null
++++ b/com/coderyo/redstone/RedstoneNetwork.java
+@@ -0,0 +1,183 @@
++/*
++ * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
++ */
++package com.coderyo.redstone;
++
++import it.unimi.dsi.fastutil.longs.LongLinkedOpenHashSet;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.longs.LongSet;
++import java.util.ArrayDeque;
++import java.util.Deque;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.Direction;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.LeverBlock;
++import net.minecraft.world.level.block.RedStoneWireBlock;
++import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.block.state.BlockState;
++
++/**
++ * A connected redstone network: the set of electrically-connected redstone
++ * components (wire / torch / repeater / lever / redstone-block …) discovered by a
++ * flood from a seed position, together with the passive conductor blocks that
++ * transmit strong power between them (the simulation footprint).
++ *
++ * <p><b>Region / thread affinity.</b> {@link #spansSingleRegion} resolves the owning
++ * {@code RegionId} of every chunk the network touches via the live
++ * {@code com.coderyo.region.RegionIndex}. A connected network can only span adjacent
++ * chunks, and the region merge rule (any two loaded chunks within {@code mergeRadius}
++ * Chebyshev distance — min 1 — merge into ONE region) guarantees adjacent loaded
++ * chunks are co-owned; so a connected network is structurally confined to a single
++ * region and may be ticked by exactly one region worker (single-writer upheld). This
++ * method asserts that invariant rather than relying on it implicitly.
++ */
++public final class RedstoneNetwork {
++
++    /** Hard cap so a pathological flood can never run away. */
++    private static final int MAX_CELLS = 8192;
++
++    private final ResourceKey<Level> dimension;
++    /** Active components (wire/torch/repeater/lever/redstone-block). */
++    private final LongSet components;
++    /** Components + the passive conductor blocks between them (full sim footprint). */
++    private final LongSet footprint;
++    private final LongSet chunkKeys;
++
++    private RedstoneNetwork(final ResourceKey<Level> dimension, final LongSet components,
++                           final LongSet footprint, final LongSet chunkKeys) {
++        this.dimension = dimension;
++        this.components = components;
++        this.footprint = footprint;
++        this.chunkKeys = chunkKeys;
++    }
++
++    public ResourceKey<Level> dimension() {
++        return this.dimension;
++    }
++
++    public LongSet components() {
++        return this.components;
++    }
++
++    public LongSet footprint() {
++        return this.footprint;
++    }
++
++    public LongSet chunkKeys() {
++        return this.chunkKeys;
++    }
++
++    public int size() {
++        return this.components.size();
++    }
++
++    static boolean isComponent(final BlockState state) {
++        return state.is(Blocks.REDSTONE_WIRE)
++            || state.getBlock() instanceof RedstoneTorchBlock
++            || state.getBlock() instanceof DiodeBlock
++            || state.getBlock() instanceof LeverBlock
++            || state.is(Blocks.REDSTONE_BLOCK);
++    }
++
++    /**
++     * Flood-fill a connected network from {@code seed}. Expands through redstone
++     * components and through conductor blocks that are adjacent to a component (those
++     * carry strong power between components, e.g. the block under a torch inverter).
++     */
++    public static RedstoneNetwork detect(final ServerLevel level, final BlockPos seed) {
++        final LongSet components = new LongLinkedOpenHashSet();
++        final LongSet footprint = new LongLinkedOpenHashSet();
++        final LongSet visited = new LongOpenHashSet();
++        final Deque<BlockPos> frontier = new ArrayDeque<>();
++
++        frontier.add(seed.immutable());
++        visited.add(seed.asLong());
++
++        while (!frontier.isEmpty() && footprint.size() < MAX_CELLS) {
++            final BlockPos pos = frontier.poll();
++            final BlockState state = level.getBlockState(pos);
++            final boolean component = isComponent(state);
++            final boolean conductor = !component && state.isRedstoneConductor(level, pos);
++            if (!component && !conductor) {
++                continue;
++            }
++            footprint.add(pos.asLong());
++            if (component) {
++                components.add(pos.asLong());
++            }
++
++            // Expand to the 6 face neighbours, plus the 8 vertical-diagonals so wire
++            // climbing up/down a block step stays connected.
++            for (final Direction dir : Direction.values()) {
++                enqueue(level, frontier, visited, components, conductor, pos.relative(dir));
++            }
++            for (final Direction dir : Direction.Plane.HORIZONTAL) {
++                enqueue(level, frontier, visited, components, conductor, pos.relative(dir).above());
++                enqueue(level, frontier, visited, components, conductor, pos.relative(dir).below());
++            }
++        }
++
++        final LongSet chunkKeys = new LongOpenHashSet();
++        final BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
++        for (final long packed : footprint) {
++            m.set(packed);
++            chunkKeys.add(ChunkPos.pack(m.getX() >> 4, m.getZ() >> 4));
++        }
++        return new RedstoneNetwork(level.dimension(), components, footprint, chunkKeys);
++    }
++
++    private static void enqueue(final ServerLevel level, final Deque<BlockPos> frontier,
++                                final LongSet visited, final LongSet components,
++                                final boolean fromConductor, final BlockPos next) {
++        if (!visited.add(next.asLong())) {
++            return;
++        }
++        final BlockState state = level.getBlockState(next);
++        if (isComponent(state)) {
++            frontier.add(next.immutable());
++            return;
++        }
++        // Only step into a conductor if it is adjacent to a component (it bridges
++        // strong power); never flood across an open conductor plane indefinitely.
++        if (!fromConductor && state.isRedstoneConductor(level, next) && touchesComponent(level, next)) {
++            frontier.add(next.immutable());
++        }
++    }
++
++    private static boolean touchesComponent(final ServerLevel level, final BlockPos pos) {
++        for (final Direction dir : Direction.values()) {
++            if (isComponent(level.getBlockState(pos.relative(dir)))) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * True iff every chunk this network touches resolves to the same owning region
++     * (or no region has formed yet). Drives the single-writer affinity assertion.
++     */
++    public boolean spansSingleRegion(final ServerLevel level) {
++        Object owner = null;
++        boolean first = true;
++        for (final long chunkKey : this.chunkKeys) {
++            final Object region = com.coderyo.region.RegionLifecycle.index()
++                .regionOf(level.dimension(), chunkKey);
++            if (region == null) {
++                continue;
++            }
++            if (first) {
++                owner = region;
++                first = false;
++            } else if (!region.equals(owner)) {
++                return false;
++            }
++        }
++        return true;
++    }
++}
+diff --git a/com/coderyo/redstone/VirtualRedstoneWorld.java b/com/coderyo/redstone/VirtualRedstoneWorld.java
+new file mode 100644
+index 0000000..2164e40
+--- /dev/null
++++ b/com/coderyo/redstone/VirtualRedstoneWorld.java
+@@ -0,0 +1,84 @@
++/*
++ * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
++ */
++package com.coderyo.redstone;
++
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.SignalGetter;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.entity.BlockEntity;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.material.FluidState;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * The in-memory substrate of the compiled redstone logic graph: a sparse
++ * {@code BlockPos -> BlockState} grid that implements {@link SignalGetter}.
++ *
++ * <p><b>Why this is the key to bit-parity.</b> All of vanilla's redstone signal
++ * propagation ({@code getSignal}, {@code getBestNeighborSignal}, {@code getDirectSignal},
++ * {@code getControlInputSignal}, wire connection geometry, {@code isRedstoneConductor})
++ * is expressed as {@link SignalGetter}/{@link net.minecraft.world.level.BlockGetter}
++ * default methods plus {@link BlockState} methods that only ever read neighbour block
++ * states. By backing those reads with our own grid we reuse the EXACT vanilla logic to
++ * evaluate the compiled circuit — no reimplementation of the propagation formulas, so
++ * the computed power levels are identical by construction. Only the discrete-event
++ * scheduling layer (which delays/commits torch & repeater state) lives in
++ * {@link CompiledNetwork}.
++ *
++ * <p>Positions outside the populated grid read as AIR (signal 0, non-conductor),
++ * matching an open-air circuit on a platform.
++ */
++final class VirtualRedstoneWorld implements SignalGetter {
++
++    private static final BlockState AIR = Blocks.AIR.defaultBlockState();
++
++    private final Long2ObjectMap<BlockState> states = new Long2ObjectOpenHashMap<>();
++
++    void set(final BlockPos pos, final BlockState state) {
++        this.states.put(pos.asLong(), state);
++    }
++
++    void set(final long packed, final BlockState state) {
++        this.states.put(packed, state);
++    }
++
++    @Override
++    public BlockState getBlockState(final BlockPos pos) {
++        return this.states.getOrDefault(pos.asLong(), AIR);
++    }
++
++    @Nullable
++    @Override
++    public BlockState getBlockStateIfLoaded(final BlockPos pos) {
++        return this.getBlockState(pos);
++    }
++
++    @Override
++    public FluidState getFluidState(final BlockPos pos) {
++        return this.getBlockState(pos).getFluidState();
++    }
++
++    @Nullable
++    @Override
++    public FluidState getFluidIfLoaded(final BlockPos pos) {
++        return this.getFluidState(pos);
++    }
++
++    @Override
++    public @Nullable BlockEntity getBlockEntity(final BlockPos pos) {
++        return null; // no block entities in the redstone logic-graph substrate (comparators deferred)
++    }
++
++    @Override
++    public int getHeight() {
++        return 384;
++    }
++
++    @Override
++    public int getMinY() {
++        return -64;
++    }
++}
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 5f34b66..05e877c 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1628,6 +1628,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         this.tickRateManager.tick();
+         this.tickChildren(haveTime);
+         com.coderyo.neighborshare.NeighborShare.maybeDumpCounters(this.tickCount); // coderyo - neighbor-scan elimination instrumentation (debug only)
++        com.coderyo.redstone.RedstoneDiffTestHarness.onServerTickEnd(this); // coderyo - redstone HDL-compiler differential parity harness (flag-gated, no-op unless coderyo.redstone.difftest)
+         if (nano - this.lastServerStatus >= STATUS_EXPIRE_TIME_NANOS) {
+             this.lastServerStatus = nano;
+             this.status = this.buildServerStatus();
+-- 
+2.54.0.windows.1
+
