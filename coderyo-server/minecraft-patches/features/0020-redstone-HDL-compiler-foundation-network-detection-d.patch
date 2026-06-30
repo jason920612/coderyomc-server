@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751e1c800f3
+index 0000000000000000000000000000000000000000..5ecedbc00327165c5199d41c6e46f39e4d4b916e
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,1266 @@
+@@ -0,0 +1,1761 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -35,9 +35,16 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +import net.minecraft.core.BlockPos;
 +import net.minecraft.core.Direction;
 +import net.minecraft.server.level.ServerLevel;
++import net.minecraft.util.RandomSource;
++import net.minecraft.world.Container;
++import net.minecraft.world.inventory.AbstractContainerMenu;
++import net.minecraft.world.item.ItemStack;
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.ComparatorBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.DispenserBlock;
++import net.minecraft.world.level.block.DropperBlock;
++import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
@@ -47,7 +54,10 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +import net.minecraft.world.level.block.piston.MovingPistonBlock;
 +import net.minecraft.world.level.block.piston.PistonBaseBlock;
 +import net.minecraft.world.level.block.piston.PistonHeadBlock;
++import net.minecraft.world.level.block.entity.BlockEntity;
 +import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
++import net.minecraft.world.level.block.entity.DispenserBlockEntity;
++import net.minecraft.world.level.block.entity.HopperBlockEntity;
 +import net.minecraft.world.level.block.state.BlockState;
 +import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 +import net.minecraft.world.level.block.state.properties.ComparatorMode;
@@ -78,15 +88,22 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 + *
 + * <p>MODELLED: redstone wire, torch, repeater, lever/redstone-block sources,
 + * <b>comparator</b> (compare/subtract analog, container/block-entity input, 2-tick
-+ * delay) and <b>observer</b> (2-tick pulse on observed block-state change).
++ * delay), <b>observer</b> (2-tick pulse on observed block-state change), the full
++ * <b>piston</b> (normal/sticky, QC, slime/honey multi-block drag, 0-tick fast-retract),
++ * and the <b>item/container layer</b>: container inventories (hopper/dropper/dispenser/
++ * chest/barrel) drive DYNAMIC comparator fullness; the <b>hopper</b> transfer (8-tick
++ * cooldown, ENABLED locked-by-redstone gate, the inter-hopper one-tick cooldown skip —
++ * the hopper clock); and <b>dispenser/dropper</b> firing on the rising power edge.
 + *
-+ * <p>DEFERRED (not modelled — see RedstoneDiffTestHarness): pistons, dispensers/droppers,
-+ * quasi-connectivity, 0-tick pulses, item frames in front of comparators, the EIGENCRAFT
-+ * / ALTERNATE_CURRENT wire algorithms and the experimental wire flood.
++ * <p>DEFERRED (not modelled — see RedstoneDiffTestHarness): item-ENTITY physics (thrown/
++ * dropped/elevator items, pickup, despawn), item frames in front of comparators, item
++ * sorting hardware edge cases, hopper/chest-minecarts, furnace fuel, special dispenser
++ * behaviours (projectiles/block placement/armour), pressure-plate/tripwire entity
++ * detection, the EIGENCRAFT / ALTERNATE_CURRENT wire algorithms and the wire flood.
 + */
 +final class CompiledNetwork {
 +
-+    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP, BUTTON, TARGET, PISTON }
++    private enum Kind { TORCH, REPEATER, COMPARATOR, OBSERVER, LAMP, BUTTON, TARGET, PISTON, DISPENSER }
 +
 +    /**
 +     * One cell of an in-flight piston contraption — the compiled analogue of a vanilla
@@ -139,6 +156,43 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +    private final LongSet buttons = new LongOpenHashSet();
 +    private final LongSet targets = new LongOpenHashSet();
 +    private final LongSet pistons = new LongOpenHashSet();
++
++    /**
++     * Hoppers in this network, in compile (insertion) order. The order matters: a hopper's
++     * transfer reads {@code tickedGameTime} of its source/destination hopper to decide the
++     * one-tick cooldown skip ({@code HopperBlockEntity.tryMoveInItem}), so hoppers must tick in
++     * the SAME order the live world ticks its block entities (block-entity list order) for the
++     * inter-hopper clock timing to be bit-identical. A {@code LinkedHashSet} preserves that order.
++     */
++    private final LongSet hoppers = new it.unimi.dsi.fastutil.longs.LongLinkedOpenHashSet();
++    /** Dispensers + droppers (a dropper is a {@code DispenserBlock} subclass). */
++    private final LongSet dispensers = new LongOpenHashSet();
++    /** Every cell holding a compiled (privately-owned, independently-evolving) container BE. */
++    private final LongSet containers = new LongOpenHashSet();
++
++    /** Per-hopper transfer cooldown ({@code HopperBlockEntity.cooldownTime}); fires when {@code <= 0}. */
++    private final java.util.Map<Long, Integer> hopperCooldown = new HashMap<>();
++    /** Per-hopper {@code tickedGameTime} (the tick it last ran), for the cooldown-skip comparison. */
++    private final java.util.Map<Long, Long> hopperTicked = new HashMap<>();
++    /**
++     * Per-hopper ENABLED state LATCHED from the previous step. Vanilla ticks the hopper's
++     * block-entity ticker EARLY in the server tick, BEFORE the end-of-tick redstone change that
++     * locks/unlocks it lands; so a same-tick power change only gates the hopper's transfer on the
++     * NEXT tick. The compiled harness applies the stimulus at the start of the step, so we gate the
++     * transfer on this latched (pre-this-step) value while still writing the live (post-step)
++     * ENABLED into the grid for the block-state comparison — reproducing that one-tick lock latency.
++     */
++    private final java.util.Map<Long, Boolean> hopperEnabledLatched = new HashMap<>();
++
++    /** Spigot's {@code hopper-transfer} default: items move and the cooldown resets to 8 ticks. */
++    private static final int HOPPER_TRANSFER_COOLDOWN = 8;
++    /** Spigot's {@code hopper-amount} default: one item per transfer (vanilla parity). */
++    private static final int HOPPER_AMOUNT = 1;
++    /** {@code DispenserBlock.TRIGGER_DURATION}: fire 4 ticks after the rising power edge. */
++    private static final int DISPENSER_TRIGGER_DELAY = 4;
++
++    /** A throwaway RNG for {@code getRandomSlot}; deterministic when exactly one slot is occupied. */
++    private final RandomSource slotRng = RandomSource.create(0L);
 +
 +    /** In-flight piston-moved cells (grid cell == MOVING_PISTON), keyed by packed pos. */
 +    private final Long2ObjectMap<MovingBlock> moving = new Long2ObjectOpenHashMap<>();
@@ -196,6 +250,10 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +                c.targets.add(packed);
 +            } else if (state.getBlock() instanceof PistonBaseBlock) {
 +                c.pistons.add(packed);
++            } else if (state.getBlock() instanceof HopperBlock) {
++                c.hoppers.add(packed);
++            } else if (state.getBlock() instanceof DispenserBlock) {
++                c.dispensers.add(packed); // covers DropperBlock (a DispenserBlock subclass)
 +            }
 +        }
 +        // A piston's quasi-connectivity (QC) power read samples the block ABOVE it and that
@@ -227,8 +285,49 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +            c.snapshotExternal(level, observed);
 +            c.lastObserved.put(packed, level.getBlockState(observed));
 +        }
++        // ITEM/CONTAINER layer: give every container in the footprint (hopper / dropper /
++        // dispenser / chest / barrel — including the plain partner containers a hopper transfers
++        // with, forced into the footprint by RedstoneNetwork) a PRIVATELY-OWNED block entity seeded
++        // with a COPY of the live inventory. The compiled simulator evolves these independently, so
++        // the differential harness is a true oracle: comparator fullness + hopper transfers read the
++        // compiled inventory, never the live world's answer.
++        for (final long packed : network.footprint()) {
++            c.createContainer(level, packed);
++        }
 +        c.recomputeWires();
 +        return c;
++    }
++
++    /**
++     * Create a privately-owned container block entity for a footprint cell, seeded with a COPY of
++     * the live inventory, so the compiled model tracks item movement independently of the live
++     * world. Hoppers also seed their {@code cooldownTime} from the live block entity.
++     */
++    private void createContainer(final ServerLevel level, final long packed) {
++        final BlockPos pos = BlockPos.of(packed);
++        final BlockState state = this.vw.getBlockState(pos);
++        if (!(level.getBlockEntity(pos) instanceof Container liveContainer)) {
++            return;
++        }
++        if (!(state.getBlock() instanceof net.minecraft.world.level.block.EntityBlock eb)) {
++            return;
++        }
++        final BlockEntity copy = eb.newBlockEntity(pos, state);
++        if (!(copy instanceof Container dest)) {
++            return; // not a container BE (e.g. a comparator) — leave the existing snapshot alone
++        }
++        final int n = Math.min(liveContainer.getContainerSize(), dest.getContainerSize());
++        for (int i = 0; i < n; i++) {
++            dest.setItem(i, liveContainer.getItem(i).copy());
++        }
++        this.vw.setBlockEntity(packed, copy);
++        this.containers.add(packed);
++        if (copy instanceof HopperBlockEntity && liveContainer instanceof HopperBlockEntity liveHopper) {
++            this.hopperCooldown.put(packed, liveHopper.cooldownTime);
++            this.hopperTicked.put(packed, Long.MIN_VALUE);
++            this.hopperEnabledLatched.put(packed,
++                state.hasProperty(HopperBlock.ENABLED) ? state.getValue(HopperBlock.ENABLED) : Boolean.TRUE);
++        }
 +    }
 +
 +    /** Snapshot an external input cell (block state + live block entity) if not already present. */
@@ -315,6 +414,16 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +        this.advanceMovers();
 +        this.recomputeWires();
 +        this.syncObservers();
++
++        // ITEM/CONTAINER layer, ticked LAST — vanilla runs block-entity tickers (hopper transfer)
++        // after scheduled block ticks and block events within one ServerLevel.tick. A hopper moves
++        // up to one item per 8-tick cooldown; a container's contents changing is then picked up by
++        // the comparator re-scan below (anchored at THIS tick, exactly like vanilla's setChanged ->
++        // updateNeighbourForOutputSignal -> comparator checkTickOnNeighbor schedule).
++        this.tickHoppers(tick);
++        this.recomputeWires();
++        this.syncObservers();
++        this.rescanContainers(tick);
 +    }
 +
 +    private void run(final ScheduledEntry e, final long tick) {
@@ -327,6 +436,7 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +            case BUTTON -> this.runButton(e.pos());
 +            case TARGET -> this.runTarget(e.pos());
 +            case PISTON -> this.runPistonEvent(e.pos());
++            case DISPENSER -> this.runDispenser(e.pos());
 +        }
 +    }
 +
@@ -346,6 +456,24 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +        }
 +        for (final long pos : this.pistons) {
 +            this.schedulePistonIfNeeded(pos, tick);
++        }
++        for (final long pos : this.dispensers) {
++            this.scheduleDispenserIfNeeded(pos, tick);
++        }
++    }
++
++    /**
++     * Re-scan just the comparator / dispenser schedules after the item layer ticked, so a
++     * container-fullness change drives the comparator output (and a dispenser's power read stays
++     * current) anchored at the SAME tick the change happened — mirroring vanilla's synchronous
++     * neighbour notification when a container's {@code setChanged} fires.
++     */
++    private void rescanContainers(final long tick) {
++        for (final long pos : this.comparators) {
++            this.scheduleComparatorIfNeeded(pos, tick);
++        }
++        for (final long pos : this.dispensers) {
++            this.scheduleDispenserIfNeeded(pos, tick);
 +        }
 +    }
 +
@@ -588,16 +716,32 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +        // Comparator analog override.
 +        BlockState targetState = this.vw.getBlockState(targetPos);
 +        if (targetState.hasAnalogOutputSignal()) {
-+            resultSignal = targetState.getAnalogOutputSignal(this.level, targetPos, facing.getOpposite());
++            resultSignal = this.analogOutput(targetPos, targetState, facing.getOpposite());
 +        } else if (resultSignal < Redstone.SIGNAL_MAX && targetState.isRedstoneConductor(this.vw, targetPos)) {
 +            targetPos = targetPos.relative(facing);
 +            targetState = this.vw.getBlockState(targetPos);
 +            // Item frames in front of a comparator are NOT modelled (no entities in the grid).
 +            if (targetState.hasAnalogOutputSignal()) {
-+                resultSignal = targetState.getAnalogOutputSignal(this.level, targetPos, facing.getOpposite());
++                resultSignal = this.analogOutput(targetPos, targetState, facing.getOpposite());
 +            }
 +        }
 +        return resultSignal;
++    }
++
++    /**
++     * The analog (comparator) output of a block. When the cell holds a compiled CONTAINER block
++     * entity, read its fullness with vanilla's EXACT formula
++     * ({@code AbstractContainerMenu.getRedstoneSignalFromContainer}) over the INDEPENDENTLY-evolved
++     * compiled inventory — so a comparator on a hopper/chest/barrel tracks the simulated item
++     * movement, not the live world. Otherwise fall back to the vanilla block method against the
++     * live level (static external analog sources: a barrel that is a pure network input, etc.).
++     */
++    private int analogOutput(final BlockPos pos, final BlockState state, final Direction dir) {
++        final BlockEntity be = this.vw.getBlockEntity(pos);
++        if (be instanceof Container container) {
++            return AbstractContainerMenu.getRedstoneSignalFromContainer(container);
++        }
++        return state.getAnalogOutputSignal(this.level, pos, dir);
 +    }
 +
 +    // Transcribed from DiodeBlock.getAlternateSignal (comparator side input; NOT diodes-only).
@@ -1256,6 +1400,357 @@ index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751
 +        return !state.hasBlockEntity();
 +    }
 +
++    // ---------------------------------------------------- item / container layer
++    //
++    // The ITEM transport layer the comparator / hopper-timer circuits need. Container inventories
++    // (hopper / dropper / dispenser / chest / barrel) are modelled as privately-owned block
++    // entities in the grid (see compile/createContainer), seeded with COPIES of the live world and
++    // evolved here independently — so the comparator analog read (getRedstoneSignalFromContainer)
++    // and the differential harness observe the SIMULATED inventory, never the live answer.
++    //
++    // The hopper transfer is transcribed from vanilla HopperBlockEntity (pushItemsTick / tryMoveItems
++    // / ejectItems / suckInItems / tryMoveInItem), INCLUDING the 8-tick cooldown, the
++    // ENABLED-(un)locked gate, and the one-tick cooldown-SKIP between hoppers that ticked the same
++    // game tick (the inter-hopper clock-timing nuance). Bukkit events, item-ENTITY pickup/ejection,
++    // WorldlyContainer face-slot filtering, chunk-load guards and the hopper-minecart path are
++    // DEFERRED (noted; not needed for the redstone-relevant inventory + timing). The corpus uses
++    // only flat-slot containers (none are WorldlyContainer), so getSlots == every slot.
++
++    private static final int HOPPER_EMPTY = 0;
++    private static final int HOPPER_HAS_ITEMS = 1;
++    private static final int HOPPER_IS_FULL = 2;
++
++    /** Tick every hopper once this game tick, in compile order (== live block-entity tick order). */
++    private void tickHoppers(final long tick) {
++        for (final long pos : this.hoppers) {
++            this.tickHopper(pos, tick);
++        }
++    }
++
++    // Transcribed from HopperBlockEntity.pushItemsTick + HopperBlock.checkPoweredState.
++    private void tickHopper(final long pos, final long tick) {
++        final BlockPos bp = BlockPos.of(pos);
++        if (!(this.vw.getBlockEntity(bp) instanceof HopperBlockEntity hopper)) {
++            return;
++        }
++        // ENABLED == !hasNeighborSignal (locked when powered). Write the LIVE (post-step) value into
++        // the grid for the block-state comparison, but gate the TRANSFER on the value LATCHED at the
++        // end of the previous step — vanilla's block-entity ticker runs before the end-of-tick power
++        // change, so a same-tick lock/unlock only takes effect on the next tick.
++        final boolean enabledNow = !this.vw.hasNeighborSignal(bp);
++        final BlockState st = this.state(pos);
++        if (st.hasProperty(HopperBlock.ENABLED) && st.getValue(HopperBlock.ENABLED) != enabledNow) {
++            this.vw.set(pos, st.setValue(HopperBlock.ENABLED, enabledNow));
++        }
++        final boolean enabledGate = this.hopperEnabledLatched.getOrDefault(pos, enabledNow);
++        this.hopperEnabledLatched.put(pos, enabledNow);
++        // cooldownTime--; tickedGameTime = now.
++        int cooldown = this.hopperCooldown.getOrDefault(pos, -1) - 1;
++        this.hopperTicked.put(pos, tick);
++        if (cooldown > 0) { // isOnCooldown
++            this.hopperCooldown.put(pos, cooldown);
++            return;
++        }
++        cooldown = 0;
++        this.hopperCooldown.put(pos, cooldown);
++        // tryMoveItems requires !onCooldown AND HopperBlock.ENABLED (the locked-by-redstone gate).
++        if (!enabledGate) {
++            return;
++        }
++        final int fullState = this.hopperFullState(hopper);
++        boolean changed = false;
++        if (fullState != HOPPER_EMPTY) {
++            changed = this.ejectItems(pos, hopper);
++        }
++        if (changed || fullState != HOPPER_IS_FULL) {
++            changed |= this.suckInItems(pos, hopper);
++        }
++        if (changed) {
++            this.hopperCooldown.put(pos, HOPPER_TRANSFER_COOLDOWN);
++        }
++    }
++
++    // Transcribed from HopperBlockEntity.getFullState.
++    private int hopperFullState(final Container hopper) {
++        boolean empty = true;
++        boolean full = true;
++        for (int i = 0; i < hopper.getContainerSize(); i++) {
++            final ItemStack stack = hopper.getItem(i);
++            if (stack.isEmpty()) {
++                full = false;
++                continue;
++            }
++            if (!full) {
++                return HOPPER_HAS_ITEMS;
++            }
++            empty = false;
++            if (stack.getCount() != stack.getMaxStackSize()) {
++                return HOPPER_HAS_ITEMS;
++            }
++        }
++        return empty ? HOPPER_EMPTY : (full ? HOPPER_IS_FULL : HOPPER_HAS_ITEMS);
++    }
++
++    // Transcribed from HopperBlockEntity.ejectItems (push into the faced container).
++    private boolean ejectItems(final long pos, final HopperBlockEntity hopper) {
++        final Direction facing = this.state(pos).getValue(HopperBlock.FACING);
++        final long destPacked = BlockPos.of(pos).relative(facing).asLong();
++        final Container dest = this.containerAt(destPacked);
++        if (dest == null) {
++            return false;
++        }
++        final Direction insertDir = facing.getOpposite();
++        if (this.isFullContainer(dest)) {
++            return false;
++        }
++        return this.hopperPush(pos, hopper, destPacked, dest, insertDir);
++    }
++
++    // Transcribed from HopperBlockEntity.suckInItems (pull from the container ABOVE). Item-ENTITY
++    // pickup (items lying on top of a hopper with no container above) is DEFERRED.
++    private boolean suckInItems(final long pos, final HopperBlockEntity hopper) {
++        final long srcPacked = BlockPos.of(pos).above().asLong();
++        final Container src = this.containerAt(srcPacked);
++        if (src == null) {
++            return false;
++        }
++        for (int slot = 0; slot < src.getContainerSize(); slot++) {
++            final ItemStack item = src.getItem(slot);
++            if (!item.isEmpty() && src.canTakeItem(hopper, slot, item)) {
++                if (this.hopperPull(pos, hopper, srcPacked, src, slot)) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++
++    // Transcribed from HopperBlockEntity.hopperPush (move up to hopperAmount=1 of one slot).
++    private boolean hopperPush(final long hopperPos, final Container hopper, final long destPacked,
++                               final Container dest, final Direction dir) {
++        boolean foundItem = false;
++        for (int i = 0; i < hopper.getContainerSize(); i++) {
++            final ItemStack item = hopper.getItem(i);
++            if (!item.isEmpty()) {
++                foundItem = true;
++                final int originalCount = item.getCount();
++                final int movedCount = Math.min(HOPPER_AMOUNT, originalCount);
++                item.setCount(movedCount);
++                final ItemStack remaining = this.addItem(hopper, hopperPos, dest, destPacked, item, dir);
++                final int remainingCount = remaining.getCount();
++                if (remainingCount != movedCount) {
++                    ItemStack restored = item.copy(true);
++                    restored.setCount(originalCount);
++                    if (!restored.isEmpty()) {
++                        restored.setCount(originalCount - movedCount + remainingCount);
++                    }
++                    hopper.setItem(i, restored);
++                    return true;
++                }
++                item.setCount(originalCount);
++            }
++        }
++        if (foundItem) { // Paper hopper.cooldownWhenFull (default true): full destination -> cooldown
++            this.hopperCooldown.put(hopperPos, HOPPER_TRANSFER_COOLDOWN);
++        }
++        return false;
++    }
++
++    // Transcribed from HopperBlockEntity.hopperPull (pull up to hopperAmount=1 from a source slot).
++    private boolean hopperPull(final long hopperPos, final Container hopper, final long srcPacked,
++                               final Container src, final int slot) {
++        final ItemStack item = src.getItem(slot);
++        final int originalCount = item.getCount();
++        final int movedCount = Math.min(HOPPER_AMOUNT, originalCount);
++        item.setCount(movedCount);
++        final ItemStack remaining = this.addItem(src, srcPacked, hopper, hopperPos, item, null);
++        final int remainingCount = remaining.getCount();
++        if (remainingCount != movedCount) {
++            ItemStack restored = item.copy(true);
++            restored.setCount(originalCount);
++            if (!restored.isEmpty()) {
++                restored.setCount(originalCount - movedCount + remainingCount);
++            }
++            src.setItem(slot, restored);
++            return true;
++        }
++        item.setCount(originalCount);
++        return false;
++    }
++
++    // Transcribed from HopperBlockEntity.addItem (flat-slot container; no WorldlyContainer in corpus).
++    private ItemStack addItem(final Container from, final long fromPacked, final Container to,
++                              final long toPacked, ItemStack stack, final @org.jspecify.annotations.Nullable Direction dir) {
++        final int size = to.getContainerSize();
++        for (int i = 0; i < size && !stack.isEmpty(); i++) {
++            stack = this.tryMoveInItem(from, fromPacked, to, toPacked, stack, i, dir);
++        }
++        return stack;
++    }
++
++    // Transcribed from HopperBlockEntity.tryMoveInItem (place/merge + the inter-hopper cooldown skip).
++    private ItemStack tryMoveInItem(final Container from, final long fromPacked, final Container to,
++                                    final long toPacked, ItemStack stack, final int slot,
++                                    final @org.jspecify.annotations.Nullable Direction dir) {
++        final ItemStack current = to.getItem(slot);
++        if (to.canPlaceItem(slot, stack)) {
++            boolean success = false;
++            final boolean wasEmpty = to.isEmpty();
++            if (current.isEmpty()) {
++                ItemStack leftover = ItemStack.EMPTY;
++                if (!stack.isEmpty() && stack.getCount() > to.getMaxStackSize()) {
++                    leftover = stack;
++                    stack = stack.split(to.getMaxStackSize());
++                }
++                to.setItem(slot, stack);
++                stack = leftover;
++                success = true;
++            } else if (canMergeItems(current, stack)) {
++                final int space = Math.min(stack.getMaxStackSize(), to.getMaxStackSize()) - current.getCount();
++                final int count = Math.min(stack.getCount(), space);
++                stack.shrink(count);
++                current.grow(count);
++                success = count > 0;
++            }
++            if (success) {
++                // The famous hopper-to-hopper timing: a destination hopper that was empty gets a
++                // cooldown of 8 minus 1 tick when the SOURCE hopper already ticked this game tick
++                // (so the chain advances a tick faster). Mirrors HopperBlockEntity.tryMoveInItem.
++                if (wasEmpty && this.hoppers.contains(toPacked)
++                    && this.hopperCooldown.getOrDefault(toPacked, -1) <= 8) { // !isOnCustomCooldown
++                    int skipTickCount = 0;
++                    if (this.hoppers.contains(fromPacked)
++                        && this.hopperTicked.getOrDefault(toPacked, Long.MIN_VALUE)
++                            >= this.hopperTicked.getOrDefault(fromPacked, Long.MIN_VALUE)) {
++                        skipTickCount = 1;
++                    }
++                    this.hopperCooldown.put(toPacked, HOPPER_TRANSFER_COOLDOWN - skipTickCount);
++                }
++            }
++        }
++        return stack;
++    }
++
++    // Transcribed from HopperBlockEntity.canMergeItems.
++    private static boolean canMergeItems(final ItemStack a, final ItemStack b) {
++        return a.getCount() < a.getMaxStackSize() && ItemStack.isSameItemSameComponents(a, b);
++    }
++
++    // Transcribed from HopperBlockEntity.isFullContainer (flat slots).
++    private boolean isFullContainer(final Container container) {
++        for (int slot = 0; slot < container.getContainerSize(); slot++) {
++            final ItemStack stack = container.getItem(slot);
++            if (stack.getCount() < stack.getMaxStackSize()) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    /** The compiled container BE at a cell, or null if that cell holds no compiled container. */
++    private @org.jspecify.annotations.Nullable Container containerAt(final long packed) {
++        if (!this.containers.contains(packed)) {
++            return null;
++        }
++        return this.vw.getBlockEntity(BlockPos.of(packed)) instanceof Container c ? c : null;
++    }
++
++    // ------------------------------------------------------- dispenser / dropper
++    //
++    // Fire on the RISING edge of power: a rising edge sets TRIGGERED and schedules a fire 4 ticks
++    // later (DispenserBlock.neighborChanged -> scheduleTick); the fire empties one item from a
++    // random slot (DispenserBlockEntity.getRandomSlot — deterministic when one slot is occupied).
++    // A dropper moves the item into the faced container if present, else "drops" it (slot -1); a
++    // dispenser ejects it (slot -1). The thrown/placed ITEM ENTITY + special dispense behaviours
++    // (projectiles, block placement, armour) are DEFERRED — only the comparator-visible inventory
++    // change + TRIGGERED state are modelled.
++
++    private boolean dispenserShouldTrigger(final long pos) {
++        final BlockPos bp = BlockPos.of(pos);
++        return this.vw.hasNeighborSignal(bp) || this.vw.hasNeighborSignal(bp.above());
++    }
++
++    // Transcribed from DispenserBlock.neighborChanged.
++    private void scheduleDispenserIfNeeded(final long pos, final long tick) {
++        if (this.willTick(pos, Kind.DISPENSER)) {
++            return;
++        }
++        final BlockState st = this.state(pos);
++        if (!st.hasProperty(DispenserBlock.TRIGGERED)) {
++            return;
++        }
++        final boolean shouldTrigger = this.dispenserShouldTrigger(pos);
++        final boolean isTriggered = st.getValue(DispenserBlock.TRIGGERED);
++        if (shouldTrigger && !isTriggered) {
++            this.vw.set(pos, st.setValue(DispenserBlock.TRIGGERED, true));
++            this.schedule(pos, Kind.DISPENSER, DISPENSER_TRIGGER_DELAY, P_NORMAL, tick);
++        } else if (!shouldTrigger && isTriggered) {
++            this.vw.set(pos, st.setValue(DispenserBlock.TRIGGERED, false));
++        }
++    }
++
++    // Transcribed from DispenserBlock.tick -> dispenseFrom / DropperBlock.dispenseFrom.
++    private void runDispenser(final long pos) {
++        final BlockPos bp = BlockPos.of(pos);
++        if (!(this.vw.getBlockEntity(bp) instanceof DispenserBlockEntity be)) {
++            return;
++        }
++        final int slot = be.getRandomSlot(this.slotRng);
++        if (slot < 0) {
++            return; // no item -> fail (no inventory change)
++        }
++        final ItemStack item = be.getItem(slot);
++        if (item.isEmpty()) {
++            return;
++        }
++        if (this.state(pos).getBlock() instanceof DropperBlock) {
++            final Direction facing = this.state(pos).getValue(DispenserBlock.FACING);
++            final long intoPacked = bp.relative(facing).asLong();
++            final Container into = this.containerAt(intoPacked);
++            ItemStack remaining;
++            if (into == null) {
++                remaining = item.copy();
++                remaining.shrink(1); // dropped into the world as an item entity (entity deferred)
++            } else {
++                final ItemStack moved = item.copyWithCount(1);
++                final ItemStack leftover = this.addItem(be, pos, into, intoPacked, moved, facing.getOpposite());
++                if (leftover.isEmpty()) {
++                    remaining = item.copy();
++                    remaining.shrink(1);
++                } else {
++                    remaining = item.copy();
++                }
++            }
++            be.setItem(slot, remaining);
++        } else {
++            // Dispenser default behaviour for a plain item: eject as an item entity, slot loses 1.
++            final ItemStack remaining = item.copy();
++            remaining.shrink(1);
++            be.setItem(slot, remaining);
++        }
++    }
++
++    // ----------------------------------------------------------- harness probes
++
++    /** Total item count across a compiled container's slots (-1 if no compiled container). */
++    int containerItemCount(final long packed) {
++        final Container c = this.containerAt(packed);
++        if (c == null) {
++            return -1;
++        }
++        int total = 0;
++        for (int i = 0; i < c.getContainerSize(); i++) {
++            total += c.getItem(i).getCount();
++        }
++        return total;
++    }
++
++    /** Vanilla comparator fullness of a compiled container (-1 if no compiled container). */
++    int containerRedstoneSignal(final long packed) {
++        final Container c = this.containerAt(packed);
++        return c == null ? -1 : AbstractContainerMenu.getRedstoneSignalFromContainer(c);
++    }
++
 +    // -------------------------------------------------------------- scheduling
 +
 +    private boolean willTick(final long pos, final Kind kind) {
@@ -1374,10 +1869,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..ee38674b69e4a1829707c45c9be3a1bcd2126b9c
+index 0000000000000000000000000000000000000000..186f3adc78c71e3f93e109324dbaf049c6b5095a
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,880 @@
+@@ -0,0 +1,1022 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -1391,11 +1886,14 @@ index 0000000000000000000000000000000000000000..ee38674b69e4a1829707c45c9be3a1bc
 +import net.minecraft.server.MinecraftServer;
 +import net.minecraft.server.level.ServerLevel;
 +import net.minecraft.world.Container;
++import net.minecraft.world.inventory.AbstractContainerMenu;
 +import net.minecraft.world.item.ItemStack;
 +import net.minecraft.world.item.Items;
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.ComparatorBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.DispenserBlock;
++import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedstoneLampBlock;
@@ -1570,6 +2068,33 @@ index 0000000000000000000000000000000000000000..ee38674b69e4a1829707c45c9be3a1bc
 +    private static final BlockState STICKY_E = pistonE(true);
 +    private static final BlockState SLIME = Blocks.SLIME_BLOCK.defaultBlockState();
 +    private static final BlockState HONEY = Blocks.HONEY_BLOCK.defaultBlockState();
++    // ---- ITEM / CONTAINER layer ----
++    private static final BlockState HOPPER_DOWN = Blocks.HOPPER.defaultBlockState()
++        .setValue(HopperBlock.FACING, Direction.DOWN);
++    private static final BlockState HOPPER_E = Blocks.HOPPER.defaultBlockState()
++        .setValue(HopperBlock.FACING, Direction.EAST);
++    private static final BlockState HOPPER_W = Blocks.HOPPER.defaultBlockState()
++        .setValue(HopperBlock.FACING, Direction.WEST);
++    private static final BlockState DROPPER_DOWN = Blocks.DROPPER.defaultBlockState()
++        .setValue(DispenserBlock.FACING, Direction.DOWN);
++    private static final BlockState DISPENSER_UP = Blocks.DISPENSER.defaultBlockState()
++        .setValue(DispenserBlock.FACING, Direction.UP);
++    /** Comparator (COMPARE mode) facing EAST: reads the container immediately to its east. */
++    private static final BlockState COMP_CMP_E =
++        Blocks.COMPARATOR.defaultBlockState()
++            .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST)
++            .setValue(ComparatorBlock.MODE, ComparatorMode.COMPARE);
++
++    /** Seed the first {@code slots} slots of a live container with {@code count} of {@code item}. */
++    private static void fillSlots(final ServerLevel level, final BlockPos pos,
++                                  final net.minecraft.world.item.Item item, final int count, final int slots) {
++        if (level.getBlockEntity(pos) instanceof Container container) {
++            for (int s = 0; s < slots && s < container.getContainerSize(); s++) {
++                container.setItem(s, new ItemStack(item, count));
++            }
++            container.setChanged();
++        }
++    }
 +
 +    private static void put(final ServerLevel level, final int x, final int y, final int z, final BlockState state) {
 +        level.setBlockAndUpdate(new BlockPos(x, y, z), state);
@@ -2051,6 +2576,87 @@ index 0000000000000000000000000000000000000000..ee38674b69e4a1829707c45c9be3a1bc
 +                setBoth(lvl, c, new BlockPos(68, 100, 82), AIR);      // power off ~2 ticks later
 +            }
 +        }));
++
++        // =================================================================
++        //  ITEM / CONTAINER LAYER — hopper transfer (8-tick cooldown), the
++        //  hopper clock, dynamic comparator fullness, dropper/dispenser fire
++        //  on a rising edge, and the redstone-LOCKED hopper. All differential-
++        //  compared per tick on inventory counts + comparator output + the
++        //  HOPPER_ENABLED / TRIGGERED block states.
++        // =================================================================
++
++        // ---- Circuit 25: HOPPER CLOCK (headline) — items cycle between two hoppers ----
++        // Hopper A (faces EAST) and hopper B (faces WEST) point into each other; A is seeded with a
++        // stack of sticks. Each fires every 8 ticks, pushing one item to the other (with the famous
++        // one-tick inter-hopper cooldown SKIP), so the items cycle and each hopper's fullness
++        // oscillates — a self-timed item clock. A comparator reads each hopper. The whole ping-pong
++        // (item counts in BOTH hoppers + both comparator outputs) must be bit-identical every tick.
++        put(level, 59, 101, 90, COMP_CMP_E);       // comparator reads A (east)
++        put(level, 60, 101, 90, HOPPER_E);         // hopper A -> pushes east into B
++        put(level, 61, 101, 90, HOPPER_W);         // hopper B -> pushes west into A
++        put(level, 62, 101, 90, COMP_CMP_W);       // comparator reads B (west)
++        fillSlots(level, new BlockPos(60, 101, 90), Items.STICK, 32, 1);
++        SCENARIOS.add(new Scenario("hopper-clock", new BlockPos(60, 101, 90), (lvl, c, rel) -> {
++        }));
++
++        // ---- Circuit 26: hopper DRAINING into a barrel (8-tick cadence + falling comparator) ----
++        // A hopper (faces DOWN) seeded nearly full drips one item every 8 ticks into the barrel
++        // below it. A comparator reads the hopper's FALLING fullness; the barrel's item count rises.
++        // Proves the 8-tick transfer cadence + dynamic comparator fullness, single-hopper (no skip).
++        put(level, 64, 101, 93, COMP_CMP_E);       // comparator reads the hopper (east)
++        put(level, 65, 101, 93, HOPPER_DOWN);      // hopper -> drains down into barrel
++        put(level, 65, 100, 93, BARREL);           // sink
++        fillSlots(level, new BlockPos(65, 101, 93), Items.STICK, 64, 4); // 256 items
++        SCENARIOS.add(new Scenario("hopper-drain", new BlockPos(65, 101, 93), (lvl, c, rel) -> {
++        }));
++
++        // ---- Circuit 27: DROPPER fires on a rising power edge, moving 1 item into a barrel ----
++        // A dropper (faces DOWN) over a barrel; a redstone block toggled to its east supplies the
++        // rising edge. Each rising edge schedules a fire 4 ticks later (TRIGGERED set immediately),
++        // moving exactly one item from the dropper into the barrel. Inventory decrement + TRIGGERED
++        // must match vanilla tick-for-tick. (A single occupied slot => deterministic getRandomSlot.)
++        put(level, 67, 101, 96, COMP_CMP_E);       // comparator reads the dropper (east)
++        put(level, 68, 101, 96, DROPPER_DOWN);     // dropper -> faces barrel below
++        put(level, 68, 100, 96, BARREL);           // catch container
++        fillSlots(level, new BlockPos(68, 101, 96), Items.STICK, 16, 1);
++        SCENARIOS.add(new Scenario("dropper-pulse", new BlockPos(68, 101, 96), (lvl, c, rel) -> {
++            if (rel == 30 || rel == 80) {
++                setBoth(lvl, c, new BlockPos(69, 101, 96), REDBLOCK); // rising edge -> fire @+4
++            } else if (rel == 50 || rel == 100) {
++                setBoth(lvl, c, new BlockPos(69, 101, 96), AIR);      // falling edge -> TRIGGERED off
++            }
++        }));
++
++        // ---- Circuit 28: DISPENSER fires on a rising power edge (slot emptied) ----
++        // A dispenser (faces UP) seeded with a stack; a redstone block toggled to its east fires it.
++        // The dispensed item leaves the inventory (the thrown item ENTITY is deferred); the slot
++        // decrements and TRIGGERED toggles, both differential-compared.
++        put(level, 71, 101, 96, COMP_CMP_E);       // comparator reads the dispenser (east)
++        put(level, 72, 101, 96, DISPENSER_UP);
++        fillSlots(level, new BlockPos(72, 101, 96), Items.STICK, 16, 1);
++        SCENARIOS.add(new Scenario("dispenser-pulse", new BlockPos(72, 101, 96), (lvl, c, rel) -> {
++            if (rel == 30 || rel == 80) {
++                setBoth(lvl, c, new BlockPos(73, 101, 96), REDBLOCK); // rising edge -> fire @+4
++            } else if (rel == 50 || rel == 100) {
++                setBoth(lvl, c, new BlockPos(73, 101, 96), AIR);      // falling edge -> TRIGGERED off
++            }
++        }));
++
++        // ---- Circuit 29: hopper LOCKED by redstone power (no transfer while powered) ----
++        // A hopper draining into a barrel; powering it (redstone block to its east) sets
++        // HopperBlock.ENABLED=false, FREEZING all transfer. The item counts must stay frozen for the
++        // whole powered window, then resume on unpower — ENABLED state + inventory both bit-identical.
++        put(level, 75, 101, 99, COMP_CMP_E);       // comparator reads the hopper (east)
++        put(level, 76, 101, 99, HOPPER_DOWN);      // hopper -> drains down into barrel
++        put(level, 76, 100, 99, BARREL);
++        fillSlots(level, new BlockPos(76, 101, 99), Items.STICK, 64, 4);
++        SCENARIOS.add(new Scenario("hopper-locked", new BlockPos(76, 101, 99), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(77, 101, 99), REDBLOCK); // lock (ENABLED -> false)
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(77, 101, 99), AIR);      // unlock -> resume draining
++            }
++        }));
 +    }
 +
 +    /** (rear, side) strength pairs swept across the analog range for the subtractor. */
@@ -2166,6 +2772,27 @@ index 0000000000000000000000000000000000000000..ee38674b69e4a1829707c45c9be3a1bc
 +                        detail = pos.toShortString() + " COMPARATOR-OUT real=" + realOut + " sim=" + simOut;
 +                    }
 +                }
++                // CONTAINER inventory parity: a compiled container's total item count AND its
++                // vanilla comparator fullness must match the live container every tick (so hopper
++                // transfers, dropper/dispenser firing and dynamic comparator fullness are all
++                // differential-proven, not just the block state).
++                if (detail == null && this.compiled.containerItemCount(packed) >= 0
++                    && level.getBlockEntity(pos) instanceof Container live) {
++                    int realCount = 0;
++                    for (int i = 0; i < live.getContainerSize(); i++) {
++                        realCount += live.getItem(i).getCount();
++                    }
++                    final int simCount = this.compiled.containerItemCount(packed);
++                    if (realCount != simCount) {
++                        detail = pos.toShortString() + " ITEM-COUNT real=" + realCount + " sim=" + simCount;
++                    } else {
++                        final int realSig = AbstractContainerMenu.getRedstoneSignalFromContainer(live);
++                        final int simSig = this.compiled.containerRedstoneSignal(packed);
++                        if (realSig != simSig) {
++                            detail = pos.toShortString() + " CONTAINER-SIGNAL real=" + realSig + " sim=" + simSig;
++                        }
++                    }
++                }
 +                // A MOVING_PISTON cell's animation lives in its PistonMovingBlockEntity: assert the
 +                // compiled mover matches vanilla's progress (0->0.5->1), extending/source flags and
 +                // moved block-state every tick — the transient piston motion, bit-identical.
@@ -2255,15 +2882,25 @@ index 0000000000000000000000000000000000000000..ee38674b69e4a1829707c45c9be3a1bc
 +            }
 +            return null;
 +        }
++        if (real.getBlock() instanceof HopperBlock) {
++            final boolean r = real.getValue(HopperBlock.ENABLED);
++            final boolean s = sim.getValue(HopperBlock.ENABLED);
++            return r == s ? null : pos.toShortString() + " HOPPER-ENABLED real=" + r + " sim=" + s;
++        }
++        if (real.getBlock() instanceof DispenserBlock) {
++            final boolean r = real.getValue(DispenserBlock.TRIGGERED);
++            final boolean s = sim.getValue(DispenserBlock.TRIGGERED);
++            return r == s ? null : pos.toShortString() + " TRIGGERED real=" + r + " sim=" + s;
++        }
 +        return null;
 +    }
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..09309955ed71c89ce732294f0a9de7fc87990c88
+index 0000000000000000000000000000000000000000..1b434d0a120f17eb32be1aa1be74caf8da24fbf1
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,265 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -2282,6 +2919,8 @@ index 0000000000000000000000000000000000000000..09309955ed71c89ce732294f0a9de7fc
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.DispenserBlock;
++import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.LeverBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
@@ -2357,6 +2996,8 @@ index 0000000000000000000000000000000000000000..09309955ed71c89ce732294f0a9de7fc
 +            || state.getBlock() instanceof ButtonBlock
 +            || state.getBlock() instanceof TargetBlock
 +            || state.getBlock() instanceof PistonBaseBlock
++            || state.getBlock() instanceof HopperBlock
++            || state.getBlock() instanceof DispenserBlock
 +            || state.is(Blocks.REDSTONE_BLOCK);
 +    }
 +
@@ -2422,6 +3063,26 @@ index 0000000000000000000000000000000000000000..09309955ed71c89ce732294f0a9de7fc
 +                    for (final BlockPos destroyed : r.getToDestroy()) {
 +                        forceCell(forced, visited, frontier, destroyed);
 +                    }
++                }
++            }
++
++            // A hopper / dispenser / dropper transfers ITEMS with adjacent containers: force its
++            // transfer-partner cells into the footprint so the partner container (even a plain
++            // barrel/chest that is not a redstone component) is detected, snapshotted into the
++            // compiled grid and differential-compared. A hopper pushes into the cell it FACES and
++            // pulls from the cell ABOVE; a dropper drops into the cell it faces; a dispenser's
++            // power read also samples the block above and that block's neighbours.
++            if (state.getBlock() instanceof HopperBlock) {
++                final Direction f = state.getValue(HopperBlock.FACING);
++                forceCell(forced, visited, frontier, pos.relative(f));
++                forceCell(forced, visited, frontier, pos.above());
++            } else if (state.getBlock() instanceof DispenserBlock) {
++                final Direction f = state.getValue(DispenserBlock.FACING);
++                forceCell(forced, visited, frontier, pos.relative(f));
++                final BlockPos above = pos.above();
++                forceCell(forced, visited, frontier, above);
++                for (final Direction dir : Direction.values()) {
++                    forceCell(forced, visited, frontier, above.relative(dir));
 +                }
 +            }
 +
