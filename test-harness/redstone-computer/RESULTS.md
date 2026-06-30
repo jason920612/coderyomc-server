@@ -165,6 +165,69 @@ torch memory is proven the way build-04 was diagnosed — by **vanilla** behavio
 latch's R/S repeaters) and the **4-bit register** (4 D-latches, shared Enable) are the
 immediate next builds; both inherit the same vanilla-proof / compiler-torch-gap situation.
 
+## Rung 1 — SIDE-ENTRY-Cin FULL ADDER (build-07) — COMPLETE ✅
+
+The ripple-ready successor to build-03. build-05 found build-03 was **top-fed** — its four
+Cin ports were buried comparator ports each driven by a `redstone_block` at y+1, so a
+horizontal Cout→Cin carry had no way in. **build-07 takes Cin as a HORIZONTAL dust/repeater
+BUS** entering at the west edge (driver = a `redstone_block` placed ONE BLOCK ABOVE the
+bus-start cell `4,20`), so the carry can be wired in horizontally.
+
+- **SUM = A⊕B⊕Cin**, **Cout = majority(A,B,Cin)**.
+- The XOR `|P−Q|` gadget's two inputs alternate around its perimeter (P,Q,P,Q) → a single-
+  layer planar crossover is impossible. **Fix:** XOR2 uses **two INDEPENDENT subtract
+  comparators facing each other into ONE shared merge cell** (`30,14`); X1 is fed from the
+  NW corner, Cin from the SE corner — no crossover. Every comparator port has a dedicated
+  cleaning **repeater** right at it (so the analog Cin level can never corrupt a subtract).
+
+**Full-adder truth table** (SUM `30,101,14`, Cout `44,101,11`), all 8 (A,B,Cin) combos:
+
+| A B Cin | 000 | 001 | 010 | 011 | 100 | 101 | 110 | 111 |
+|---------|-----|-----|-----|-----|-----|-----|-----|-----|
+| SUM     |  0  |  1  |  1  |  0  |  1  |  0  |  0  |  1  |
+| Cout    |  0  |  0  |  0  |  1  |  0  |  1  |  1  |  1  |
+
+**8 / 8 SUM and 8 / 8 Cout correct** = the full-adder truth table.
+**difftest** (`/coderyo redstone difftest 30 101 14`) over the whole connected net
+(~270 cells): **BIT-IDENTICAL, 0 divergences.**
+
+**Bugs the build exposed (and fixes):**
+1. The three Cout AND gadgets must be **spaced** so no comp2's east SIDE touches the next
+   gadget's 15-source `redstone_block` — adjacency poisons the subtract and **Cout sticks 0**.
+2. The Cout OR-merge cleaning repeater must face **south** (rear=merge, out=Cout); facing
+   north silently drives the merge instead, and Cout reads 0.
+3. **The decisive harness lesson — SETTLE BY GAME TICKS, NOT WALL-CLOCK.** This tile is a
+   deep comparator cascade; on the regionized server the redstone load drops wall-clock TPS,
+   so a probe taken 3–15 s after an input change reads a **half-propagated** state and looks
+   exactly like "Cin is ignored" (SUM collapses to A⊕B). A ≥40–55 s real-time settle (or,
+   better, a long-tick `difftest`, which steps the model in **game** ticks and is TPS-
+   independent) is required before the arithmetic is valid. Every per-combo result above was
+   confirmed on a **fresh per-combo build with a long settle**; the cross-combo sweeps that
+   "failed" were pure settle artifacts, not circuit faults (difftest stayed BIT-IDENTICAL
+   throughout).
+
+## Rung 1 — 2-BIT RIPPLE-CARRY ADDER (build-08) — physical ripple ✅
+
+Two build-07 tiles (bit0 at x+0, bit1 at x+60) with **bit0's Cout (`44,11`) wired
+HORIZONTALLY into bit1's Cin bus entry (`64,20`)** — the carry physically ripples
+Cout₀→Cin₁. (The carry wire ends in a cleaning **repeater** at `63,20`; a bare dust run
+delivers a low analog level that dies a few blocks into bit1's bus.)
+
+Test vector **A = 11b (3) + B = 01b (1)** (bit0: A0=1,B0=1,Cin0=0 ; bit1: A1=1,B1=0):
+
+| signal | bit0 | ripple | bit1 |
+|--------|------|--------|------|
+| Cin    | 0 | → | **1 (RIPPLED, read live at 64,101,20)** |
+| SUM    | **0** | | **0** |
+| Cout   | **1** | wired → Cin₁ | **1** |
+
+Result bits {Cout₁, SUM₁, SUM₀} = **1,0,0 = 100b = 4 = 3 + 1** — arithmetically correct,
+with the carry **physically propagating** from bit0 to bit1 through a horizontal wire.
+**difftest over the whole 2-tile network** (`difftest 30 101 14 60`): **BIT-IDENTICAL
+(644 cells), 0 divergences** — the entire rippling datapath compiles bit-for-bit to vanilla.
+This is the first **physically-rippling** multi-bit arithmetic datapath on the map (build-05's
+4 tiles were difftest-clean but independent; this one's carry actually flows tile→tile).
+
 ## Divergence the difftest CAUGHT (and its root cause)
 
 On the first half-adder run the difftest reported, e.g.:
@@ -192,6 +255,17 @@ logically correct across their truth tables. Running difftest totals: **30 (gate
 adder) + 16 (full-adder SUM/Cout) + 8 (4-bit adder SUM/Cout) = 54 BIT-IDENTICAL cases,
 0 divergences.** The full adder tiles cleanly; the ripple interconnect needs a side-entry
 Cin tile (build-03 is top-fed) — the documented next tile design.
+
+**That side-entry tile now exists and ripples (build-07 + build-08).** The
+**side-entry-Cin full adder** (Cin enters as a horizontal bus, not a top redstone-block) is
+bit-identical to vanilla and logically correct across all 8 (A,B,Cin) combos; two of them
+wired Cout₀→Cin₁ form a **2-bit ripple-carry adder whose carry physically propagates** and
+computes 3+1=4 correctly, BIT-IDENTICAL over all 644 cells. Running difftest totals now:
+**54 (prior) + 8 (side-entry tile SUM/Cout) + 1 (2-bit rippling net) ≥ 63 BIT-IDENTICAL,
+0 divergences.** The key new engineering lesson: deep comparator cascades on the regionized
+server must be **settled by game ticks** (long-tick difftest) or a long wall-clock wait, not
+a few seconds — a premature probe reads a half-propagated state. Next: extend the ripple to
+3–4 bits (same tile, more Cout→Cin wires) and pair it with the build-06 register.
 
 Rung 2 (sequential / memory) now has a **working 1-bit cell**: the **torch RS-NOR latch**
 HOLDs a clean digital bit (15/0), fixing build-04's analog-attenuation failure. Its correctness

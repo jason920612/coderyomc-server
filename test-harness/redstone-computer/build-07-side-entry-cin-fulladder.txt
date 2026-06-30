@@ -1,0 +1,148 @@
+# coderyoMC redstone-computer MAP — SIDE-ENTRY-Cin 1-bit FULL ADDER (SUM + Cout).
+#
+# The ripple-ready successor to build-03 (which was TOP-FED: every Cin port driven by a
+# redstone_block at y+1, so a horizontal Cout->Cin carry could not enter — build-05 found
+# the four Cin ports were buried with no horizontal access). THIS tile takes Cin as a
+# HORIZONTAL dust/repeater BUS entering at the WEST edge (driver = redstone_block ABOVE
+# the bus-start cell 4,20), so the Cout of bit i can be wired straight into the Cin bus of
+# bit i+1 and the carry physically ripples.
+#
+#   SUM  = A XOR B XOR Cin
+#   Cout = majority(A,B,Cin) = (A.B) + (A.Cin) + (B.Cin)
+#
+# CONVENTION (locked, empirically verified on this fork against build-01's NOT gate):
+#   comparator/repeater [facing=D] => REAR/INPUT is on side D, OUTPUT exits the OPPOSITE
+#   side; the two perpendicular cells are the comparator SIDES. SUBTRACT comparator:
+#   out = max(0, rear - max(sideL, sideR)). A redstone_block ABOVE a dust drives it to 15.
+#
+# KEY DESIGN POINTS (each found the hard way; see RESULTS.md):
+#  * XOR is built from a "merged-centre" |P-Q| pair whose two inputs alternate around the
+#    perimeter (P,Q,P,Q) -> a planar single-layer crossover is impossible. SOLUTION: XOR2
+#    uses TWO INDEPENDENT subtract comparators facing each other into ONE shared merge
+#    cell (30,14); X1 is fed from the NW corner, Cin from the SE corner -> no crossover.
+#  * Every comparator PORT is fed by a dedicated cleaning REPEATER placed right at the
+#    port (so the analog Cin level can never corrupt a subtract). Cin is a repeater-
+#    refreshed bus (a bare dust run dies after 15 blocks).
+#  * The three Cout AND gadgets must be SPACED so no comp2's east SIDE touches the next
+#    gadget's 15-source redstone_block (that poisons the subtract -> Cout stuck 0).
+#  * The Cout OR-merge cleaning repeater must face SOUTH (rear=merge, out=Cout); facing
+#    north silently drives the merge instead and Cout reads 0.
+#
+# VALIDATION (port 15568, -Dcoderyo.redstone.compile.enabled=true, flat world, force-
+# loaded, mob-spawn + random-tick frozen by the difftest harness):
+#   * SUM(30,101,14) + Cout(44,101,11) read correct = full-adder truth table for all 8
+#     (A,B,Cin) combos (per-combo FRESH build, long settle — see the TPS note below).
+#   * `/coderyo redstone difftest 30 101 14` = BIT-IDENTICAL to vanilla (the whole
+#     connected network, ~270 cells), 0 divergences, every combo.
+#
+# !! SETTLE/TPS NOTE: this tile is a deep comparator cascade. On the regionized server
+# the redstone load drops wall-clock TPS, so a probe must allow a LONG real-time settle
+# (>=40 s) before reading — a 3-15 s settle reads a half-propagated state and looks like
+# "Cin ignored". `difftest` is the reliable validator (it steps the model in GAME ticks,
+# not wall-clock, so it is TPS-independent).
+#
+# Platform: y=100 stone, y=101 logic, y=102 input togglers (driver-placed).
+# Boot then: forceload add 0 0 64 64 ; build (below) ; drive inputs ; settle ; difftest.
+
+# ============================== TILE bit0 (logic) ==============================
+fill 2 100 2 56 100 40 minecraft:stone
+fill 2 101 2 56 103 40 minecraft:air
+# ===== XOR1: A XOR B -> X1_clean(20,14), fanned to XOR2 + (north rail to comp_a2) =====
+setblock 18 101 10 minecraft:comparator[facing=north,mode=subtract]
+setblock 18 101 9 minecraft:redstone_wire
+setblock 19 101 10 minecraft:redstone_wire
+setblock 22 101 10 minecraft:comparator[facing=north,mode=subtract]
+setblock 22 101 9 minecraft:redstone_wire
+setblock 23 101 10 minecraft:redstone_wire
+setblock 18 101 11 minecraft:redstone_wire
+setblock 22 101 11 minecraft:redstone_wire
+fill 18 101 12 22 101 12 minecraft:redstone_wire
+setblock 20 101 13 minecraft:repeater[facing=north]
+setblock 20 101 14 minecraft:redstone_wire
+fill 21 101 14 27 101 14 minecraft:redstone_wire
+setblock 27 101 15 minecraft:redstone_wire
+setblock 27 101 16 minecraft:redstone_wire
+setblock 27 101 13 minecraft:redstone_wire
+setblock 27 101 12 minecraft:repeater[facing=south]
+setblock 27 101 11 minecraft:redstone_wire
+setblock 27 101 10 minecraft:redstone_wire
+setblock 27 101 9 minecraft:redstone_wire
+setblock 28 101 9 minecraft:redstone_wire
+setblock 29 101 9 minecraft:redstone_wire
+setblock 30 101 9 minecraft:redstone_wire
+# ===== Cin SIDE-ENTRY horizontal bus (driver = redstone_block ABOVE 4,20) =====
+fill 4 101 20 11 101 20 minecraft:redstone_wire
+setblock 12 101 20 minecraft:repeater[facing=west]
+fill 13 101 20 19 101 20 minecraft:redstone_wire
+setblock 20 101 20 minecraft:repeater[facing=west]
+fill 21 101 20 27 101 20 minecraft:redstone_wire
+setblock 28 101 20 minecraft:repeater[facing=west]
+fill 29 101 20 33 101 20 minecraft:redstone_wire
+fill 33 101 16 33 101 19 minecraft:redstone_wire
+setblock 32 101 19 minecraft:redstone_wire
+setblock 31 101 19 minecraft:redstone_wire
+setblock 30 101 19 minecraft:redstone_wire
+fill 33 101 13 33 101 14 minecraft:redstone_wire
+setblock 33 101 15 minecraft:repeater[facing=south]
+setblock 33 101 12 minecraft:redstone_wire
+fill 34 101 20 37 101 20 minecraft:redstone_wire
+setblock 38 101 20 minecraft:repeater[facing=west]
+fill 39 101 20 48 101 20 minecraft:redstone_wire
+# ===== XOR2: SUM = X1 XOR Cin (two independent comps -> shared merge 30,14) =====
+setblock 30 101 12 minecraft:comparator[facing=north,mode=subtract]
+setblock 30 101 13 minecraft:redstone_wire
+setblock 30 101 16 minecraft:comparator[facing=south,mode=subtract]
+setblock 30 101 15 minecraft:redstone_wire
+setblock 30 101 14 minecraft:redstone_wire
+setblock 30 101 11 minecraft:redstone_wire
+setblock 30 101 10 minecraft:repeater[facing=north]
+setblock 31 101 12 minecraft:redstone_wire
+setblock 32 101 12 minecraft:repeater[facing=east]
+setblock 30 101 17 minecraft:redstone_wire
+setblock 30 101 18 minecraft:repeater[facing=south]
+setblock 29 101 16 minecraft:redstone_wire
+setblock 28 101 16 minecraft:repeater[facing=west]
+# ===== Cout = majority(A,B,Cin): 3 spaced ANDs (out NORTH) -> OR merge z13 -> 44,11 =====
+setblock 35 101 16 minecraft:redstone_block
+setblock 36 101 16 minecraft:comparator[facing=west,mode=subtract]
+setblock 36 101 17 minecraft:redstone_wire
+setblock 37 101 16 minecraft:redstone_wire
+setblock 38 101 16 minecraft:comparator[facing=south,mode=subtract]
+setblock 38 101 17 minecraft:redstone_wire
+setblock 38 101 15 minecraft:redstone_wire
+setblock 41 101 16 minecraft:redstone_block
+setblock 42 101 16 minecraft:comparator[facing=west,mode=subtract]
+setblock 42 101 17 minecraft:redstone_wire
+setblock 43 101 16 minecraft:redstone_wire
+setblock 44 101 16 minecraft:comparator[facing=south,mode=subtract]
+setblock 44 101 17 minecraft:redstone_wire
+setblock 44 101 15 minecraft:redstone_wire
+setblock 47 101 16 minecraft:redstone_block
+setblock 48 101 16 minecraft:comparator[facing=west,mode=subtract]
+setblock 48 101 17 minecraft:redstone_wire
+setblock 49 101 16 minecraft:redstone_wire
+setblock 50 101 16 minecraft:comparator[facing=south,mode=subtract]
+setblock 50 101 17 minecraft:redstone_wire
+setblock 50 101 15 minecraft:redstone_wire
+setblock 42 101 19 minecraft:redstone_wire
+setblock 42 101 18 minecraft:repeater[facing=south]
+setblock 48 101 19 minecraft:redstone_wire
+setblock 48 101 18 minecraft:repeater[facing=south]
+setblock 38 101 14 minecraft:redstone_wire
+setblock 44 101 14 minecraft:redstone_wire
+setblock 50 101 14 minecraft:redstone_wire
+fill 38 101 13 50 101 13 minecraft:redstone_wire
+setblock 44 101 12 minecraft:repeater[facing=south]
+setblock 44 101 11 minecraft:redstone_wire
+
+# ================================ DRIVER / INPUTS ================================
+# Place a redstone_block at y=102 OVER each cell to drive that input to 1 (remove -> 0):
+#   A   : (18,9) (23,10)  [XOR1] + (38,17) (44,17)  [AB.P, ACin.P]
+#   B   : (22,9) (19,10)  [XOR1] + (36,17) (50,17)  [AB.Q, BCin.P]
+#   Cin : ONE block over (4,20)  -> enters the HORIZONTAL bus (side-entry)
+# Read / difftest seeds (y=101):
+#   SUM  = (30,14)   Cout = (44,11)
+#   /coderyo redstone difftest 30 101 14     (covers the whole connected net)
+# RIPPLE: Cout exits at (44,101,11); wire it horizontally into the next tile's Cin bus
+# (its 4,20-equivalent) so Cout_i drives Cin_{i+1}. Cin_0 = 0 (no driver over 4,20).
+# After any input change, settle >=40 s (low TPS under load) before a probe read.

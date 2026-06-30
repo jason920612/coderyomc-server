@@ -1,0 +1,65 @@
+# coderyoMC redstone-computer MAP — 2-BIT RIPPLE-CARRY ADDER (physical Cout->Cin ripple).
+#
+# Two copies of the build-07 SIDE-ENTRY-Cin full-adder tile, with bit0's Cout wired
+# HORIZONTALLY into bit1's Cin bus so the carry physically ripples (Cout_0 -> Cin_1).
+# This is the proof that the side-entry tile composes into a real ripple datapath —
+# the thing build-03/build-05's TOP-FED tile could not do.
+#
+#   bit0 = build-07 tile at x+0      (Cin_0 = 0: no driver over 4,20)
+#   bit1 = build-07 tile at x+60     (every x-coord of build-07 shifted +60)
+#   carry interconnect: bit0 Cout (44,101,11)  ->  bit1 Cin bus entry (64,101,20)
+#
+# The carry wire MUST end in a cleaning repeater right at bit1's bus entry (a bare dust
+# run delivers a low analog level that dies a few blocks into the bus); see the repeater
+# at (63,20) below.
+#
+# VALIDATION (port 15568, compiler ON, force-loaded). Test vector A=11b(3)+B=01b(1):
+#   bit0 A0=1,B0=1,Cin0=0 -> SUM0=0, Cout0=1   (1+1 = 0 carry 1)
+#   carry ripples: bit1 Cin = 1   (read live at 64,101,20 = "CIN1 RIPPLED")
+#   bit1 A1=1,B1=0,Cin1=1 -> SUM1=0, Cout1=1   (1+0+1 = 0 carry 1)
+#   result bits {Cout1,SUM1,SUM0} = 1,0,0 = 100b = 4 = 3+1  CORRECT.
+#   `/coderyo redstone difftest 30 101 14 60` over the whole 2-tile network =
+#   BIT-IDENTICAL (644 cells), 0 divergences.
+#
+# SETTLE NOTE (see build-07): probe reads need a LONG wall-clock settle (~60 s) because
+# the regionized server's TPS drops under this deep cascade; difftest (game-tick lockstep)
+# is TPS-independent and is the primary parity proof.
+#
+# Build: paste build-07's tile body once at x+0, once at x+60, then this interconnect.
+# (Below is only the interconnect + the per-bit drivers for the 3+1 vector; the two tile
+#  bodies are build-07 verbatim and verbatim-shifted +60 in x.)
+
+# platform must span both tiles
+fill 2 100 2 120 100 40 minecraft:stone
+fill 2 101 2 120 103 40 minecraft:air
+
+# ---- (place build-07 tile body here at x+0, and again with every x +60) ----
+
+# ===== CARRY INTERCONNECT: Cout0 (44,11) -> Cin1 bus entry (64,20) =====
+fill 45 101 11 57 101 11 minecraft:redstone_wire
+setblock 58 101 11 minecraft:repeater[facing=west]
+fill 59 101 11 62 101 11 minecraft:redstone_wire
+fill 62 101 12 62 101 19 minecraft:redstone_wire
+setblock 62 101 20 minecraft:redstone_wire
+setblock 63 101 20 minecraft:repeater[facing=west]
+setblock 64 101 20 minecraft:redstone_wire
+
+# ===== DRIVERS for the 3 + 1 = 4 ripple vector =====
+# bit0 A0=1 : (18,9)(23,10)(38,17)(44,17)   B0=1 : (22,9)(19,10)(36,17)(50,17)   Cin0=0
+setblock 18 102 9 minecraft:redstone_block
+setblock 23 102 10 minecraft:redstone_block
+setblock 38 102 17 minecraft:redstone_block
+setblock 44 102 17 minecraft:redstone_block
+setblock 22 102 9 minecraft:redstone_block
+setblock 19 102 10 minecraft:redstone_block
+setblock 36 102 17 minecraft:redstone_block
+setblock 50 102 17 minecraft:redstone_block
+# bit1 A1=1 : (78,9)(83,10)(98,17)(104,17)   B1=0   Cin1 = (rippled from Cout0)
+setblock 78 102 9 minecraft:redstone_block
+setblock 83 102 10 minecraft:redstone_block
+setblock 98 102 17 minecraft:redstone_block
+setblock 104 102 17 minecraft:redstone_block
+
+# Read/difftest seeds:  bit0 SUM(30,14) Cout(44,11) ; bit1 Cin(64,20) SUM(90,14) Cout(104,11)
+#   /coderyo redstone difftest 30 101 14 60   -> BIT-IDENTICAL over the whole rippling net.
+# Settle >=60 s before a probe read.
