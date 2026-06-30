@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc4726a3f2
+index 0000000000000000000000000000000000000000..3ab54605b29aa0458bf09454255ae6490499538e
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,1812 @@
+@@ -0,0 +1,1930 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -48,6 +48,13 @@ index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc
 +import net.minecraft.world.level.block.DropperBlock;
 +import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
++import net.minecraft.world.level.block.ChiseledBookShelfBlock;
++import net.minecraft.world.level.block.ComposterBlock;
++import net.minecraft.world.level.block.CopperBulbBlock;
++import net.minecraft.world.level.block.DaylightDetectorBlock;
++import net.minecraft.world.level.block.JukeboxBlock;
++import net.minecraft.world.level.block.LecternBlock;
++import net.minecraft.world.level.block.NoteBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
 +import net.minecraft.world.level.block.RedstoneLampBlock;
@@ -162,6 +169,23 @@ index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc
 +    private final LongSet pistons = new LongOpenHashSet();
 +
 +    /**
++     * Copper bulbs ({@code 1.21}): a 1-bit MEMORY cell. A RISING power edge toggles the
++     * {@code LIT} state (the bit), which persists until the next rising edge — modelled from
++     * {@code CopperBulbBlock.checkAndFlip}. A comparator reads the stored bit as analog 15/0
++     * (the bulb's {@code getAnalogOutputSignal}); because the bulb evolves inside the compiled
++     * grid, that analog is read from the GRID {@code LIT} (see {@link #analogOutput}) — a true
++     * compiled oracle, not the live world.
++     */
++    private final LongSet copperBulbs = new LongOpenHashSet();
++
++    /**
++     * Note blocks: a pure redstone LOAD. Vanilla mirrors the neighbour signal into its
++     * {@code POWERED} state (playing a note on the rising edge) but emits NO redstone output —
++     * modelled from {@code NoteBlock.neighborChanged}. Included for block-state parity only.
++     */
++    private final LongSet noteBlocks = new LongOpenHashSet();
++
++    /**
 +     * Entity-detection INPUT cells: pressure plates (binary/weighted), tripwire hooks +
 +     * string, detector rails. Each is a boundary input node whose redstone OUTPUT is driven
 +     * by ENTITY PRESENCE — external to the logic graph, exactly like a player-toggled lever.
@@ -274,6 +298,15 @@ index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc
 +                c.hoppers.add(packed);
 +            } else if (state.getBlock() instanceof DispenserBlock) {
 +                c.dispensers.add(packed); // covers DropperBlock (a DispenserBlock subclass)
++            } else if (state.getBlock() instanceof CopperBulbBlock) {
++                c.copperBulbs.add(packed); // 1-bit memory: rising-edge LIT toggle
++            } else if (state.getBlock() instanceof NoteBlock) {
++                c.noteBlocks.add(packed); // load only: POWERED mirrors neighbour signal
++            } else if (state.getBlock() instanceof DaylightDetectorBlock) {
++                // Analog signal source driven by SKY LIGHT — a boundary INPUT read live each
++                // step (vanilla computes light->POWER, incl. the inverted mode), exactly like a
++                // pressure plate's entity-presence input.
++                c.detectionInputs.add(packed);
 +            } else if (state.getBlock() instanceof BasePressurePlateBlock
 +                || state.getBlock() instanceof TripWireHookBlock
 +                || state.getBlock() instanceof TripWireBlock
@@ -332,6 +365,18 @@ index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc
 +    private void createContainer(final ServerLevel level, final long packed) {
 +        final BlockPos pos = BlockPos.of(packed);
 +        final BlockState state = this.vw.getBlockState(pos);
++        // Comparator SOURCE / memory blocks (copper bulb, composter, lectern, jukebox, chiseled
++        // bookshelf) are read LIVE for their analog output (see analogOutput) and are NEVER simulated
++        // as inventory containers — even though some expose a Container block entity. Skip them so the
++        // item layer owns only true inventory containers, and so a level-less BE copy is never mutated
++        // (their setItem touches the level, which a detached copy lacks).
++        if (state.getBlock() instanceof CopperBulbBlock
++            || state.getBlock() instanceof ComposterBlock
++            || state.getBlock() instanceof LecternBlock
++            || state.getBlock() instanceof JukeboxBlock
++            || state.getBlock() instanceof ChiseledBookShelfBlock) {
++            return;
++        }
 +        if (!(level.getBlockEntity(pos) instanceof Container liveContainer)) {
 +            return;
 +        }
@@ -492,6 +537,15 @@ index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc
 +    }
 +
 +    private void rescan(final long tick) {
++        // Memory / load cells react synchronously to a settled neighbour signal (vanilla
++        // neighborChanged, no scheduled delay), BEFORE the comparator re-scan so a copper bulb's
++        // freshly-toggled LIT is the analog a facing comparator schedules its 2-tick update from.
++        for (final long pos : this.copperBulbs) {
++            this.updateCopperBulb(pos);
++        }
++        for (final long pos : this.noteBlocks) {
++            this.updateNoteBlock(pos);
++        }
 +        for (final long pos : this.torches) {
 +            this.scheduleTorchIfNeeded(pos, tick);
 +        }
@@ -788,9 +842,30 @@ index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc
 +     * live level (static external analog sources: a barrel that is a pure network input, etc.).
 +     */
 +    private int analogOutput(final BlockPos pos, final BlockState state, final Direction dir) {
-+        final BlockEntity be = this.vw.getBlockEntity(pos);
-+        if (be instanceof Container container) {
-+            return AbstractContainerMenu.getRedstoneSignalFromContainer(container);
++        // A copper bulb is an INTERNAL compiled component (its LIT bit evolves in the grid). Its
++        // vanilla getAnalogOutputSignal reads level.getBlockState(pos).LIT — the LIVE world — so we
++        // must read the GRID LIT instead to keep the comparator a true compiled oracle (15/0).
++        if (state.getBlock() instanceof CopperBulbBlock) {
++            return state.getValue(CopperBulbBlock.LIT) ? Redstone.SIGNAL_MAX : Redstone.SIGNAL_MIN;
++        }
++        // Comparator SOURCE blocks whose analog output is a SPECIAL state read (NOT container
++        // fullness): composter fill (0-8), lectern page progress, jukebox disc, chiseled-bookshelf
++        // last-touched slot. Each is an external read-live input — defer to vanilla's exact
++        // getAnalogOutputSignal (passed grid state for composter; live block entity for the rest),
++        // so it is NEVER mis-read as inventory fullness even if the block also exposes a Container BE.
++        if (state.getBlock() instanceof ComposterBlock
++            || state.getBlock() instanceof LecternBlock
++            || state.getBlock() instanceof JukeboxBlock
++            || state.getBlock() instanceof ChiseledBookShelfBlock) {
++            return state.getAnalogOutputSignal(this.level, pos, dir);
++        }
++        // A privately-compiled, independently-evolving inventory container (hopper/chest/barrel/
++        // dropper/dispenser): read its fullness from the COMPILED inventory.
++        if (this.containers.contains(pos.asLong())) {
++            final BlockEntity be = this.vw.getBlockEntity(pos);
++            if (be instanceof Container container) {
++                return AbstractContainerMenu.getRedstoneSignalFromContainer(container);
++            }
 +        }
 +        return state.getAnalogOutputSignal(this.level, pos, dir);
 +    }
@@ -936,6 +1011,49 @@ index 0000000000000000000000000000000000000000..190d68212edddc608421b2a5882c4ccc
 +        final BlockState state = this.state(pos);
 +        if (state.getValue(BlockStateProperties.LIT) && !this.vw.hasNeighborSignal(this.m.immutable())) {
 +            this.vw.set(pos, state.setValue(BlockStateProperties.LIT, false));
++        }
++    }
++
++    // ----------------------------------------------------------- copper bulb
++
++    /**
++     * The copper-bulb 1-bit memory. Transcribed from {@code CopperBulbBlock.checkAndFlip}: a
++     * neighbour-signal change writes {@code POWERED}; a RISING edge (becoming powered) ALSO toggles
++     * the {@code LIT} bit, which then persists until the next rising edge — a flip-flop / memory
++     * cell. No scheduled delay (vanilla acts synchronously in neighborChanged). The bulb emits NO
++     * redstone signal; only a comparator reads its stored bit (see {@link #analogOutput}).
++     */
++    private void updateCopperBulb(final long pos) {
++        this.m.set(pos);
++        final boolean signal = this.vw.hasNeighborSignal(this.m.immutable());
++        final BlockState state = this.state(pos);
++        if (signal != state.getValue(BlockStateProperties.POWERED)) {
++            BlockState next = state;
++            if (!state.getValue(BlockStateProperties.POWERED)) {
++                next = next.cycle(BlockStateProperties.LIT); // rising edge -> flip the memory bit
++            }
++            this.vw.set(pos, next.setValue(BlockStateProperties.POWERED, signal));
++        }
++    }
++
++    // ------------------------------------------------------------- note block
++
++    /**
++     * Note block — pure redstone LOAD. Transcribed from {@code NoteBlock.neighborChanged}: the
++     * {@code POWERED} state mirrors the neighbour signal immediately (vanilla plays a note on the
++     * rising edge — not modelled, no game effect on the circuit). It emits no redstone output, so
++     * this only keeps the block-state bit-identical. Honours the Paper
++     * {@code disableNoteblockUpdates} switch so parity holds when note-block updates are off.
++     */
++    private void updateNoteBlock(final long pos) {
++        if (io.papermc.paper.configuration.GlobalConfiguration.get().blockUpdates.disableNoteblockUpdates) {
++            return;
++        }
++        this.m.set(pos);
++        final boolean signal = this.vw.hasNeighborSignal(this.m.immutable());
++        final BlockState state = this.state(pos);
++        if (signal != state.getValue(BlockStateProperties.POWERED)) {
++            this.vw.set(pos, state.setValue(BlockStateProperties.POWERED, signal));
 +        }
 +    }
 +
@@ -1920,10 +2038,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b3abd1c5c
+index 0000000000000000000000000000000000000000..03f291c7dcfc62db2fdc5f4764e373ab7049fbd2
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,1252 @@
+@@ -0,0 +1,1427 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -1943,16 +2061,25 @@ index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b
 +import net.minecraft.world.entity.item.ItemEntity;
 +import net.minecraft.world.entity.vehicle.minecart.Minecart;
 +import net.minecraft.world.inventory.AbstractContainerMenu;
++import net.minecraft.core.component.DataComponents;
++import net.minecraft.server.network.Filterable;
 +import net.minecraft.world.item.ItemStack;
 +import net.minecraft.world.item.Items;
++import net.minecraft.world.item.component.WritableBookContent;
 +import net.minecraft.world.level.block.BasePressurePlateBlock;
 +import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.ChiseledBookShelfBlock;
 +import net.minecraft.world.level.block.ComparatorBlock;
++import net.minecraft.world.level.block.ComposterBlock;
++import net.minecraft.world.level.block.CopperBulbBlock;
 +import net.minecraft.world.level.block.DetectorRailBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
 +import net.minecraft.world.level.block.DispenserBlock;
 +import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
++import net.minecraft.world.level.block.JukeboxBlock;
++import net.minecraft.world.level.block.LecternBlock;
++import net.minecraft.world.level.block.NoteBlock;
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
@@ -1961,7 +2088,10 @@ index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b
 +import net.minecraft.world.level.block.TripWireHookBlock;
 +import net.minecraft.world.level.block.piston.PistonBaseBlock;
 +import net.minecraft.world.level.block.piston.PistonMovingBlockEntity;
++import net.minecraft.world.level.block.entity.ChiseledBookShelfBlockEntity;
 +import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
++import net.minecraft.world.level.block.entity.JukeboxBlockEntity;
++import net.minecraft.world.level.block.entity.LecternBlockEntity;
 +import net.minecraft.world.level.block.state.BlockState;
 +import net.minecraft.world.level.block.state.properties.AttachFace;
 +import net.minecraft.world.level.block.state.properties.BlockStateProperties;
@@ -2024,7 +2154,11 @@ index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b
 +                    // reproducible (the boundary inputs are exactly our controlled entities).
 +                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MOBS, false, level);
 +                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MONSTERS, false, level);
-+                    LOG.info("[redstone-difftest] forceloaded build-area chunks; mob-spawning OFF; waiting for load");
++                    // FREEZE the world clock so the daylight-sensor circuit reads a STABLE sky-light
++                    // level (its analog POWER is computed by vanilla and copied live into the compiled
++                    // grid each tick — a fixed light keeps the input, and thus the parity, constant).
++                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.ADVANCE_TIME, false, level);
++                    LOG.info("[redstone-difftest] forceloaded build-area chunks; mob-spawning OFF; world clock frozen; waiting for load");
 +                }
 +                if (ticks > 40 && areaLoaded(level)) {
 +                    buildCorpus(level);
@@ -2166,6 +2300,14 @@ index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b
 +        .setValue(TripWireHookBlock.FACING, Direction.WEST);
 +    private static final BlockState STRING = Blocks.TRIPWIRE.defaultBlockState();
 +    private static final BlockState DETECTOR_RAIL = Blocks.DETECTOR_RAIL.defaultBlockState();
++    // ---- MISC SIGNAL BLOCKS (daylight sensor / copper bulb memory / comparator sources / note) ----
++    private static final BlockState DAYLIGHT = Blocks.DAYLIGHT_DETECTOR.defaultBlockState();
++    private static final BlockState COPPER_BULB = Blocks.COPPER_BULB.weathering().unaffected().defaultBlockState();
++    private static final BlockState NOTEBLOCK = Blocks.NOTE_BLOCK.defaultBlockState();
++    private static final BlockState CHISELED_BOOKSHELF = Blocks.CHISELED_BOOKSHELF.defaultBlockState();
++    private static BlockState composterLevel(final int level) {
++        return Blocks.COMPOSTER.defaultBlockState().setValue(ComposterBlock.LEVEL, level);
++    }
 +
 +    /** Live controlled entities for the detection circuits (spawned/removed by the stimuli). */
 +    private static Entity stonePlateEntity;
@@ -2902,6 +3044,139 @@ index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b
 +                removeEntity(detectorCart); detectorCart = null;
 +            }
 +        }));
++
++        // =================================================================
++        //  MISC SIGNAL BLOCKS — daylight sensor (analog SOURCE from sky light),
++        //  copper bulb (1-bit MEMORY), comparator SOURCES (composter fill /
++        //  lectern page / chiseled-bookshelf slot / jukebox disc), note block
++        //  (pure LOAD). Row z=100, x 20-58, inside the force-loaded build area;
++        //  >=1-cell air gaps keep each circuit an independent network.
++        // =================================================================
++
++        // ---- Circuit 35: DAYLIGHT SENSOR (analog signal source) -> wire -> lamp ----
++        // The sensor's redstone POWER is computed by vanilla from the (frozen-noon) sky light and
++        // copied live into the compiled grid each tick (a boundary input, like a pressure plate).
++        // The dust reads the analog level and decays; the lamp follows. Bit-identical every tick.
++        put(level, 20, 100, 100, STONE);  put(level, 20, 101, 100, DAYLIGHT); // analog source
++        put(level, 21, 100, 100, STONE);  put(level, 21, 101, 100, WIRE);
++        put(level, 22, 100, 100, STONE);  put(level, 22, 101, 100, WIRE);
++        put(level, 23, 100, 100, STONE);  put(level, 23, 101, 100, LAMP);
++        SCENARIOS.add(new Scenario("daylight-sensor", new BlockPos(20, 101, 100), (lvl, c, rel) -> {
++        }));
++
++        // ---- Circuit 36: COPPER BULB as 1-bit MEMORY — pulse toggles LIT, comparator reads it ----
++        // A redstone block pulsed to the bulb's WEST gives rising edges; each rising edge FLIPS the
++        // bulb's LIT bit, which then HOLDS while unpowered (memory). A comparator on the bulb's EAST
++        // reads the stored bit as analog 15/0. Pulsing three times proves the bit toggles on each
++        // rising edge AND persists across the gaps — the compiled memory + comparator read, bit-exact.
++        put(level, 26, 100, 100, STONE);  put(level, 26, 101, 100, COPPER_BULB);  // 1-bit memory
++        put(level, 27, 100, 100, STONE);  put(level, 27, 101, 100, COMP_CMP_W);   // faces WEST -> reads bulb LIT
++        put(level, 28, 100, 100, STONE);  put(level, 28, 101, 100, WIRE);         // comparator output
++        put(level, 29, 100, 100, STONE);  put(level, 29, 101, 100, LAMP);
++        SCENARIOS.add(new Scenario("copper-bulb-memory", new BlockPos(27, 101, 100), (lvl, c, rel) -> {
++            // Three pulses on the WEST face: LIT goes false->true (hold)->false (hold)->true.
++            if (rel == 30 || rel == 60 || rel == 90) {
++                setBoth(lvl, c, new BlockPos(25, 101, 100), REDBLOCK); // rising edge -> flip LIT
++            } else if (rel == 35 || rel == 65 || rel == 95) {
++                setBoth(lvl, c, new BlockPos(25, 101, 100), AIR);      // falling edge -> LIT holds
++            }
++        }));
++
++        // ---- Circuit 37: COMPARATOR reads a COMPOSTER fill level (0-8 analog) ----
++        // The composter's fill LEVEL is its analog output; a COMPARE comparator emits that level.
++        // The fill is changed mid-run (3 -> 6 -> 8) and the comparator output tracks it bit-exactly.
++        // (Stable fill levels only: vanilla auto-advances a LEVEL-7 composter to 8 via a scheduled
++        // tick, so 7 is a transient state — this static comparator-source corpus uses set values.)
++        put(level, 33, 100, 100, STONE);  put(level, 33, 101, 100, composterLevel(3)); // analog source (fill 3)
++        put(level, 34, 100, 100, STONE);  put(level, 34, 101, 100, COMP_CMP_W);        // faces WEST -> reads composter
++        put(level, 35, 100, 100, STONE);  put(level, 35, 101, 100, WIRE);
++        put(level, 36, 100, 100, STONE);  put(level, 36, 101, 100, LAMP);
++        SCENARIOS.add(new Scenario("comparator-composter", new BlockPos(34, 101, 100), (lvl, c, rel) -> {
++            if (rel == 40) {
++                setBoth(lvl, c, new BlockPos(33, 101, 100), composterLevel(6));
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(33, 101, 100), composterLevel(8));
++            }
++        }));
++
++        // ---- Circuit 38: COMPARATOR reads a LECTERN page progress ----
++        // A lectern holding a 5-page book at page index 2 -> getRedstoneSignal = floor(2/4*14)+1 = 8.
++        // The compiled comparator reads vanilla's getAnalogOutputSignal (the live lectern BE) and
++        // must match the real comparator output for the set page. Static page; output constant @8.
++        put(level, 39, 100, 100, STONE);
++        put(level, 39, 101, 100, Blocks.LECTERN.defaultBlockState().setValue(LecternBlock.HAS_BOOK, true));
++        put(level, 40, 100, 100, STONE);  put(level, 40, 101, 100, COMP_CMP_W); // faces WEST -> reads lectern
++        put(level, 41, 100, 100, STONE);  put(level, 41, 101, 100, WIRE);
++        put(level, 42, 100, 100, STONE);  put(level, 42, 101, 100, LAMP);
++        configureLectern(level, new BlockPos(39, 101, 100), 2, 5); // page 2 of 5
++        SCENARIOS.add(new Scenario("comparator-lectern", new BlockPos(40, 101, 100), (lvl, c, rel) -> {
++        }));
++
++        // ---- Circuit 39: COMPARATOR reads a CHISELED BOOKSHELF last-touched slot ----
++        // The bookshelf's analog output is (lastInteractedSlot + 1). Set slot 3 -> output 4; the
++        // compiled comparator reads vanilla's getAnalogOutputSignal (live BE) and matches, bit-exact.
++        put(level, 45, 100, 100, STONE);  put(level, 45, 101, 100, CHISELED_BOOKSHELF); // analog source
++        put(level, 46, 100, 100, STONE);  put(level, 46, 101, 100, COMP_CMP_W);         // faces WEST -> reads shelf
++        put(level, 47, 100, 100, STONE);  put(level, 47, 101, 100, WIRE);
++        put(level, 48, 100, 100, STONE);  put(level, 48, 101, 100, LAMP);
++        configureBookshelfSlot(level, new BlockPos(45, 101, 100), 3); // last-interacted slot 3 -> analog 4
++        SCENARIOS.add(new Scenario("comparator-bookshelf", new BlockPos(46, 101, 100), (lvl, c, rel) -> {
++        }));
++
++        // ---- Circuit 40: COMPARATOR reads a JUKEBOX with a disc ----
++        // A jukebox holding a music disc -> getComparatorOutput = the disc's fixed comparator value.
++        // The compiled comparator reads vanilla's getAnalogOutputSignal (live BE) and matches.
++        put(level, 51, 100, 100, STONE);  put(level, 51, 101, 100, Blocks.JUKEBOX.defaultBlockState()); // analog source
++        put(level, 52, 100, 100, STONE);  put(level, 52, 101, 100, COMP_CMP_W); // faces WEST -> reads jukebox
++        put(level, 53, 100, 100, STONE);  put(level, 53, 101, 100, WIRE);
++        put(level, 54, 100, 100, STONE);  put(level, 54, 101, 100, LAMP);
++        configureJukeboxDisc(level, new BlockPos(51, 101, 100)); // insert a disc
++        SCENARIOS.add(new Scenario("comparator-jukebox", new BlockPos(52, 101, 100), (lvl, c, rel) -> {
++        }));
++
++        // ---- Circuit 41: NOTE BLOCK — pure LOAD (POWERED mirrors signal, NO redstone output) ----
++        // A redstone block pulsed to the note block's EAST drives its POWERED state on/off; the note
++        // block emits no signal, so only its POWERED bit is differential-compared (block-state parity).
++        put(level, 57, 100, 100, STONE);  put(level, 57, 101, 100, NOTEBLOCK);
++        SCENARIOS.add(new Scenario("note-block-load", new BlockPos(57, 101, 100), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(58, 101, 100), REDBLOCK); // power -> POWERED true (plays note)
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(58, 101, 100), AIR);      // unpower -> POWERED false
++            }
++        }));
++    }
++
++    /** Place a 5-page writable book in a lectern and open it to {@code pageIndex} (for the comparator). */
++    private static void configureLectern(final ServerLevel level, final BlockPos pos, final int pageIndex, final int pages) {
++        if (!(level.getBlockEntity(pos) instanceof LecternBlockEntity lectern)) {
++            return;
++        }
++        final List<Filterable<String>> content = new ArrayList<>();
++        for (int i = 0; i < pages; i++) {
++            content.add(Filterable.passThrough("page " + i));
++        }
++        final ItemStack book = new ItemStack(Items.WRITABLE_BOOK);
++        book.set(DataComponents.WRITABLE_BOOK_CONTENT, new WritableBookContent(content));
++        lectern.setBook(book);
++        lectern.setPage(pageIndex);
++        lectern.setChanged();
++    }
++
++    /** Set a chiseled bookshelf's last-interacted slot (its comparator output is slot + 1). */
++    private static void configureBookshelfSlot(final ServerLevel level, final BlockPos pos, final int slot) {
++        if (level.getBlockEntity(pos) instanceof ChiseledBookShelfBlockEntity shelf) {
++            shelf.lastInteractedSlot = slot;
++            shelf.setChanged();
++        }
++    }
++
++    /** Insert a music disc into a jukebox so its comparator output is the disc's fixed value. */
++    private static void configureJukeboxDisc(final ServerLevel level, final BlockPos pos) {
++        if (level.getBlockEntity(pos) instanceof JukeboxBlockEntity jukebox) {
++            jukebox.setTheItem(new ItemStack(Items.MUSIC_DISC_13));
++            jukebox.setChanged();
++        }
 +    }
 +
 +    /** (rear, side) strength pairs swept across the analog range for the subtractor. */
@@ -3020,6 +3295,9 @@ index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b
 +                        || liveState.getBlock() instanceof DetectorRailBlock)
 +                        && liveState.getValue(BlockStateProperties.POWERED)) {
 +                    this.peakDetection = Math.max(this.peakDetection, 15);
++                } else if (liveState.getBlock() instanceof net.minecraft.world.level.block.DaylightDetectorBlock) {
++                    // Record the daylight sensor's emitted analog level (proves a non-trivial signal).
++                    this.peakDetection = Math.max(this.peakDetection, liveState.getValue(BlockStateProperties.POWER));
 +                }
 +                String detail = diff(pos, liveState, this.compiled.state(packed));
 +                // Comparator analog output lives in the block entity, not the block state:
@@ -3130,6 +3408,21 @@ index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b
 +            final boolean s = sim.getValue(BlockStateProperties.POWERED);
 +            return r == s ? null : pos.toShortString() + " POWERED real=" + r + " sim=" + s;
 +        }
++        if (real.getBlock() instanceof CopperBulbBlock) {
++            // 1-bit memory: assert both the stored LIT bit and the POWERED edge-tracking state.
++            if (real.getValue(BlockStateProperties.LIT) != sim.getValue(BlockStateProperties.LIT)) {
++                return pos.toShortString() + " BULB-LIT real=" + real.getValue(BlockStateProperties.LIT)
++                    + " sim=" + sim.getValue(BlockStateProperties.LIT);
++            }
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            return r == s ? null : pos.toShortString() + " BULB-POWERED real=" + r + " sim=" + s;
++        }
++        if (real.getBlock() instanceof NoteBlock) {
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            return r == s ? null : pos.toShortString() + " NOTE-POWERED real=" + r + " sim=" + s;
++        }
 +        if (real.getBlock() instanceof PistonBaseBlock) {
 +            final boolean r = real.getValue(BlockStateProperties.EXTENDED);
 +            final boolean s = sim.getValue(BlockStateProperties.EXTENDED);
@@ -3178,10 +3471,10 @@ index 0000000000000000000000000000000000000000..d2a307df77ec4f0409ad3cad74007c4b
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..050f9cca019403e74de1cd5efa3e598a313487fb
+index 0000000000000000000000000000000000000000..ebe205ce0326f652f58a263a9b5bb1facf339297
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,287 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -3200,8 +3493,11 @@ index 0000000000000000000000000000000000000000..050f9cca019403e74de1cd5efa3e598a
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.BasePressurePlateBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
++import net.minecraft.world.level.block.CopperBulbBlock;
++import net.minecraft.world.level.block.DaylightDetectorBlock;
 +import net.minecraft.world.level.block.DetectorRailBlock;
 +import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.NoteBlock;
 +import net.minecraft.world.level.block.DispenserBlock;
 +import net.minecraft.world.level.block.HopperBlock;
 +import net.minecraft.world.level.block.LeverBlock;
@@ -3283,6 +3579,12 @@ index 0000000000000000000000000000000000000000..050f9cca019403e74de1cd5efa3e598a
 +            || state.getBlock() instanceof PistonBaseBlock
 +            || state.getBlock() instanceof HopperBlock
 +            || state.getBlock() instanceof DispenserBlock
++            // Copper bulb (1-bit memory, comparator-readable) and note block (pure load) are
++            // stateful network nodes the compiler models; a daylight detector is an analog signal
++            // SOURCE driven by sky light, a boundary input read live each tick (see CompiledNetwork).
++            || state.getBlock() instanceof CopperBulbBlock
++            || state.getBlock() instanceof NoteBlock
++            || state.getBlock() instanceof DaylightDetectorBlock
 +            // Entity-detection INPUT sources: a pressure plate (stone/wood binary,
 +            // weighted analog), a tripwire (hook + string line) and a detector rail are
 +            // redstone signal sources driven by ENTITY PRESENCE (external to the circuit).
