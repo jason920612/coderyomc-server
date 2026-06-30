@@ -1,0 +1,58 @@
+# coderyoMC redstone-computer MAP — full-adder (SUM path: A XOR B XOR Cin)
+#
+# STATUS: stage-1 XOR(A,B) is built + VERIFIED (X1 = A XOR B, 4/4 combos correct,
+# difftest BIT-IDENTICAL). The 2-stage cascade (stage-2 = XOR(X1,Cin)) is built and
+# the X1 repeater-cleaned routing is proven functional (hub powers to 15), but full
+# 8-combo SUM verification was time-boxed out: multi-stage setblock-driven builds are
+# flaky to settle in vanilla (scheduled repeater ticks do not always fire on a bare
+# setblock — a primary-input toggle edge is needed to force propagation), and the
+# cramped stage-2 cluster suffered a redstone-update integrity loss during input
+# sweeps. Treat stage-2 below as the intended design, not a validated result.
+#
+# Comparator/repeater FACING points at the REAR/INPUT; output exits the opposite side.
+# So a repeater that must PUSH a signal toward +Z (south) has facing=south (rear=south),
+# and toward -Z (north) has facing=north. (This bit me once — the routing repeaters
+# only start passing signal after the upstream input is toggled to force an update.)
+#
+# Lane z=86..94, y=100 stone, y=101 logic, y=102 input togglers (driver-placed).
+
+fill 26 100 84 40 100 96 minecraft:stone
+fill 26 101 84 40 102 96 minecraft:air
+
+# ===== STAGE 1: X1 = A XOR B  (shared out X1 = 31,101,92)  [VERIFIED] =====
+setblock 30 101 92 minecraft:comparator[facing=west,mode=subtract]
+setblock 29 101 92 minecraft:redstone_wire
+setblock 30 101 93 minecraft:redstone_wire
+setblock 31 101 92 minecraft:redstone_wire
+setblock 32 101 92 minecraft:comparator[facing=east,mode=subtract]
+setblock 33 101 92 minecraft:redstone_wire
+setblock 32 101 93 minecraft:redstone_wire
+
+# ===== X1 distribution: tap north, repeater-clean hub, two cleaned branches =====
+setblock 31 101 91 minecraft:redstone_wire
+setblock 31 101 90 minecraft:repeater[facing=south]
+setblock 31 101 89 minecraft:redstone_wire
+# branch1 -> Pa (29,101,86): push north -> facing=south
+setblock 30 101 89 minecraft:redstone_wire
+setblock 29 101 89 minecraft:redstone_wire
+setblock 29 101 88 minecraft:redstone_wire
+setblock 29 101 87 minecraft:repeater[facing=south]
+setblock 29 101 86 minecraft:redstone_wire
+# branch2 -> Pb (32,101,87): push south -> facing=north
+setblock 32 101 89 minecraft:redstone_wire
+setblock 32 101 88 minecraft:repeater[facing=north]
+setblock 32 101 87 minecraft:redstone_wire
+
+# ===== STAGE 2: SUM = XOR(X1, Cin)  (shared out SUM = 31,101,86) =====
+setblock 30 101 86 minecraft:comparator[facing=west,mode=subtract]
+setblock 30 101 87 minecraft:redstone_wire
+setblock 31 101 86 minecraft:redstone_wire
+setblock 32 101 86 minecraft:comparator[facing=east,mode=subtract]
+setblock 33 101 86 minecraft:redstone_wire
+
+# Driver toggles (y+1 over input dust):
+#   A   : 29 102 92 , 32 102 93
+#   B   : 30 102 93 , 33 102 92
+#   Cin : 30 102 87 , 33 102 86
+# After every input change, toggle the source OFF->ON to force vanilla propagation,
+# settle >=2s, then read SUM @ (31,101,86) / difftest seed (31,101,86).

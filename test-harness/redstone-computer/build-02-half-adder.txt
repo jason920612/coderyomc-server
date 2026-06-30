@@ -1,0 +1,26 @@
+# coderyoMC redstone-computer MAP — half-adder (SUM = A XOR B, CARRY = A AND B)
+# SUM gadget = XOR (two SUBTRACT comparators |A-B| merged); CARRY gadget = AND
+# (A-(15-B), the 15-B via a SUBTRACT comparator). Primary inputs A,B are driven by
+# redstone_block togglers (y+1 above an input dust); the driver sets every A-toggler
+# together and every B-toggler together. SUM read @ (11,101,70); CARRY read @ (12,101,75).
+
+fill 8 100 69 14 100 76 minecraft:stone
+fill 8 101 69 14 102 76 minecraft:air
+
+# --- SUM = XOR(A,B)  out (11,101,70) ---
+setblock 10 101 70 minecraft:comparator[facing=west,mode=subtract]
+setblock 9 101 70 minecraft:redstone_wire
+setblock 10 101 71 minecraft:redstone_wire
+setblock 11 101 70 minecraft:redstone_wire
+setblock 12 101 70 minecraft:comparator[facing=east,mode=subtract]
+setblock 13 101 70 minecraft:redstone_wire
+setblock 12 101 71 minecraft:redstone_wire
+
+# --- CARRY = AND(A,B)  out (12,101,75) ---
+setblock 9 101 74 minecraft:redstone_block
+setblock 10 101 74 minecraft:comparator[facing=west,mode=subtract]
+setblock 10 101 75 minecraft:redstone_wire
+setblock 11 101 74 minecraft:redstone_wire
+setblock 12 101 74 minecraft:comparator[facing=north,mode=subtract]
+setblock 12 101 73 minecraft:redstone_wire
+setblock 12 101 75 minecraft:redstone_wire
