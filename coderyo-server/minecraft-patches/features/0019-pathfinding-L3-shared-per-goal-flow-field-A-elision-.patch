@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/pathfinding/flowfield/FlowField.java b/com/coderyo/pathfinding/flowfield/FlowField.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..3fe5a0f3fe77ed11033fd0ae0c0192bf75009801
+index 0000000000000000000000000000000000000000..5e4d30569229cf210e64dea9a2d42dd06ab8af89
 --- /dev/null
 +++ b/com/coderyo/pathfinding/flowfield/FlowField.java
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,381 @@
 +/*
 + * coderyoMC — pathfinding A* elision (L3: shared per-goal FLOW-FIELD).
 + *
@@ -59,8 +59,9 @@ index 0000000000000000000000000000000000000000..3fe5a0f3fe77ed11033fd0ae0c0192bf
 + * A* path. PathFinder is never touched.
 + *
 + * <p><b>Concurrency.</b> A {@code FlowField} is created and consumed entirely on ONE region-worker
-+ * thread (it lives in a {@link ThreadLocal} {@link FlowFieldRouter}); it holds no reference to any
-+ * cross-thread mutable structure. World block-state reads are side-effect-free.
++ * thread (it lives in a per-Region {@link FlowFieldRouter} — or the ThreadLocal fallback when
++ * regionization is off — touched single-threaded per region under the single-writer invariant); it
++ * holds no reference to any cross-thread mutable structure. World block-state reads are side-effect-free.
 + */
 +public final class FlowField {
 +
@@ -397,10 +398,10 @@ index 0000000000000000000000000000000000000000..3fe5a0f3fe77ed11033fd0ae0c0192bf
 +}
 diff --git a/com/coderyo/pathfinding/flowfield/FlowFieldConfig.java b/com/coderyo/pathfinding/flowfield/FlowFieldConfig.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..674969ad54d915094392f5c0b1592a4b5db8bf6b
+index 0000000000000000000000000000000000000000..bfd23825f7bacedd7ca4398fd52eb9bcae9f457d
 --- /dev/null
 +++ b/com/coderyo/pathfinding/flowfield/FlowFieldConfig.java
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,254 @@
 +/*
 + * coderyoMC — pathfinding A* elision (L3: shared per-goal FLOW-FIELD).
 + *
@@ -443,9 +444,11 @@ index 0000000000000000000000000000000000000000..674969ad54d915094392f5c0b1592a4b
 + *
 + * <p><b>Concurrency.</b> This config is immutable after class-load. The only shared mutable state
 + * L3 introduces is the {@link LongAdder} debug counters here (lock-free, contention-friendly) — the
-+ * field cache and per-mob stall tracking live in a {@link FlowFieldRouter} that is
-+ * <em>thread-confined via {@link ThreadLocal}</em> (one registry per region-worker thread), so no
-+ * cross-region shared mutable structure is created (avoids the issue #24 shared-queue race class).
++ * field cache and per-mob stall tracking live in a {@link FlowFieldRouter} that is held <em>per
++ * {@link com.coderyo.region.Region}</em> under {@code region.enabled=true} (and ThreadLocal-confined
++ * on the non-regionized path). Each region's registry is touched only by the single worker ticking
++ * that region (single-writer-per-region), so no registry is shared across regions and the issue #24
++ * shared-queue race class is avoided.
 + */
 +public final class FlowFieldConfig {
 +
@@ -655,10 +658,10 @@ index 0000000000000000000000000000000000000000..674969ad54d915094392f5c0b1592a4b
 +}
 diff --git a/com/coderyo/pathfinding/flowfield/FlowFieldRouter.java b/com/coderyo/pathfinding/flowfield/FlowFieldRouter.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..3d1127eea7ab635263d58989c1ad4635deb5d522
+index 0000000000000000000000000000000000000000..9572ac0df43601012e9ab0a53625b9740ccca8db
 --- /dev/null
 +++ b/com/coderyo/pathfinding/flowfield/FlowFieldRouter.java
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,322 @@
 +/*
 + * coderyoMC — pathfinding A* elision (L3: shared per-goal FLOW-FIELD).
 + *
@@ -669,10 +672,15 @@ index 0000000000000000000000000000000000000000..3d1127eea7ab635263d58989c1ad4635
 + */
 +package com.coderyo.pathfinding.flowfield;
 +
++import com.coderyo.region.RegionConfig;
++import com.coderyo.region.RegionId;
++import com.coderyo.region.RegionLifecycle;
 +import java.util.HashMap;
 +import java.util.Iterator;
 +import java.util.Map;
 +import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
 +import net.minecraft.core.BlockPos;
 +import net.minecraft.server.MinecraftServer;
 +import net.minecraft.util.Mth;
@@ -683,14 +691,31 @@ index 0000000000000000000000000000000000000000..3d1127eea7ab635263d58989c1ad4635
 +import org.jspecify.annotations.Nullable;
 +
 +/**
-+ * Thread-confined flow-field registry (one instance per region-worker thread via {@link #INSTANCE}).
++ * Per-Region flow-field registry: one {@link FlowFieldRouter} instance per live {@link
++ * com.coderyo.region.Region} (keyed by {@link com.coderyo.region.RegionId} in {@link #BY_REGION}),
++ * with a {@link #INSTANCE ThreadLocal} fallback for the non-regionized server.
 + *
-+ * <p><b>Why ThreadLocal.</b> Each region is ticked single-threaded on one worker, and all of a
-+ * region's mobs request paths on that worker's thread, so a per-thread registry naturally scopes
-+ * "mobs in a region sharing a goal" with ZERO cross-region shared mutable state — exactly the
-+ * invariant that keeps L3 clear of the issue #24 mid-tick race class. Field keys are world-unique
-+ * (entity id, or world goal cell), so a worker that ticks several regions in turn never confuses
-+ * their fields, and validation (shape + goal-proximity + TTL) rejects any stale/foreign entry.
++ * <p><b>Why per-Region, not ThreadLocal (issue: inert under work-stealing).</b> Under
++ * {@code region.enabled=true} a region's mobs are not pinned to one worker thread across ticks — the
++ * work-stealing scheduler may tick a given region on a different worker each tick. A ThreadLocal
++ * registry therefore scatters one region's group demand across many per-worker registries, so the
++ * {@link FlowFieldConfig#groupSize() K}-mob grouping threshold is never reached and L3 builds ZERO
++ * fields (stable but inert). Keying the registry by the region the mob is ticking in instead makes
++ * all of a region's mobs accumulate into the SAME registry regardless of which worker ticks the
++ * region, so grouping engages and the N&rarr;1 win is delivered in the real parallel mode.
++ *
++ * <p><b>Single-writer safety (#24).</b> A region is ticked by exactly one worker at a time
++ * (single-writer-per-region invariant), so the per-Region registry is touched single-threaded per
++ * region — its inner {@link HashMap}s never see concurrent access, and no registry is shared across
++ * regions. The only cross-thread structure is the {@link #BY_REGION} container itself, a
++ * {@link java.util.concurrent.ConcurrentHashMap} whose {@code computeIfAbsent}/iterator-remove are
++ * thread-safe; the region lookup uses the index's lock-free volatile snapshot ({@link
++ * com.coderyo.region.RegionIndex#regionOf}). When {@code region.enabled=false} (or for the rare
++ * unowned entity ticked on the orchestrator thread) the {@link #INSTANCE} ThreadLocal is used — the
++ * original behavior that already delivers the win in the non-regionized path.
++ *
++ * <p>Field keys are world-unique (entity id, or world goal cell), and validation (shape +
++ * goal-proximity + TTL) rejects any stale entry.
 + *
 + * <p><b>Grouping.</b> A field is only built once at least {@link FlowFieldConfig#groupSize()}
 + * distinct mobs have requested the same goal within a recent tick window — so a lone mob never pays
@@ -712,12 +737,31 @@ index 0000000000000000000000000000000000000000..3d1127eea7ab635263d58989c1ad4635
 +    private static final int GOAL_MOVE_TOL = 4;
 +    /** Evict a field whose demand is empty this long after build. */
 +    private static final long FIELD_EVICT = 80L;
++    /** Drop a per-Region registry idle (no demand) this many ticks — bounds {@link #BY_REGION} as
++     *  regions merge/split/dissolve (region ids are monotonic and never recycle). */
++    private static final long REGION_ROUTER_EVICT = 200L;
 +
++    /**
++     * Fallback registry for {@code region.enabled=false} (single main tick thread) and for the rare
++     * unowned entity ticked on the orchestrator thread. One instance per accessing thread.
++     */
 +    private static final ThreadLocal<FlowFieldRouter> INSTANCE = ThreadLocal.withInitial(FlowFieldRouter::new);
++
++    /**
++     * Per-Region registries (region id value &rarr; router). The container is concurrent (workers
++     * ticking DISTINCT regions create entries in parallel); each value is only ever touched by the
++     * single worker currently ticking that region, so its inner maps stay single-threaded.
++     */
++    private static final ConcurrentHashMap<Long, FlowFieldRouter> BY_REGION = new ConcurrentHashMap<>();
++
++    /** Last server tick a {@link #BY_REGION} idle-sweep ran (one sweep per tick, CAS-guarded). */
++    private static final AtomicLong lastRegionPruneTick = new AtomicLong(Long.MIN_VALUE);
 +
 +    private final Map<Long, Entry> fields = new HashMap<>();
 +    private final Map<Integer, Stall> stalls = new HashMap<>();
 +    private long lastPruneTick = Long.MIN_VALUE;
++    /** Last tick this per-Region registry served a request (idle-eviction from {@link #BY_REGION}). */
++    private volatile long lastTouchTick = Long.MIN_VALUE;
 +
 +    private FlowFieldRouter() {
 +    }
@@ -763,10 +807,60 @@ index 0000000000000000000000000000000000000000..3d1127eea7ab635263d58989c1ad4635
 +        if (targets.isEmpty()) {
 +            return null;
 +        }
-+        final FlowFieldRouter reg = INSTANCE.get();
 +        final long tick = MinecraftServer.currentTick;
++        final FlowFieldRouter reg = registryFor(mob, level, tick);
 +        reg.maybePrune(tick);
++        return reg.serve(mob, level, targets, target, reachRange, tick);
++    }
 +
++    /**
++     * Resolve the registry that owns {@code mob}'s group demand this tick. Under
++     * {@code region.enabled=true} this is the registry for the {@link com.coderyo.region.Region} the
++     * mob is ticking in (so demand accumulates per-region across whichever worker ticks it); under
++     * {@code region.enabled=false}, or when the mob's chunk is owned by no region (unowned entity on
++     * the orchestrator thread), it is the {@link #INSTANCE ThreadLocal} fallback.
++     */
++    private static FlowFieldRouter registryFor(final Mob mob, final Level level, final long tick) {
++        if (RegionConfig.isEnabled()) {
++            // Lock-free volatile snapshot read (RegionIndex hot path) — safe from a worker thread.
++            final RegionId rid = RegionLifecycle.index().regionOf(level.dimension(), mob.chunkPosition().longKey());
++            if (rid != null) {
++                maybePruneRegions(tick);
++                final FlowFieldRouter reg = BY_REGION.computeIfAbsent(rid.value(), k -> {
++                    final FlowFieldRouter r = new FlowFieldRouter();
++                    r.lastTouchTick = tick; // stamp at creation so a concurrent sweep can't evict it
++                    return r;
++                });
++                reg.lastTouchTick = tick;
++                return reg;
++            }
++        }
++        return INSTANCE.get();
++    }
++
++    /** Evict per-Region registries idle longer than {@link #REGION_ROUTER_EVICT}. One sweep per tick. */
++    private static void maybePruneRegions(final long tick) {
++        final long prev = lastRegionPruneTick.get();
++        if (prev == tick || !lastRegionPruneTick.compareAndSet(prev, tick)) {
++            return;
++        }
++        final long cutoff = tick - REGION_ROUTER_EVICT;
++        final Iterator<Map.Entry<Long, FlowFieldRouter>> it = BY_REGION.entrySet().iterator();
++        while (it.hasNext()) {
++            if (it.next().getValue().lastTouchTick < cutoff) {
++                it.remove();
++            }
++        }
++    }
++
++    /**
++     * Try to serve a shared flow-field path for {@code mob} toward {@code target} (or the
++     * representative of {@code targets}). Returns {@code null} to fall back to the real A*. Runs on
++     * the single worker currently ticking this registry's region (or the main/orchestrator thread in
++     * the ThreadLocal case), so this instance's maps are accessed single-threaded.
++     */
++    private @Nullable Path serve(final Mob mob, final Level level, final Set<BlockPos> targets,
++                                 final @Nullable Entity target, final int reachRange, final long tick) {
 +        final int shape = FlowField.shapeBucketOf(mob);
 +        final BlockPos goal;
 +        final long key;
@@ -784,12 +878,12 @@ index 0000000000000000000000000000000000000000..3d1127eea7ab635263d58989c1ad4635
 +
 +        final int mobId = mob.getId();
 +        // Stuck-detector blacklist gate: a recently-stalled mob runs the real A*.
-+        final Stall stall = reg.stalls.get(mobId);
++        final Stall stall = this.stalls.get(mobId);
 +        if (stall != null && stall.blacklistUntil > tick) {
 +            return null;
 +        }
 +
-+        final Entry e = reg.fields.computeIfAbsent(key, k -> new Entry());
++        final Entry e = this.fields.computeIfAbsent(key, k -> new Entry());
 +        e.recordDemand(mobId, tick);
 +        final int distinct = e.distinctDemand(tick);
 +
@@ -818,7 +912,7 @@ index 0000000000000000000000000000000000000000..3d1127eea7ab635263d58989c1ad4635
 +        }
 +
 +        // Progress / stall accounting (stuck-detector). Compare the mob's cell to the last serve.
-+        final Stall st = reg.stalls.computeIfAbsent(mobId, k -> new Stall());
++        final Stall st = this.stalls.computeIfAbsent(mobId, k -> new Stall());
 +        final int bx = Mth.floor(mob.getX());
 +        final int bz = Mth.floor(mob.getZ());
 +        if (st.lastX == bx && st.lastZ == bz) {
