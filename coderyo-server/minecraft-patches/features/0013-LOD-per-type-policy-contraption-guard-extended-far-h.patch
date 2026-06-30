@@ -6,13 +6,37 @@ Subject: [PATCH] LOD per-type policy + contraption guard + extended
 
 
 diff --git a/com/coderyo/lod/LodConfig.java b/com/coderyo/lod/LodConfig.java
-index 4344d3f67199edc48f29ad3bfd9c0b916422b921..a548f7aaae7729a49378fa4e2676d029d70c387c 100644
+index 4344d3f67199edc48f29ad3bfd9c0b916422b921..4bdf86405376a0a7479bfe3fa11af961e019a3e8 100644
 --- a/com/coderyo/lod/LodConfig.java
 +++ b/com/coderyo/lod/LodConfig.java
-@@ -62,10 +62,51 @@ public final class LodConfig {
+@@ -10,16 +10,17 @@
+  *
+  * Resolved once at class-load from system properties / environment variables, mirroring
+  * {@link com.coderyo.region.RegionConfig} and {@link com.coderyo.pathfinding.LosElisionConfig}.
+- * Purely additive: touches NO upstream config file, so default-off boots byte-for-byte vanilla.
++ * Purely additive: touches NO upstream config file. DAB now defaults ON (user-confirmed,
++ * soak-validated); set {@code -Dcoderyo.lod.dab.enabled=false} for byte-for-byte vanilla AI cadence.
+  */
+ package com.coderyo.lod;
+ 
+ /**
+  * Flags + tunable parameters for the player-relative simulation LOD framework.
+  *
+- * <p><strong>Default OFF.</strong> When {@code coderyo.lod.dab.enabled} is off — the default —
+- * mob AI runs at full vanilla cadence at every distance. Turn it on to throttle distant mobs' AI
+- * goal-selection + pathfinding frequency by LOD band:
++ * <p><strong>Default ON.</strong> When {@code coderyo.lod.dab.enabled} is on — the default —
++ * distant mobs' AI goal-selection + pathfinding frequency is throttled by LOD band (NEAR stays full
++ * vanilla cadence). Set the flag to {@code false} to opt out and run full vanilla cadence everywhere:
+  * <pre>
+  *   -Dcoderyo.lod.dab.enabled=true        (system property, takes precedence)
+  *   CODERYO_LOD_DAB_ENABLED=true           (environment variable, fallback)
+@@ -62,10 +63,56 @@ public final class LodConfig {
      /** Environment variable key for the LOD debug counters flag. */
      public static final String DEBUG_ENV = "CODERYO_LOD_DEBUG";
  
+-    /** {@code lod.dab.enabled} default — OFF (full vanilla AI cadence at all distances). */
+-    public static final boolean DEFAULT_ENABLED = false;
 +    /** System property key for the per-entity-type policy master flag (the contraption guard). */
 +    public static final String POLICY_PROPERTY = "coderyo.lod.policy.enabled";
 +    /** Environment variable key for the per-entity-type policy master flag. */
@@ -23,8 +47,13 @@ index 4344d3f67199edc48f29ad3bfd9c0b916422b921..a548f7aaae7729a49378fa4e2676d029
 +    /** Environment variable key for the extended far-hostile throttle. */
 +    public static final String EXTENDED_ENV = "CODERYO_LOD_EXTENDED_ENABLED";
 +
-     /** {@code lod.dab.enabled} default — OFF (full vanilla AI cadence at all distances). */
-     public static final boolean DEFAULT_ENABLED = false;
++    /**
++     * {@code lod.dab.enabled} default — ON (user-confirmed, soak-validated: ~34-min run held 20 TPS,
++     * −43.9% far-entity cost, contraption-safe). Distant mobs' AI goal-selection + pathfinding cadence
++     * is throttled by LOD band out of the box; the NEAR band stays full vanilla. Overridable: set
++     * {@code -Dcoderyo.lod.dab.enabled=false} (or {@code CODERYO_LOD_DAB_ENABLED=false}) to opt out.
++     */
++    public static final boolean DEFAULT_ENABLED = true;
      /** {@code lod.debug} default — quiet. */
      public static final boolean DEFAULT_DEBUG = false;
 +    /**
@@ -61,7 +90,7 @@ index 4344d3f67199edc48f29ad3bfd9c0b916422b921..a548f7aaae7729a49378fa4e2676d029
  
      // --- Band edge radii (blocks). Distances are compared squared internally for cheapness. ---
      /** Outer edge of the NEAR band (default 16). Inside this, AI is always full vanilla cadence. */
-@@ -86,6 +127,19 @@ public final class LodConfig {
+@@ -86,6 +133,19 @@ public final class LodConfig {
  
      private static final boolean ENABLED = resolveBoolean(PROPERTY, ENV, DEFAULT_ENABLED);
      private static final boolean DEBUG = resolveBoolean(DEBUG_PROPERTY, DEBUG_ENV, DEFAULT_DEBUG);
@@ -81,7 +110,16 @@ index 4344d3f67199edc48f29ad3bfd9c0b916422b921..a548f7aaae7729a49378fa4e2676d029
  
      private static final double NEAR = resolveDouble("coderyo.lod.band.near", "CODERYO_LOD_BAND_NEAR", DEFAULT_NEAR);
      private static final double BAND1 = resolveDouble("coderyo.lod.band.b1", "CODERYO_LOD_BAND_B1", DEFAULT_BAND1);
-@@ -116,6 +170,48 @@ public final class LodConfig {
+@@ -106,7 +166,7 @@ public final class LodConfig {
+     private LodConfig() {
+     }
+ 
+-    /** Whether L0 DAB AI throttling is enabled. Resolved once at class-load (default false). */
++    /** Whether L0 DAB AI throttling is enabled. Resolved once at class-load (default true). */
+     public static boolean isEnabled() {
+         return ENABLED;
+     }
+@@ -116,6 +176,48 @@ public final class LodConfig {
          return DEBUG;
      }
  

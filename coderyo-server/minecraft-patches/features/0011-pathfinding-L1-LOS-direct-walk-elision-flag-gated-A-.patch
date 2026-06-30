@@ -333,10 +333,10 @@ index 0000000000000000000000000000000000000000..5300f6fcc1b8caa2300ad6664c11cbb3
 +}
 diff --git a/com/coderyo/pathfinding/LosElisionConfig.java b/com/coderyo/pathfinding/LosElisionConfig.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..82ae6d12b4bc5187e826ac220f44a2721d4e5aaf
+index 0000000000000000000000000000000000000000..fdf4ed9338995f327d3450cdc353d88fb4c0e7c2
 --- /dev/null
 +++ b/com/coderyo/pathfinding/LosElisionConfig.java
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,202 @@
 +/*
 + * coderyoMC — pathfinding A* elision (L1: LOS / direct-walk).
 + *
@@ -354,9 +354,9 @@ index 0000000000000000000000000000000000000000..82ae6d12b4bc5187e826ac220f44a272
 +/**
 + * Flag + counters for the L1 LOS / direct-walk A* elision (pathfinding-elision-design.md §6, §5 #1).
 + *
-+ * <p><strong>Default OFF.</strong> When off — the default — {@code PathNavigation.createPath} runs
-+ * the stock A* search byte-for-byte identical to vanilla Paper. Turn it on to elide A* for ground
-+ * mobs whose straight line to the target is provably walkable:
++ * <p><strong>Default ON.</strong> When on — the default — A* is elided for ground mobs whose
++ * straight line to the target is provably walkable; anything not provably safe falls back to the
++ * stock A* byte-for-byte. Set the flag to {@code false} to run stock A* for every repath:
 + * <pre>
 + *   -Dcoderyo.pathfinding.los.enabled=true     (system property, takes precedence)
 + *   CODERYO_PATHFINDING_LOS_ENABLED=true        (environment variable, fallback)
@@ -396,8 +396,13 @@ index 0000000000000000000000000000000000000000..82ae6d12b4bc5187e826ac220f44a272
 +    /** Environment variable key for the max direct-walk distance (blocks). */
 +    public static final String MAX_DIRECT_ENV = "CODERYO_PATHFINDING_LOS_MAX_DIRECT";
 +
-+    /** {@code pathfinding.los.enabled} default — OFF (vanilla A* runs). */
-+    public static final boolean DEFAULT_ENABLED = false;
++    /**
++     * {@code pathfinding.los.enabled} default — ON (user-confirmed, soak-validated alongside DAB).
++     * Ground mobs whose straight line to the target is provably walkable synthesize a direct path and
++     * skip the A* search; anything not provably safe still falls back to the real byte-for-byte A*.
++     * Overridable: set {@code -Dcoderyo.pathfinding.los.enabled=false} to run stock A* everywhere.
++     */
++    public static final boolean DEFAULT_ENABLED = true;
 +
 +    /** {@code pathfinding.los.debug} default — quiet. */
 +    public static final boolean DEFAULT_DEBUG = false;
@@ -435,7 +440,7 @@ index 0000000000000000000000000000000000000000..82ae6d12b4bc5187e826ac220f44a272
 +
 +    /**
 +     * Whether the L1 LOS / direct-walk elision is enabled. Resolved once at class-load.
-+     * Default {@link #DEFAULT_ENABLED} (false) → the stock A* path runs unchanged.
++     * Default {@link #DEFAULT_ENABLED} (true) → A* is elided where provably safe, else stock A* runs.
 +     */
 +    public static boolean isEnabled() {
 +        return ENABLED;
