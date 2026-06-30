@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..0cc6180c36f191f43b6481be198be5edc359398d
+index 0000000000000000000000000000000000000000..f8bd1d27ea09fa803470f7c2400087c570668b1d
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,2142 @@
+@@ -0,0 +1,2157 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -60,6 +60,7 @@ index 0000000000000000000000000000000000000000..0cc6180c36f191f43b6481be198be5ed
 +import net.minecraft.world.level.block.RedStoneWireBlock;
 +import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.SculkSensorBlock;
 +import net.minecraft.world.level.block.TargetBlock;
 +import net.minecraft.world.level.block.TripWireBlock;
 +import net.minecraft.world.level.block.TripWireHookBlock;
@@ -338,6 +339,20 @@ index 0000000000000000000000000000000000000000..0cc6180c36f191f43b6481be198be5ed
 +                // step (vanilla computes light->POWER, incl. the inverted mode), exactly like a
 +                // pressure plate's entity-presence input.
 +                c.detectionInputs.add(packed);
++            } else if (state.getBlock() instanceof SculkSensorBlock) {
++                // Sculk sensor / calibrated sculk sensor — a VIBRATION-driven analog source.
++                // Vanilla's VibrationSystem owns the game-event detection, the listener range, the
++                // 1-block/tick travel delay, the frequency filter (calibrated) and the ACTIVE/
++                // COOLDOWN phase machine; we read the resulting block state (POWER + PHASE) live
++                // each step (a boundary input, exactly like a daylight detector) and the compiled
++                // circuit propagates its analog output downstream. We also bind the LIVE sensor
++                // block entity into the grid so a comparator facing the sensor reads vanilla's
++                // getAnalogOutputSignal (the ACTIVE last-vibration FREQUENCY) bit-identically.
++                c.detectionInputs.add(packed);
++                final BlockEntity sensorBe = level.getBlockEntity(pos);
++                if (sensorBe != null) {
++                    c.vw.setBlockEntity(packed, sensorBe);
++                }
 +            } else if (state.getBlock() instanceof BasePressurePlateBlock
 +                || state.getBlock() instanceof TripWireHookBlock
 +                || state.getBlock() instanceof TripWireBlock
@@ -2330,10 +2345,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef86c31de84
+index 0000000000000000000000000000000000000000..d2195479b99d7e448d3ff835e3572a1bb4352624
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,1809 @@
+@@ -0,0 +1,1899 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -2382,6 +2397,7 @@ index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef8
 +import net.minecraft.world.level.block.ObserverBlock;
 +import net.minecraft.world.level.block.RedstoneLampBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.SculkSensorBlock;
 +import net.minecraft.world.level.block.TargetBlock;
 +import net.minecraft.world.level.block.TripWireBlock;
 +import net.minecraft.world.level.block.TripWireHookBlock;
@@ -2396,6 +2412,8 @@ index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef8
 +import net.minecraft.world.level.block.state.properties.AttachFace;
 +import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 +import net.minecraft.world.level.block.state.properties.ComparatorMode;
++import net.minecraft.world.level.block.state.properties.SculkSensorPhase;
++import net.minecraft.world.level.gameevent.GameEvent;
 +import net.minecraft.world.phys.Vec3;
 +import org.slf4j.Logger;
 +
@@ -2831,6 +2849,11 @@ index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef8
 +        .setValue(TripWireHookBlock.FACING, Direction.WEST);
 +    private static final BlockState STRING = Blocks.TRIPWIRE.defaultBlockState();
 +    private static final BlockState DETECTOR_RAIL = Blocks.DETECTOR_RAIL.defaultBlockState();
++    // ---- VIBRATION SENSORS (sculk sensor / calibrated sculk sensor) ----
++    private static final BlockState SCULK_SENSOR = Blocks.SCULK_SENSOR.defaultBlockState();
++    /** Calibrated sensor facing SOUTH -> its CALIBRATION input (frequency filter) is the NORTH (back) side. */
++    private static final BlockState CALIBRATED_SOUTH = Blocks.CALIBRATED_SCULK_SENSOR.defaultBlockState()
++        .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.SOUTH);
 +    // ---- MISC SIGNAL BLOCKS (daylight sensor / copper bulb memory / comparator sources / note) ----
 +    private static final BlockState DAYLIGHT = Blocks.DAYLIGHT_DETECTOR.defaultBlockState();
 +    private static final BlockState COPPER_BULB = Blocks.COPPER_BULB.weathering().unaffected().defaultBlockState();
@@ -3753,6 +3776,73 @@ index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef8
 +                setBoth(lvl, c, new BlockPos(16, 101, 40), AIR);      // falling edge -> TRIGGERED off
 +            }
 +        }));
++
++        // =================================================================
++        //  VIBRATION SENSORS — sculk sensor + calibrated sculk sensor. Vanilla's
++        //  VibrationSystem owns the game-event detection, listener range, the 1-block/tick
++        //  travel delay, the frequency filter (calibrated) and the ACTIVE/COOLDOWN phase
++        //  machine; each sensor is a boundary input whose POWER + PHASE are read live every
++        //  step (like a daylight detector) and the compiled circuit propagates it downstream.
++        //  Stimulus = a CONTROLLED game event (level.gameEvent) at a fixed pos+tick, OFF the
++        //  network footprint, exactly as a real block place/break would emit a vibration.
++        //  Placed deep INSIDE the force-loaded build area (chunk x=0, z=2..3) so all 3x3
++        //  neighbour chunks tick — required by VibrationSystem.requiresAdjacentChunksToBeTicking.
++        //  Row z=44/48/52, x 9-14 — clear of every other circuit.
++        // =================================================================
++
++        // ---- Circuit 45: SCULK SENSOR — controlled vibration -> analog dust -> lamp ----
++        // A BLOCK_PLACE game event (frequency 13) is emitted 2 blocks ABOVE the sensor (off the
++        // circuit). Vanilla schedules the vibration, it travels 1 block/tick, the sensor goes
++        // ACTIVE (30 ticks) emitting analog POWER = getRedstoneStrengthForDistance(2, radius 8) =
++        // max(1, 15 - floor(15/8 * 2)) = 12, then COOLDOWN (10 ticks) -> INACTIVE. The dust reads
++        // the analog level and decays; the lamp follows. Phase + analog POWER + active/cooldown
++        // timing are differential-compared bit-identical every tick (the compiler reads vanilla's
++        // sensor state live and propagates it — it never re-derives the vibration math).
++        put(level, 9,  100, 44, STONE);  put(level, 9,  101, 44, SCULK_SENSOR); // vibration source
++        put(level, 10, 100, 44, STONE);  put(level, 10, 101, 44, WIRE);
++        put(level, 11, 100, 44, STONE);  put(level, 11, 101, 44, WIRE);
++        put(level, 12, 100, 44, STONE);  put(level, 12, 101, 44, LAMP);
++        SCENARIOS.add(new Scenario("sculk-sensor-vibration", new BlockPos(9, 101, 44), (lvl, c, rel) -> {
++            // Emit a controlled BLOCK_PLACE vibration 2 blocks above the sensor (off-footprint).
++            // Re-fire after the 40-tick ACTIVE+COOLDOWN recovery so a second pulse is also proven.
++            if (rel == 20 || rel == 140) {
++                lvl.gameEvent(null, GameEvent.BLOCK_PLACE, new BlockPos(9, 103, 44));
++            }
++        }));
++
++        // ---- Circuit 46: CALIBRATED SCULK SENSOR — frequency FILTER (fires only on a match) ----
++        // The calibrated sensor faces SOUTH, so its CALIBRATION input is the NORTH (back) side: a
++        // redstone block there gives back-signal 15, so it ONLY accepts frequency-15 vibrations.
++        // An ENTITY_DIE event (frequency 15) MATCHES -> fires (radius 16, dist 2 -> POWER 14); a
++        // BLOCK_PLACE event (frequency 13) does NOT match -> filtered out (output stays 0). Both
++        // cases are differential-compared bit-identical every tick — vanilla owns the filter.
++        put(level, 9,  100, 47, STONE);  put(level, 9,  101, 47, REDBLOCK);       // back (NORTH) calibration = freq 15
++        put(level, 9,  100, 48, STONE);  put(level, 9,  101, 48, CALIBRATED_SOUTH); // faces SOUTH; outputs EAST
++        put(level, 10, 100, 48, STONE);  put(level, 10, 101, 48, WIRE);
++        put(level, 11, 100, 48, STONE);  put(level, 11, 101, 48, WIRE);
++        put(level, 12, 100, 48, STONE);  put(level, 12, 101, 48, LAMP);
++        SCENARIOS.add(new Scenario("calibrated-sculk-filter", new BlockPos(9, 101, 48), (lvl, c, rel) -> {
++            if (rel == 20 || rel == 140) {
++                lvl.gameEvent(null, GameEvent.ENTITY_DIE, new BlockPos(9, 103, 48));  // freq 15 -> MATCHES -> fires
++            } else if (rel == 80 || rel == 200) {
++                lvl.gameEvent(null, GameEvent.BLOCK_PLACE, new BlockPos(9, 103, 48)); // freq 13 -> NO match -> filtered
++            }
++        }));
++
++        // ---- Circuit 47: SCULK SENSOR -> COMPARATOR (reads the FREQUENCY) -> dust -> lamp ----
++        // A comparator facing the sensor reads its getAnalogOutputSignal — the ACTIVE last-vibration
++        // FREQUENCY (13 for BLOCK_PLACE), NOT the redstone POWER. The comparator (COMPARE, 2-tick
++        // delay) emits 13 while the sensor is ACTIVE, then 0. Proves the sensor drives a downstream
++        // comparator with the compiled model reading vanilla's live block entity, bit-identical.
++        put(level, 9,  100, 52, STONE);  put(level, 9,  101, 52, SCULK_SENSOR); // analog source (frequency)
++        put(level, 10, 100, 52, STONE);  put(level, 10, 101, 52, COMP_CMP_W);   // faces WEST -> reads sensor frequency
++        put(level, 11, 100, 52, STONE);  put(level, 11, 101, 52, WIRE);
++        put(level, 12, 100, 52, STONE);  put(level, 12, 101, 52, LAMP);
++        SCENARIOS.add(new Scenario("sculk-comparator-frequency", new BlockPos(9, 101, 52), (lvl, c, rel) -> {
++            if (rel == 20 || rel == 140) {
++                lvl.gameEvent(null, GameEvent.BLOCK_PLACE, new BlockPos(9, 103, 52)); // freq 13 -> comparator emits 13
++            }
++        }));
 +    }
 +
 +    /** Seed a live crafter's 3x3 grid: fill {@code slots} with {@code item} x{@code count}, then
@@ -3922,6 +4012,10 @@ index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef8
 +                } else if (liveState.getBlock() instanceof net.minecraft.world.level.block.DaylightDetectorBlock) {
 +                    // Record the daylight sensor's emitted analog level (proves a non-trivial signal).
 +                    this.peakDetection = Math.max(this.peakDetection, liveState.getValue(BlockStateProperties.POWER));
++                } else if (liveState.getBlock() instanceof SculkSensorBlock) {
++                    // Record the sculk sensor's analog POWER when ACTIVE — proves a controlled
++                    // vibration really fired vanilla's VibrationSystem (non-trivial detection).
++                    this.peakDetection = Math.max(this.peakDetection, liveState.getValue(BlockStateProperties.POWER));
 +                }
 +                final String detail = cellDivergence(level, this.compiled, packed);
 +                if (detail != null) {
@@ -3954,6 +4048,17 @@ index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef8
 +        final BlockPos pos = BlockPos.of(packed);
 +        final BlockState liveState = level.getBlockState(pos);
 +        String detail = diff(pos, liveState, compiled.state(packed));
++        // SCULK SENSOR phase parity: diff() already compared the analog POWER (the sensor has the
++        // POWER property); ALSO assert the SCULK_SENSOR_PHASE (INACTIVE/ACTIVE/COOLDOWN) matches,
++        // so the full vibration-driven phase machine + active/cooldown timing is differential-proven
++        // bit-identical every tick, not just the emitted power.
++        if (detail == null && liveState.getBlock() instanceof SculkSensorBlock) {
++            final SculkSensorPhase realPhase = liveState.getValue(SculkSensorBlock.PHASE);
++            final SculkSensorPhase simPhase = compiled.state(packed).getValue(SculkSensorBlock.PHASE);
++            if (realPhase != simPhase) {
++                detail = pos.toShortString() + " SCULK-PHASE real=" + realPhase + " sim=" + simPhase;
++            }
++        }
 +        // Comparator analog output lives in the block entity, not the block state:
 +        // assert the compiled simulator's stored analog value matches vanilla's.
 +        if (detail == null && liveState.getBlock() instanceof ComparatorBlock) {
@@ -4145,10 +4250,10 @@ index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef8
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..066e82d18791d07f27223db32427eea65037e14f
+index 0000000000000000000000000000000000000000..85c17b5a7685366310ac04acf18c2f451c6a2270
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,298 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -4181,6 +4286,7 @@ index 0000000000000000000000000000000000000000..066e82d18791d07f27223db32427eea6
 +import net.minecraft.world.level.block.TripWireHookBlock;
 +import net.minecraft.world.level.block.RedStoneWireBlock;
 +import net.minecraft.world.level.block.RedstoneTorchBlock;
++import net.minecraft.world.level.block.SculkSensorBlock;
 +import net.minecraft.world.level.block.TargetBlock;
 +import net.minecraft.world.level.block.piston.PistonBaseBlock;
 +import net.minecraft.world.level.block.piston.PistonStructureResolver;
@@ -4272,6 +4378,12 @@ index 0000000000000000000000000000000000000000..066e82d18791d07f27223db32427eea6
 +            || state.getBlock() instanceof TripWireHookBlock
 +            || state.getBlock() instanceof TripWireBlock
 +            || state.getBlock() instanceof DetectorRailBlock
++            // Sculk sensor + calibrated sculk sensor (CalibratedSculkSensorBlock extends
++            // SculkSensorBlock): a VIBRATION-driven analog signal SOURCE. Vanilla's
++            // VibrationSystem owns the game-event detection, the listener range, the 1-block/
++            // tick travel delay and the ACTIVE/COOLDOWN phase timing; the sensor is a boundary
++            // input whose redstone POWER + PHASE are read live each tick (see CompiledNetwork).
++            || state.getBlock() instanceof SculkSensorBlock
 +            || state.is(Blocks.REDSTONE_BLOCK);
 +    }
 +
