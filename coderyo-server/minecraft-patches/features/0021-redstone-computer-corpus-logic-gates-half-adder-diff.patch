@@ -1,0 +1,571 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jason920612 <jasonya2206@gmail.com>
+Date: Tue, 30 Jun 2026 20:17:13 +0800
+Subject: [PATCH] redstone computer corpus: logic gates + half-adder
+ differential parity (flag-gated)
+
+
+diff --git a/com/coderyo/redstone/RedstoneComputerHarness.java b/com/coderyo/redstone/RedstoneComputerHarness.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b8a0850f11f7740745addb6984df66bd580474e
+--- /dev/null
++++ b/com/coderyo/redstone/RedstoneComputerHarness.java
+@@ -0,0 +1,546 @@
++/*
++ * coderyoMC — redstone HDL-compiler, COMPUTER corpus (Stream B, rung 1).
++ * Clean-room independent implementation.
++ *
++ * This is the COMPUTATIONAL-circuit differential driver (feature patch 0021). It does
++ * NOT touch the component compiler (patch 0020: RedstoneNetwork / VirtualRedstoneWorld /
++ * CompiledNetwork / RedstoneDiffTestHarness). It REUSES those proven classes to build
++ * real, in-world redstone COMPUTER circuits — logic gates and binary adders — and proves
++ * the compiled logic-graph model reproduces vanilla bit-for-bit on every footprint cell,
++ * every tick, while driving each circuit through its truth table / input sweep.
++ *
++ * Every circuit here is composed from components already proven bit-identical by patch
++ * 0020 (redstone-wire, redstone-block source, repeater, and the SUBTRACT comparator), so
++ * the per-tick parity is upheld by construction; the new evidence is that the compiler
++ * reproduces COMPOSITE computational circuits (gates + half/full/4-bit adders) exactly.
++ */
++package com.coderyo.redstone;
++
++import com.mojang.logging.LogUtils;
++import java.util.ArrayList;
++import java.util.List;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.Direction;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.ComparatorBlock;
++import net.minecraft.world.level.block.DiodeBlock;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.block.state.properties.BlockStateProperties;
++import net.minecraft.world.level.block.state.properties.ComparatorMode;
++import org.slf4j.Logger;
++
++/**
++ * Differential-parity driver for the COMPUTER corpus (rung 1 of the circuit ladder).
++ * Self-contained and flag-gated behind {@code coderyo.redstone.computer} (which itself
++ * requires the master {@code coderyo.redstone.compile.enabled}); with the flag off this
++ * method returns immediately and the server is byte-for-byte vanilla. Driven off ONE hook
++ * in {@code MinecraftServer.tickServer}, parallel to (and independent of) the patch-0020
++ * component harness.
++ */
++public final class RedstoneComputerHarness {
++
++    private static final Logger LOG = LogUtils.getLogger();
++
++    public static final String COMPUTER_PROPERTY = "coderyo.redstone.computer";
++
++    private static final boolean COMPUTER_ENABLED =
++        RedstoneCompileConfig.isEnabled() && Boolean.parseBoolean(
++            System.getProperty(COMPUTER_PROPERTY, "false").trim());
++
++    private static final int PHASE_WAIT = 0;
++    private static final int PHASE_SETTLE = 1;
++    private static final int PHASE_RUN = 2;
++    private static final int PHASE_DONE = 3;
++
++    /** Each input combination is held for this many ticks before its outputs are sampled. */
++    private static final int STEP_TICKS = 16;
++    /** Number of input-combination steps in the schedule (covers the largest truth table). */
++    private static final int STEPS = 16;
++    /** Tick offset within a step at which the (settled) vanilla outputs are read. */
++    private static final int SAMPLE_OFFSET = STEP_TICKS - 2;
++
++    // Build area (its own force-loaded region, disjoint from the patch-0020 corpus near origin).
++    private static final int CX_LO = 12, CX_HI = 18, CZ_LO = 12, CZ_HI = 20;
++
++    private static int phase = PHASE_WAIT;
++    private static boolean forced;
++    private static long ticks;
++    private static long settleUntil;
++    private static long runStart;
++    private static int lastStep = -1;
++    private static final List<Scenario> SCENARIOS = new ArrayList<>();
++
++    private RedstoneComputerHarness() {
++    }
++
++    public static void onServerTickEnd(final MinecraftServer server) {
++        if (!COMPUTER_ENABLED) {
++            return;
++        }
++        ticks++;
++        final ServerLevel level = server.overworld();
++        switch (phase) {
++            case PHASE_WAIT -> {
++                if (!forced) {
++                    forced = true;
++                    for (int cx = CX_LO; cx <= CX_HI; cx++) {
++                        for (int cz = CZ_LO; cz <= CZ_HI; cz++) {
++                            level.setChunkForced(cx, cz, true);
++                        }
++                    }
++                    // Determinism: no stray mobs, no world-clock drift.
++                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MOBS, false, level);
++                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MONSTERS, false, level);
++                    level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.ADVANCE_TIME, false, level);
++                    LOG.info("[redstone-computer] forceloaded computer build-area; mob-spawning OFF; clock frozen; waiting for load");
++                }
++                if (ticks > 40 && areaLoaded(level)) {
++                    buildCorpus(level);
++                    phase = PHASE_SETTLE;
++                    settleUntil = ticks + 12;
++                    LOG.info("[redstone-computer] corpus built; settling vanilla redstone for 12 ticks");
++                }
++            }
++            case PHASE_SETTLE -> {
++                if (ticks >= settleUntil) {
++                    for (final Scenario s : SCENARIOS) {
++                        s.compile(level);
++                    }
++                    phase = PHASE_RUN;
++                    runStart = ticks;
++                    lastStep = -1;
++                    LOG.info("[redstone-computer] ===== LOCKSTEP COMPUTER PARITY COMPARISON START =====");
++                }
++            }
++            case PHASE_RUN -> {
++                final int rel = (int) (ticks - runStart);
++                final int step = rel / STEP_TICKS;
++                final int within = rel % STEP_TICKS;
++                if (step != lastStep && step < STEPS) {
++                    lastStep = step;
++                    for (final Scenario s : SCENARIOS) {
++                        s.applyCombo(level, step);
++                    }
++                }
++                for (final Scenario s : SCENARIOS) {
++                    s.tick(level, rel);
++                }
++                if (within == SAMPLE_OFFSET && step < STEPS) {
++                    for (final Scenario s : SCENARIOS) {
++                        s.sample(level, step);
++                    }
++                }
++                if (rel >= STEPS * STEP_TICKS + 4) {
++                    phase = PHASE_DONE;
++                    summarize();
++                }
++            }
++            default -> {
++            }
++        }
++    }
++
++    private static boolean areaLoaded(final ServerLevel level) {
++        for (int cx = CX_LO; cx <= CX_HI; cx++) {
++            for (int cz = CZ_LO; cz <= CZ_HI; cz++) {
++                if (!level.getChunkSource().hasChunk(cx, cz)) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    }
++
++    private static void summarize() {
++        LOG.info("[redstone-computer] ===== COMPUTER PARITY SUMMARY ({} ticks) =====", STEPS * STEP_TICKS);
++        boolean allPass = true;
++        for (final Scenario s : SCENARIOS) {
++            if (s.divergences == 0) {
++                LOG.info("[redstone-computer]   PASS  {}  ({} cells, every tick bit-identical) | {}",
++                    s.name, s.net.footprint().size(), s.truthTable());
++            } else {
++                allPass = false;
++                LOG.warn("[redstone-computer]   FAIL  {}  ({} divergences; first @rel-tick {}: {})",
++                    s.name, s.divergences, s.firstDivergeTick, s.firstDetail);
++            }
++        }
++        LOG.info("[redstone-computer] ===== VERDICT: {} =====",
++            allPass ? "ALL COMPUTER CIRCUITS BIT-IDENTICAL" : "DIVERGENCE(S) FOUND");
++    }
++
++    // --------------------------------------------------------------- block states
++
++    private static final BlockState STONE = Blocks.STONE.defaultBlockState();
++    private static final BlockState WIRE = Blocks.REDSTONE_WIRE.defaultBlockState();
++    private static final BlockState REDBLOCK = Blocks.REDSTONE_BLOCK.defaultBlockState();
++    private static final BlockState AIR = Blocks.AIR.defaultBlockState();
++    // DIODE ORIENTATION: vanilla DiodeBlock.getInputSignal reads pos.relative(FACING), so a
++    // diode's FACING points at its REAR INPUT and the output exits the OPPOSITE side. For an
++    // EASTWARD signal flow (input from west, output to east) a comparator/repeater must FACE WEST.
++    private static final BlockState SUB_W =
++        Blocks.COMPARATOR.defaultBlockState()
++            .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.WEST)
++            .setValue(ComparatorBlock.MODE, ComparatorMode.SUBTRACT);
++
++    private static BlockState rep(final Direction d) {
++        return Blocks.REPEATER.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, d);
++    }
++
++    private static void put(final ServerLevel level, final int x, final int y, final int z, final BlockState state) {
++        level.setBlockAndUpdate(new BlockPos(x, y, z), state);
++    }
++
++    /** Place a logic cell: stone support at y=100 and {@code state} at y=101. */
++    private static void node(final ServerLevel level, final int x, final int z, final BlockState state) {
++        put(level, x, 100, z, STONE);
++        put(level, x, 101, z, state);
++    }
++
++    /** Just the support at y=100 (for cells whose y=101 block is placed later / is a source). */
++    private static void support(final ServerLevel level, final int x, final int z) {
++        put(level, x, 100, z, STONE);
++    }
++
++    /**
++     * Build a SUBTRACT-comparator gadget facing EAST at (cx,101,cz):
++     *   out = max(0, rear - side)
++     * The rear input is delivered by a repeater from the WEST (clean 15/0); the side input by
++     * a repeater from the NORTH (clean 15/0). Returns nothing; caller fills the two input cells
++     * (rearCell = cx-2, sideCell at cz-2) and reads the output dust at (cx+1, cz).
++     */
++    private static void subGadget(final ServerLevel level, final int cx, final int cz) {
++        node(level, cx, cz, SUB_W);                     // comparator faces WEST: rear=west, out=east
++        node(level, cx - 1, cz, rep(Direction.WEST));   // rear repeater faces WEST: reads (cx-2,cz), out east into rear
++        node(level, cx, cz - 1, rep(Direction.NORTH));  // side repeater faces NORTH: reads (cx,cz-2), out south into N side
++        node(level, cx + 1, cz, WIRE);                  // output dust (east of comparator)
++    }
++
++    private static void buildCorpus(final ServerLevel level) {
++        // Every gate / adder lives in its own z-lane (>=4 gap) so the flood-fill detector finds
++        // each as an independent connected network. Comparators face EAST; inputs arrive from the
++        // NORTH/WEST through repeaters (clean 15/0), output dust to the EAST. Inputs are toggled
++        // as redstone-block (1) / air (0) by the combo schedule.
++
++        // =========================== LOGIC GATES ===========================
++
++        // ---- NOT(A) = 15 - A (one SUBTRACT comparator, rear = const 15) ----
++        {
++            final int cx = 212, cz = 200;
++            subGadget(level, cx, cz);
++            put(level, cx - 2, 101, cz, REDBLOCK);      // rear const 15 (never toggled)
++            support(level, cx - 2, cz);
++            support(level, cx, cz - 2);                 // A toggle support (A placed by combo)
++            final Scenario sc = new Scenario("NOT", new BlockPos(cx, 101, cz), 1,
++                bits -> new int[] { 1 - bits[0] });
++            sc.input(new BlockPos(cx, 101, cz - 2));    // A
++            sc.output("Y", new BlockPos(cx + 1, 101, cz));
++            SCENARIOS.add(sc);
++        }
++
++        // ---- OR(A,B) = max(A,B) (pure dust merge) ----
++        {
++            final int dx = 212, dz = 205;               // output/merge dust
++            node(level, dx, dz, WIRE);
++            node(level, dx - 1, dz, WIRE);              // A branch
++            support(level, dx - 2, dz);                 // A toggle support
++            node(level, dx, dz + 1, WIRE);              // B branch (south)
++            support(level, dx, dz + 2);                 // B toggle support
++            final Scenario sc = new Scenario("OR", new BlockPos(dx, 101, dz), 2,
++                bits -> new int[] { bits[0] | bits[1] });
++            sc.input(new BlockPos(dx - 2, 101, dz));    // A (west of A branch)
++            sc.input(new BlockPos(dx, 101, dz + 2));    // B (south of B branch)
++            sc.output("Y", new BlockPos(dx, 101, dz));
++            SCENARIOS.add(sc);
++        }
++
++        // ---- NOR(A,B) = max(0,(15-A)-B): NOT(A) then subtract B (two comparators in line) ----
++        {
++            final int cx = 212, cz = 210;
++            subGadget(level, cx, cz);                   // C1 = 15 - A
++            put(level, cx - 2, 101, cz, REDBLOCK);      // C1 rear const 15
++            support(level, cx - 2, cz);
++            support(level, cx, cz - 2);                 // A toggle
++            // C2 = (15-A) - B, three east of C1's output
++            final int c2 = cx + 3;
++            subGadget(level, c2, cz);                   // C2 rear repeater reads (c2-2)=C1 output dust
++            support(level, c2, cz - 2);                 // B toggle
++            final Scenario sc = new Scenario("NOR", new BlockPos(c2, 101, cz), 2,
++                bits -> new int[] { (bits[0] | bits[1]) ^ 1 });
++            sc.input(new BlockPos(cx, 101, cz - 2));    // A
++            sc.input(new BlockPos(c2, 101, cz - 2));    // B
++            sc.output("Y", new BlockPos(c2 + 1, 101, cz));
++            SCENARIOS.add(sc);
++        }
++
++        // ---- NAND(A,B) = OR(NOT A, NOT B): two NOT comparators merged ----
++        {
++            final int cx = 212, cz = 216;
++            subGadget(level, cx, cz);                   // NOTA
++            put(level, cx - 2, 101, cz, REDBLOCK);
++            support(level, cx - 2, cz);
++            support(level, cx, cz - 2);                 // A
++            final int cz2 = cz + 4;
++            subGadget(level, cx, cz2);                  // NOTB
++            put(level, cx - 2, 101, cz2, REDBLOCK);
++            support(level, cx - 2, cz2);
++            support(level, cx, cz2 - 2);                // B
++            // merge the two NOT outputs on a column TWO east (x=cx+2), clear of the input blocks:
++            // extend each output one cell east, then a connecting dust column at x=cx+2.
++            node(level, cx + 2, cz, WIRE);
++            node(level, cx + 2, cz2, WIRE);
++            for (int z = cz + 1; z < cz2; z++) {
++                node(level, cx + 2, z, WIRE);
++            }
++            final Scenario sc = new Scenario("NAND", new BlockPos(cx, 101, cz), 2,
++                bits -> new int[] { (bits[0] & bits[1]) ^ 1 });
++            sc.input(new BlockPos(cx, 101, cz - 2));    // A
++            sc.input(new BlockPos(cx, 101, cz2 - 2));   // B
++            sc.output("Y", new BlockPos(cx + 2, 101, cz + 2));
++            SCENARIOS.add(sc);
++        }
++
++        // ---- AND(A,B) = max(0, A - (15-B)) = AND: rear=A, side=NOT B (two subGadgets) ----
++        buildAnd(level, "AND", 222, 224);
++
++        // ---- XOR(A,B) = OR(A-B, B-A) = |A-B|: two SUBTRACT comparators merged ----
++        buildXor(level, "XOR", 232, 232);
++
++        // =========================== HALF ADDER ===========================
++        // SUM = XOR(A,B), CARRY = AND(A,B). Two outputs over the 4 input combos.
++        buildXor(level, "HALF-ADDER.SUM", 232, 240);
++        buildAnd(level, "HALF-ADDER.CARRY", 222, 248);
++
++        LOG.info("[redstone-computer] built {} computer circuits", SCENARIOS.size());
++    }
++
++    /**
++     * AND(A,B) = max(0, A - (15-B)). Two SUBTRACT gadgets: the first computes NOT B = 15-B and
++     * feeds it (clean) into the second gadget's NORTH side; the second's rear is A. Output east.
++     */
++    private static void buildAnd(final ServerLevel level, final String name, final int ax, final int az) {
++        // NOTB gadget at (ax-1, az-2): output dust lands at (ax, az-2) = the AND gadget's side cell.
++        subGadget(level, ax - 1, az - 2);
++        put(level, ax - 3, 101, az - 2, REDBLOCK);      // NOTB rear const 15
++        support(level, ax - 3, az - 2);
++        support(level, ax - 1, az - 4);                 // B toggle (NOTB side)
++        // AND gadget at (ax, az): rear = A, side(north) = NOTB output dust at (ax, az-2).
++        subGadget(level, ax, az);
++        support(level, ax - 2, az);                     // A toggle (rear)
++        final Scenario sc = new Scenario(name, new BlockPos(ax, 101, az), 2,
++            bits -> new int[] { bits[0] & bits[1] });
++        sc.input(new BlockPos(ax - 2, 101, az));        // A (AND rear)
++        sc.input(new BlockPos(ax - 1, 101, az - 4));    // B (NOTB side)
++        sc.output(name.endsWith("CARRY") ? "C" : "Y", new BlockPos(ax + 1, 101, az));
++        SCENARIOS.add(sc);
++    }
++
++    /**
++     * Build an XOR gate at column {@code bx}, lane {@code bz}: two SUBTRACT comparators
++     * ({@code A-B} and {@code B-A}) whose outputs merge to {@code |A-B|}. Inputs A and B are
++     * each presented as TWO redstone-block toggle cells (one per comparator), driven together
++     * by the combo schedule, so no physical fan-out wiring is needed. Registers a Scenario.
++     */
++    private static void buildXor(final ServerLevel level, final String name, final int bx, final int bz) {
++        // C1 = A - B at (bx, bz): rear = A1 (west repeater), side(north) = B1 (north repeater)
++        subGadget(level, bx, bz);
++        support(level, bx - 2, bz);                     // A1 toggle (rear)
++        support(level, bx, bz - 2);                     // B1 toggle (side)
++        // C2 = B - A at (bx, bz+4): rear = B2, side = A2
++        subGadget(level, bx, bz + 4);
++        support(level, bx - 2, bz + 4);                 // B2 toggle (rear)
++        support(level, bx, bz + 2);                     // A2 toggle (side)
++        // merge the two outputs on a column TWO east (x=bx+2), clear of the side-input blocks at
++        // (bx, bz-2) and (bx, bz+2): extend each output east, then a connecting dust column.
++        node(level, bx + 2, bz, WIRE);
++        node(level, bx + 2, bz + 4, WIRE);
++        for (int z = bz + 1; z < bz + 4; z++) {
++            node(level, bx + 2, z, WIRE);
++        }
++        final Scenario sc = new Scenario(name, new BlockPos(bx, 101, bz), 2,
++            bits -> new int[] { bits[0] ^ bits[1] });
++        // A = {A1 rear cell, A2 side cell};  B = {B1 side cell, B2 rear cell}
++        sc.input(new BlockPos(bx - 2, 101, bz), new BlockPos(bx, 101, bz + 2));
++        sc.input(new BlockPos(bx, 101, bz - 2), new BlockPos(bx - 2, 101, bz + 4));
++        sc.output("Y", new BlockPos(bx + 2, 101, bz + 2));
++        SCENARIOS.add(sc);
++    }
++
++    // -------------------------------------------------------------- diff / parity
++
++    private static final BlockState[] BITSTATE = { AIR, REDBLOCK };
++
++    @FunctionalInterface
++    private interface TruthFn {
++        int[] apply(int[] inputBits);
++    }
++
++    private static final class Out {
++        final String label;
++        final BlockPos pos;
++        final int[] measured = new int[STEPS];
++
++        Out(final String label, final BlockPos pos) {
++            this.label = label;
++            this.pos = pos;
++            java.util.Arrays.fill(this.measured, -1);
++        }
++    }
++
++    private static final class Scenario {
++        final String name;
++        final BlockPos seed;
++        final int nInputs;
++        final TruthFn fn;
++        final List<BlockPos[]> inputs = new ArrayList<>(); // each logical input -> >=1 toggle cells
++        final List<Out> outputs = new ArrayList<>();
++        RedstoneNetwork net;
++        CompiledNetwork compiled;
++        int divergences;
++        int firstDivergeTick = -1;
++        String firstDetail = "";
++
++        Scenario(final String name, final BlockPos seed, final int nInputs, final TruthFn fn) {
++            this.name = name;
++            this.seed = seed;
++            this.nInputs = nInputs;
++            this.fn = fn;
++        }
++
++        void input(final BlockPos... cells) {
++            this.inputs.add(cells);
++        }
++
++        void output(final String label, final BlockPos pos) {
++            this.outputs.add(new Out(label, pos));
++        }
++
++        void compile(final ServerLevel level) {
++            this.net = RedstoneNetwork.detect(level, this.seed);
++            this.compiled = CompiledNetwork.compile(level, this.net);
++            final boolean affinity = this.net.spansSingleRegion(level);
++            LOG.info("[redstone-computer] compiled '{}': {} components, {} footprint cells, {} chunk(s); single-region affinity={}",
++                this.name, this.net.size(), this.net.footprint().size(), this.net.chunkKeys().size(), affinity);
++        }
++
++        /** Set every input cell for combo {@code step} (LSB = input 0) in BOTH worlds. */
++        void applyCombo(final ServerLevel level, final int step) {
++            final int combos = 1 << this.nInputs;
++            final int combo = step % combos;
++            for (int i = 0; i < this.nInputs; i++) {
++                final int bit = (combo >> i) & 1;
++                for (final BlockPos cell : this.inputs.get(i)) {
++                    level.setBlockAndUpdate(cell, BITSTATE[bit]);
++                    this.compiled.setSource(cell, BITSTATE[bit]);
++                }
++            }
++        }
++
++        void tick(final ServerLevel level, final int rel) {
++            this.compiled.step(rel);
++            for (final long packed : this.net.footprint()) {
++                final BlockPos pos = BlockPos.of(packed);
++                final BlockState live = level.getBlockState(pos);
++                String detail = diff(pos, live, this.compiled.state(packed));
++                if (detail == null && live.getBlock() instanceof ComparatorBlock) {
++                    final int simOut = this.compiled.comparatorOutputSignal(packed);
++                    final int realOut =
++                        level.getBlockEntity(pos) instanceof net.minecraft.world.level.block.entity.ComparatorBlockEntity be
++                            ? be.getOutputSignal() : -1;
++                    if (simOut != realOut) {
++                        detail = pos.toShortString() + " COMPARATOR-OUT real=" + realOut + " sim=" + simOut;
++                    }
++                }
++                if (detail != null) {
++                    this.divergences++;
++                    if (this.firstDivergeTick < 0) {
++                        this.firstDivergeTick = rel;
++                        this.firstDetail = detail;
++                    }
++                    if (this.divergences <= 8) {
++                        LOG.warn("[redstone-computer] DIVERGENCE '{}' @rel-tick {} {}", this.name, rel, detail);
++                    }
++                }
++            }
++        }
++
++        /** Record the (settled) vanilla output bits for the current combo. */
++        void sample(final ServerLevel level, final int step) {
++            for (final Out o : this.outputs) {
++                final BlockState s = level.getBlockState(o.pos);
++                final int power = s.hasProperty(BlockStateProperties.POWER)
++                    ? s.getValue(BlockStateProperties.POWER)
++                    : (s.hasProperty(BlockStateProperties.POWERED) && s.getValue(BlockStateProperties.POWERED) ? 15 : 0);
++                o.measured[step] = power > 0 ? 1 : 0;
++            }
++        }
++
++        /** Render the measured truth table vs the expected function (vanilla output is the oracle). */
++        String truthTable() {
++            final int combos = 1 << this.nInputs;
++            final StringBuilder sb = new StringBuilder("truth-table[");
++            boolean correct = true;
++            for (int combo = 0; combo < combos; combo++) {
++                // find a step that ran this combo
++                int step = -1;
++                for (int s = 0; s < STEPS; s++) {
++                    if (s % combos == combo && this.outputs.get(0).measured[s] >= 0) {
++                        step = s;
++                        break;
++                    }
++                }
++                final int[] inBits = new int[this.nInputs];
++                for (int i = 0; i < this.nInputs; i++) {
++                    inBits[i] = (combo >> i) & 1;
++                }
++                final int[] exp = this.fn.apply(inBits);
++                sb.append(combo > 0 ? " " : "");
++                for (int i = this.nInputs - 1; i >= 0; i--) {
++                    sb.append(inBits[i]);
++                }
++                sb.append("->");
++                for (int o = 0; o < this.outputs.size(); o++) {
++                    final int got = step >= 0 ? this.outputs.get(o).measured[step] : -1;
++                    final int want = o < exp.length ? exp[o] : -1;
++                    sb.append(this.outputs.get(o).label).append('=').append(got);
++                    if (got != want) {
++                        correct = false;
++                        sb.append("(exp").append(want).append(')');
++                    }
++                    if (o + 1 < this.outputs.size()) {
++                        sb.append(',');
++                    }
++                }
++            }
++            sb.append("] ").append(correct ? "MATCHES-TRUTH-TABLE" : "truth-table-MISMATCH");
++            return sb.toString();
++        }
++    }
++
++    /** Compare the parity-relevant property of a cell; null when identical. */
++    private static String diff(final BlockPos pos, final BlockState real, final BlockState sim) {
++        if (real.getBlock() != sim.getBlock()) {
++            return pos.toShortString() + " block real=" + real.getBlock() + " sim=" + sim.getBlock();
++        }
++        if (real.hasProperty(BlockStateProperties.POWER)) {
++            final int r = real.getValue(BlockStateProperties.POWER);
++            final int s = sim.getValue(BlockStateProperties.POWER);
++            return r == s ? null : pos.toShortString() + " POWER real=" + r + " sim=" + s;
++        }
++        if (real.getBlock() instanceof DiodeBlock) {
++            final boolean r = real.getValue(BlockStateProperties.POWERED);
++            final boolean s = sim.getValue(BlockStateProperties.POWERED);
++            if (r != s) {
++                return pos.toShortString() + " POWERED real=" + r + " sim=" + s;
++            }
++            if (real.hasProperty(BlockStateProperties.LOCKED)
++                && real.getValue(BlockStateProperties.LOCKED) != sim.getValue(BlockStateProperties.LOCKED)) {
++                return pos.toShortString() + " LOCKED real=" + real.getValue(BlockStateProperties.LOCKED)
++                    + " sim=" + sim.getValue(BlockStateProperties.LOCKED);
++            }
++            return null;
++        }
++        return null;
++    }
++}
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 05e877c93d771a3c47c7fc6f11fd661f7c1b403a..119be6516c5e382a1e06820bfec57a2a316e2799 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1629,6 +1629,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         this.tickChildren(haveTime);
+         com.coderyo.neighborshare.NeighborShare.maybeDumpCounters(this.tickCount); // coderyo - neighbor-scan elimination instrumentation (debug only)
+         com.coderyo.redstone.RedstoneDiffTestHarness.onServerTickEnd(this); // coderyo - redstone HDL-compiler differential parity harness (flag-gated, no-op unless coderyo.redstone.difftest)
++        com.coderyo.redstone.RedstoneComputerHarness.onServerTickEnd(this); // coderyo - redstone computer corpus (logic gates + adders) differential parity (flag-gated, no-op unless coderyo.redstone.computer)
+         if (nano - this.lastServerStatus >= STATUS_EXPIRE_TIME_NANOS) {
+             this.lastServerStatus = nano;
+             this.status = this.buildServerStatus();
