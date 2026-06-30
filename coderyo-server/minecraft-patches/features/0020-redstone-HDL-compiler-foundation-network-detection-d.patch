@@ -2129,6 +2129,86 @@ index 0000000000000000000000000000000000000000..339f3ccddf616a4ffd5a9d7af67ee74f
 +    /** Tracks the tick we are currently stepping, for repeater off-edge reschedules. */
 +    private long currentTick;
 +}
+diff --git a/com/coderyo/redstone/RedstoneCommand.java b/com/coderyo/redstone/RedstoneCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..392364776098f3331df652388a8592c411d90621
+--- /dev/null
++++ b/com/coderyo/redstone/RedstoneCommand.java
+@@ -0,0 +1,74 @@
++/*
++ * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
++ */
++package com.coderyo.redstone;
++
++import com.mojang.brigadier.CommandDispatcher;
++import com.mojang.brigadier.arguments.IntegerArgumentType;
++import com.mojang.brigadier.context.CommandContext;
++import com.mojang.brigadier.exceptions.CommandSyntaxException;
++import net.minecraft.commands.CommandSourceStack;
++import net.minecraft.commands.Commands;
++import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++
++/**
++ * Runtime Brigadier command surface for the redstone HDL-compiler's differential validation —
++ * the capability that lets an ARBITRARY in-world redstone network (one a user built in a test
++ * world, NOT a hardcoded {@code Scenario}) be differential-checked against the compiled oracle.
++ *
++ * <ul>
++ *   <li>{@code /coderyo redstone difftest <pos> [ticks]} — detect the network seeded at {@code pos},
++ *       compile a model from a snapshot of the CURRENT live state, then for {@code ticks} game ticks
++ *       re-read the network's external inputs from the live world, step the compiled model in
++ *       lockstep, and assert compiled == vanilla at every cell. Reports {@code BIT-IDENTICAL} or the
++ *       exact first divergence (pos / tick / field).</li>
++ *   <li>{@code /coderyo redstone validate-region <from> <to> [ticks]} — the same, for EVERY network
++ *       whose seed lies in the box (for a big multi-circuit test build). READ-ONLY.</li>
++ * </ul>
++ *
++ * <p>Registration is gated behind the master compiler flag ({@link RedstoneCompileConfig#isEnabled()}
++ * — see {@code Commands}): with the flag OFF the command is never registered (dormant / absent) and
++ * the server is vanilla-equivalent. Op-gated via {@link Commands#LEVEL_GAMEMASTERS}.
++ */
++public final class RedstoneCommand {
++
++    private RedstoneCommand() {
++    }
++
++    public static void register(final CommandDispatcher<CommandSourceStack> dispatcher) {
++        dispatcher.register(
++            Commands.literal("coderyo")
++                .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))
++                .then(Commands.literal("redstone")
++                    .then(Commands.literal("difftest")
++                        .then(Commands.argument("pos", BlockPosArgument.blockPos())
++                            .executes(ctx -> difftest(ctx, RedstoneDiffTestHarness.DEFAULT_LIVE_TICKS))
++                            .then(Commands.argument("ticks", IntegerArgumentType.integer(1, 100000))
++                                .executes(ctx -> difftest(ctx, IntegerArgumentType.getInteger(ctx, "ticks"))))))
++                    .then(Commands.literal("validate-region")
++                        .then(Commands.argument("from", BlockPosArgument.blockPos())
++                            .then(Commands.argument("to", BlockPosArgument.blockPos())
++                                .executes(ctx -> validateRegion(ctx, RedstoneDiffTestHarness.DEFAULT_LIVE_TICKS))
++                                .then(Commands.argument("ticks", IntegerArgumentType.integer(1, 100000))
++                                    .executes(ctx -> validateRegion(ctx, IntegerArgumentType.getInteger(ctx, "ticks")))))))));
++    }
++
++    private static int difftest(final CommandContext<CommandSourceStack> ctx, final int ticks)
++            throws CommandSyntaxException {
++        final CommandSourceStack source = ctx.getSource();
++        final ServerLevel level = source.getLevel();
++        final BlockPos pos = BlockPosArgument.getLoadedBlockPos(ctx, "pos");
++        return RedstoneDiffTestHarness.startLiveDiffTest(source, level, pos, ticks) ? 1 : 0;
++    }
++
++    private static int validateRegion(final CommandContext<CommandSourceStack> ctx, final int ticks)
++            throws CommandSyntaxException {
++        final CommandSourceStack source = ctx.getSource();
++        final ServerLevel level = source.getLevel();
++        final BlockPos from = BlockPosArgument.getLoadedBlockPos(ctx, "from");
++        final BlockPos to = BlockPosArgument.getLoadedBlockPos(ctx, "to");
++        return RedstoneDiffTestHarness.startRegionValidation(source, level, from, to, ticks);
++    }
++}
 diff --git a/com/coderyo/redstone/RedstoneCompileConfig.java b/com/coderyo/redstone/RedstoneCompileConfig.java
 new file mode 100644
 index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783166387bc
@@ -2222,20 +2302,25 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..56df0942f34c2c4f2a0e83c506314e03172585ca
+index 0000000000000000000000000000000000000000..68c7a06b98ef2dfeeb863f0808225ef86c31de84
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,1553 @@
+@@ -0,0 +1,1809 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
 +package com.coderyo.redstone;
 +
 +import com.mojang.logging.LogUtils;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.longs.LongSet;
 +import java.util.ArrayList;
++import java.util.Iterator;
 +import java.util.List;
++import net.minecraft.commands.CommandSourceStack;
 +import net.minecraft.core.BlockPos;
 +import net.minecraft.core.Direction;
++import net.minecraft.network.chat.Component;
 +import net.minecraft.server.MinecraftServer;
 +import net.minecraft.server.level.ServerLevel;
 +import net.minecraft.world.Container;
@@ -2261,6 +2346,7 @@ index 0000000000000000000000000000000000000000..56df0942f34c2c4f2a0e83c506314e03
 +import net.minecraft.world.level.block.DiodeBlock;
 +import net.minecraft.world.level.block.DispenserBlock;
 +import net.minecraft.world.level.block.HopperBlock;
++import net.minecraft.world.level.block.LeverBlock;
 +import net.minecraft.world.level.block.ButtonBlock;
 +import net.minecraft.world.level.block.JukeboxBlock;
 +import net.minecraft.world.level.block.LecternBlock;
@@ -2315,10 +2401,23 @@ index 0000000000000000000000000000000000000000..56df0942f34c2c4f2a0e83c506314e03
 +    private static long runStart;
 +    private static final List<Scenario> SCENARIOS = new ArrayList<>();
 +
++    /** Active runtime live-network differential jobs (the /coderyo redstone difftest command). */
++    private static final List<LiveJob> LIVE_JOBS = new ArrayList<>();
++    /** Saved mob-spawn gamerules, restored once the LAST live job finishes. -1 = nothing saved. */
++    private static int savedSpawnMobs = -1;
++    private static int savedSpawnMonsters = -1;
++    /** Default ticks a runtime difftest runs when the command omits an explicit count. */
++    public static final int DEFAULT_LIVE_TICKS = 200;
++
 +    private RedstoneDiffTestHarness() {
 +    }
 +
 +    public static void onServerTickEnd(final MinecraftServer server) {
++        // Runtime live-network differential jobs (the /coderyo redstone difftest command) run
++        // whenever the master compiler flag is on — independent of the corpus self-test flag.
++        if (RedstoneCompileConfig.isEnabled()) {
++            driveLiveJobs(server);
++        }
 +        if (!RedstoneCompileConfig.isDiffTest()) {
 +            return;
 +        }
@@ -2374,6 +2473,224 @@ index 0000000000000000000000000000000000000000..56df0942f34c2c4f2a0e83c506314e03
 +                }
 +            }
 +            default -> {
++            }
++        }
++    }
++
++    // ================================================================= runtime live difftest
++    // The /coderyo redstone difftest command exposes the EXACT same differential machinery the
++    // corpus uses (detect -> compile a snapshot -> per-tick lockstep compare via cellDivergence)
++    // to an ARBITRARY in-world network a user built — no hardcoded Scenario required. This is the
++    // groundwork for building the redstone computer as a MAP (not a patch) and validating it.
++
++    /**
++     * Begin a runtime differential validation of the live in-world network seeded at {@code seed}.
++     * Detects the network ({@link RedstoneNetwork#detect}), compiles a model from a snapshot of the
++     * CURRENT live state ({@link CompiledNetwork#compile}), then registers a {@link LiveJob} that the
++     * server-tick driver advances for {@code ticks} game ticks — each tick re-reading the network's
++     * external INPUT nodes from the live world and asserting compiled == vanilla at every cell.
++     * READ-ONLY: the compiler never drives/replaces vanilla here; it only observes and compares.
++     *
++     * @return true if a job was registered, false if no redstone network exists at {@code seed}.
++     */
++    public static boolean startLiveDiffTest(final CommandSourceStack source, final ServerLevel level,
++                                            final BlockPos seed, final int ticks) {
++        final RedstoneNetwork net = RedstoneNetwork.detect(level, seed);
++        if (net.size() == 0) {
++            source.sendFailure(Component.literal(
++                "[coderyo redstone] no redstone network detected at " + seed.toShortString()));
++            return false;
++        }
++        disableMobSpawning(level);
++        final CompiledNetwork compiled = CompiledNetwork.compile(level, net);
++        final LiveJob job = new LiveJob(source, level, net, compiled, ticks, seed.immutable());
++        LIVE_JOBS.add(job);
++        final boolean affinity = net.spansSingleRegion(level);
++        final String msg = "[coderyo redstone] difftest @" + seed.toShortString() + ": detected "
++            + net.size() + " components / " + net.footprint().size() + " cells across "
++            + net.chunkKeys().size() + " chunk(s) (single-region=" + affinity
++            + "); validating " + ticks + " ticks...";
++        source.sendSuccess(() -> Component.literal(msg), false);
++        LOG.info("[redstone-difftest/live] {}", msg);
++        return true;
++    }
++
++    /**
++     * Validate EVERY redstone network whose seed lies in the inclusive box [{@code from}..{@code to}]
++     * (for a big multi-circuit test build). Each distinct network — deduplicated by footprint so a
++     * network is validated once no matter how many of its cells fall in the box — gets its own
++     * {@link LiveJob} run for {@code ticks} ticks. READ-ONLY. Returns the number of networks queued.
++     */
++    public static int startRegionValidation(final CommandSourceStack source, final ServerLevel level,
++                                            final BlockPos from, final BlockPos to, final int ticks) {
++        final int minX = Math.min(from.getX(), to.getX());
++        final int minY = Math.min(from.getY(), to.getY());
++        final int minZ = Math.min(from.getZ(), to.getZ());
++        final int maxX = Math.max(from.getX(), to.getX());
++        final int maxY = Math.max(from.getY(), to.getY());
++        final int maxZ = Math.max(from.getZ(), to.getZ());
++        final LongSet seen = new LongOpenHashSet();
++        final BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
++        int queued = 0;
++        boolean spawnOff = false;
++        for (int x = minX; x <= maxX; x++) {
++            for (int y = minY; y <= maxY; y++) {
++                for (int z = minZ; z <= maxZ; z++) {
++                    m.set(x, y, z);
++                    if (seen.contains(m.asLong())) {
++                        continue;
++                    }
++                    if (!RedstoneNetwork.isComponent(level.getBlockState(m))) {
++                        continue;
++                    }
++                    final RedstoneNetwork net = RedstoneNetwork.detect(level, m);
++                    if (net.size() == 0) {
++                        continue;
++                    }
++                    seen.addAll(net.footprint());
++                    if (!spawnOff) {
++                        disableMobSpawning(level);
++                        spawnOff = true;
++                    }
++                    final CompiledNetwork compiled = CompiledNetwork.compile(level, net);
++                    LIVE_JOBS.add(new LiveJob(source, level, net, compiled, ticks, m.immutable()));
++                    queued++;
++                }
++            }
++        }
++        final int q = queued;
++        source.sendSuccess(() -> Component.literal("[coderyo redstone] validate-region: queued "
++            + q + " network(s); validating " + ticks + " ticks each..."), false);
++        LOG.info("[redstone-difftest/live] validate-region [{}..{}] queued {} networks",
++            from.toShortString(), to.toShortString(), queued);
++        return queued;
++    }
++
++    /** Disable natural mob spawning (saving prior values) so live detection stays deterministic. */
++    private static void disableMobSpawning(final ServerLevel level) {
++        if (savedSpawnMobs < 0) {
++            savedSpawnMobs = level.getGameRules().get(net.minecraft.world.level.gamerules.GameRules.SPAWN_MOBS) ? 1 : 0;
++            savedSpawnMonsters = level.getGameRules().get(net.minecraft.world.level.gamerules.GameRules.SPAWN_MONSTERS) ? 1 : 0;
++            level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MOBS, false, level);
++            level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MONSTERS, false, level);
++        }
++    }
++
++    /** Restore the mob-spawn gamerules to their pre-difftest values once the last job ends. */
++    private static void restoreMobSpawning(final ServerLevel level) {
++        if (savedSpawnMobs >= 0) {
++            level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MOBS, savedSpawnMobs == 1, level);
++            level.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_MONSTERS, savedSpawnMonsters == 1, level);
++            savedSpawnMobs = -1;
++            savedSpawnMonsters = -1;
++        }
++    }
++
++    /** Advance every active live job by one game tick, reporting + retiring finished ones. */
++    private static void driveLiveJobs(final MinecraftServer server) {
++        if (LIVE_JOBS.isEmpty()) {
++            return;
++        }
++        ServerLevel reportLevel = null;
++        final Iterator<LiveJob> it = LIVE_JOBS.iterator();
++        while (it.hasNext()) {
++            final LiveJob job = it.next();
++            reportLevel = job.level;
++            job.tickOnce();
++            if (job.done()) {
++                job.report();
++                it.remove();
++            }
++        }
++        if (LIVE_JOBS.isEmpty() && reportLevel != null) {
++            restoreMobSpawning(reportLevel);
++        }
++    }
++
++    /**
++     * One in-flight runtime differential validation of a live network. Each server tick: re-read the
++     * network's external INPUT nodes from the live world (levers / buttons / redstone-blocks — the
++     * detection inputs of plates/tripwire/daylight are pulled inside {@link CompiledNetwork#step}),
++     * advance the compiled model one tick, then assert it is bit-identical to the live world at every
++     * footprint cell ({@link #cellDivergence}). The first divergence (pos / tick / field) is captured.
++     */
++    private static final class LiveJob {
++        private final CommandSourceStack source;
++        final ServerLevel level;
++        private final RedstoneNetwork net;
++        private final CompiledNetwork compiled;
++        private final int totalTicks;
++        private final BlockPos seed;
++        /** External input cells re-read from the live world each tick (lever/button/redstone-block). */
++        private final LongSet inputCells = new LongOpenHashSet();
++        private int rel;
++        private int divergences;
++        private int firstDivergeTick = -1;
++        private String firstDetail = "";
++
++        LiveJob(final CommandSourceStack source, final ServerLevel level, final RedstoneNetwork net,
++                final CompiledNetwork compiled, final int totalTicks, final BlockPos seed) {
++            this.source = source;
++            this.level = level;
++            this.net = net;
++            this.compiled = compiled;
++            this.totalTicks = totalTicks;
++            this.seed = seed;
++            for (final long packed : net.footprint()) {
++                final BlockState s = level.getBlockState(BlockPos.of(packed));
++                if (s.getBlock() instanceof LeverBlock
++                    || s.getBlock() instanceof ButtonBlock
++                    || s.is(Blocks.REDSTONE_BLOCK)) {
++                    this.inputCells.add(packed);
++                }
++            }
++        }
++
++        void tickOnce() {
++            // INPUT BOUNDARY: re-read the live state of every external source node and push it into
++            // the compiled grid BEFORE stepping — exactly the detection-input boundary the corpus
++            // uses, generalised to player-toggled levers / pressed buttons / placed redstone blocks.
++            // Vanilla owns these inputs; the compiler verifies their PROPAGATION through the circuit.
++            final BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
++            for (final long packed : this.inputCells) {
++                m.set(packed);
++                this.compiled.setSource(m.immutable(), this.level.getBlockState(m));
++            }
++            this.compiled.step(this.rel);
++            for (final long packed : this.net.footprint()) {
++                final String detail = cellDivergence(this.level, this.compiled, packed);
++                if (detail != null) {
++                    this.divergences++;
++                    if (this.firstDivergeTick < 0) {
++                        this.firstDivergeTick = this.rel;
++                        this.firstDetail = detail;
++                    }
++                    if (this.divergences <= 8) {
++                        LOG.warn("[redstone-difftest/live] DIVERGENCE @{} rel-tick {} {}",
++                            this.seed.toShortString(), this.rel, detail);
++                    }
++                }
++            }
++            this.rel++;
++        }
++
++        boolean done() {
++            return this.rel >= this.totalTicks;
++        }
++
++        void report() {
++            final int cells = this.net.footprint().size();
++            if (this.divergences == 0) {
++                final String msg = "[coderyo redstone] difftest @" + this.seed.toShortString()
++                    + ": BIT-IDENTICAL (" + this.totalTicks + " ticks, " + cells + " cells)";
++                this.source.sendSuccess(() -> Component.literal(msg), false);
++                LOG.info("[redstone-difftest/live] PASS {}", msg);
++            } else {
++                final String msg = "[coderyo redstone] difftest @" + this.seed.toShortString()
++                    + ": DIVERGENCE — " + this.divergences + " mismatch(es); first @tick "
++                    + this.firstDivergeTick + ": " + this.firstDetail;
++                this.source.sendFailure(Component.literal(msg));
++                LOG.warn("[redstone-difftest/live] FAIL {}", msg);
 +            }
 +        }
 +    }
@@ -3578,78 +3895,7 @@ index 0000000000000000000000000000000000000000..56df0942f34c2c4f2a0e83c506314e03
 +                    // Record the daylight sensor's emitted analog level (proves a non-trivial signal).
 +                    this.peakDetection = Math.max(this.peakDetection, liveState.getValue(BlockStateProperties.POWER));
 +                }
-+                String detail = diff(pos, liveState, this.compiled.state(packed));
-+                // Comparator analog output lives in the block entity, not the block state:
-+                // assert the compiled simulator's stored analog value matches vanilla's.
-+                if (detail == null && level.getBlockState(pos).getBlock() instanceof ComparatorBlock) {
-+                    final int simOut = this.compiled.comparatorOutputSignal(packed);
-+                    final int realOut = level.getBlockEntity(pos) instanceof ComparatorBlockEntity be
-+                        ? be.getOutputSignal() : -1;
-+                    if (simOut != realOut) {
-+                        detail = pos.toShortString() + " COMPARATOR-OUT real=" + realOut + " sim=" + simOut;
-+                    }
-+                }
-+                // CONTAINER inventory parity: a compiled container's total item count AND its
-+                // vanilla comparator fullness must match the live container every tick (so hopper
-+                // transfers, dropper/dispenser firing and dynamic comparator fullness are all
-+                // differential-proven, not just the block state).
-+                if (detail == null && this.compiled.containerItemCount(packed) >= 0
-+                    && level.getBlockEntity(pos) instanceof Container live) {
-+                    int realCount = 0;
-+                    for (int i = 0; i < live.getContainerSize(); i++) {
-+                        realCount += live.getItem(i).getCount();
-+                    }
-+                    final int simCount = this.compiled.containerItemCount(packed);
-+                    if (realCount != simCount) {
-+                        detail = pos.toShortString() + " ITEM-COUNT real=" + realCount + " sim=" + simCount;
-+                    } else {
-+                        final int realSig = AbstractContainerMenu.getRedstoneSignalFromContainer(live);
-+                        final int simSig = this.compiled.containerRedstoneSignal(packed);
-+                        if (realSig != simSig) {
-+                            detail = pos.toShortString() + " CONTAINER-SIGNAL real=" + realSig + " sim=" + simSig;
-+                        }
-+                    }
-+                }
-+                // CRAFTER inventory parity: the compiled crafter's 3x3 grid total item count AND its
-+                // analog (filled-or-disabled slot count, getRedstoneSignal) must match the live
-+                // crafter every tick — so the on-pulse slot decrement, the disabled-slot count and the
-+                // craft-fail no-consume are all differential-proven, not just the block state.
-+                if (detail == null && level.getBlockEntity(pos) instanceof CrafterBlockEntity liveCrafter) {
-+                    int realCount = 0;
-+                    for (int i = 0; i < liveCrafter.getContainerSize(); i++) {
-+                        realCount += liveCrafter.getItem(i).getCount();
-+                    }
-+                    final int simCount = this.compiled.crafterItemCount(packed);
-+                    if (realCount != simCount) {
-+                        detail = pos.toShortString() + " CRAFTER-ITEM-COUNT real=" + realCount + " sim=" + simCount;
-+                    } else {
-+                        final int realSig = liveCrafter.getRedstoneSignal();
-+                        final int simSig = this.compiled.crafterRedstoneSignal(packed);
-+                        if (realSig != simSig) {
-+                            detail = pos.toShortString() + " CRAFTER-SIGNAL real=" + realSig + " sim=" + simSig;
-+                        }
-+                    }
-+                }
-+                // A MOVING_PISTON cell's animation lives in its PistonMovingBlockEntity: assert the
-+                // compiled mover matches vanilla's progress (0->0.5->1), extending/source flags and
-+                // moved block-state every tick — the transient piston motion, bit-identical.
-+                if (detail == null && level.getBlockState(pos).is(Blocks.MOVING_PISTON)) {
-+                    final PistonMovingBlockEntity be = level.getBlockEntity(pos) instanceof PistonMovingBlockEntity p ? p : null;
-+                    final CompiledNetwork.MovingBlock mb = this.compiled.movingAt(packed);
-+                    if ((be == null) != (mb == null)) {
-+                        detail = pos.toShortString() + " MOVING-BE real=" + (be != null) + " sim=" + (mb != null);
-+                    } else if (be != null) {
-+                        if (be.getProgress(0.0F) != mb.progressO) {
-+                            detail = pos.toShortString() + " MOVING-PROGRESS real=" + be.getProgress(0.0F) + " sim=" + mb.progressO;
-+                        } else if (be.isExtending() != mb.extending) {
-+                            detail = pos.toShortString() + " MOVING-EXTENDING real=" + be.isExtending() + " sim=" + mb.extending;
-+                        } else if (be.isSourcePiston() != mb.isSource) {
-+                            detail = pos.toShortString() + " MOVING-SOURCE real=" + be.isSourcePiston() + " sim=" + mb.isSource;
-+                        } else if (!be.getMovedState().equals(mb.movedState)) {
-+                            detail = pos.toShortString() + " MOVING-STATE real=" + be.getMovedState() + " sim=" + mb.movedState;
-+                        }
-+                    }
-+                }
++                final String detail = cellDivergence(level, this.compiled, packed);
 +                if (detail != null) {
 +                    this.divergences++;
 +                    if (this.firstDivergeTick < 0) {
@@ -3662,6 +3908,96 @@ index 0000000000000000000000000000000000000000..56df0942f34c2c4f2a0e83c506314e03
 +                }
 +            }
 +        }
++    }
++
++    /**
++     * Full per-cell divergence check for ONE footprint cell: the parity-relevant block-state
++     * property ({@link #diff}) PLUS the block-entity-resident state vanilla hides from the block
++     * state — a comparator's analog output, a container's item count / comparator fullness, a
++     * crafter's grid count / analog, and an in-flight moving-piston's progress/flags/moved state.
++     *
++     * <p>Returns a human-readable divergence detail (pos + field + real/sim values) for the FIRST
++     * mismatch found at this cell, or {@code null} when the compiled model is bit-identical to the
++     * live world here. This is the single source of truth for "compiled == vanilla at one cell",
++     * shared by BOTH the hardcoded corpus ({@link Scenario#tick}) and the runtime live-network
++     * differential command ({@link LiveJob}) — the comparison machinery is never re-derived.
++     */
++    static String cellDivergence(final ServerLevel level, final CompiledNetwork compiled, final long packed) {
++        final BlockPos pos = BlockPos.of(packed);
++        final BlockState liveState = level.getBlockState(pos);
++        String detail = diff(pos, liveState, compiled.state(packed));
++        // Comparator analog output lives in the block entity, not the block state:
++        // assert the compiled simulator's stored analog value matches vanilla's.
++        if (detail == null && liveState.getBlock() instanceof ComparatorBlock) {
++            final int simOut = compiled.comparatorOutputSignal(packed);
++            final int realOut = level.getBlockEntity(pos) instanceof ComparatorBlockEntity be
++                ? be.getOutputSignal() : -1;
++            if (simOut != realOut) {
++                detail = pos.toShortString() + " COMPARATOR-OUT real=" + realOut + " sim=" + simOut;
++            }
++        }
++        // CONTAINER inventory parity: a compiled container's total item count AND its
++        // vanilla comparator fullness must match the live container every tick (so hopper
++        // transfers, dropper/dispenser firing and dynamic comparator fullness are all
++        // differential-proven, not just the block state).
++        if (detail == null && compiled.containerItemCount(packed) >= 0
++            && level.getBlockEntity(pos) instanceof Container live) {
++            int realCount = 0;
++            for (int i = 0; i < live.getContainerSize(); i++) {
++                realCount += live.getItem(i).getCount();
++            }
++            final int simCount = compiled.containerItemCount(packed);
++            if (realCount != simCount) {
++                detail = pos.toShortString() + " ITEM-COUNT real=" + realCount + " sim=" + simCount;
++            } else {
++                final int realSig = AbstractContainerMenu.getRedstoneSignalFromContainer(live);
++                final int simSig = compiled.containerRedstoneSignal(packed);
++                if (realSig != simSig) {
++                    detail = pos.toShortString() + " CONTAINER-SIGNAL real=" + realSig + " sim=" + simSig;
++                }
++            }
++        }
++        // CRAFTER inventory parity: the compiled crafter's 3x3 grid total item count AND its
++        // analog (filled-or-disabled slot count, getRedstoneSignal) must match the live
++        // crafter every tick — so the on-pulse slot decrement, the disabled-slot count and the
++        // craft-fail no-consume are all differential-proven, not just the block state.
++        if (detail == null && level.getBlockEntity(pos) instanceof CrafterBlockEntity liveCrafter) {
++            int realCount = 0;
++            for (int i = 0; i < liveCrafter.getContainerSize(); i++) {
++                realCount += liveCrafter.getItem(i).getCount();
++            }
++            final int simCount = compiled.crafterItemCount(packed);
++            if (realCount != simCount) {
++                detail = pos.toShortString() + " CRAFTER-ITEM-COUNT real=" + realCount + " sim=" + simCount;
++            } else {
++                final int realSig = liveCrafter.getRedstoneSignal();
++                final int simSig = compiled.crafterRedstoneSignal(packed);
++                if (realSig != simSig) {
++                    detail = pos.toShortString() + " CRAFTER-SIGNAL real=" + realSig + " sim=" + simSig;
++                }
++            }
++        }
++        // A MOVING_PISTON cell's animation lives in its PistonMovingBlockEntity: assert the
++        // compiled mover matches vanilla's progress (0->0.5->1), extending/source flags and
++        // moved block-state every tick — the transient piston motion, bit-identical.
++        if (detail == null && liveState.is(Blocks.MOVING_PISTON)) {
++            final PistonMovingBlockEntity be = level.getBlockEntity(pos) instanceof PistonMovingBlockEntity p ? p : null;
++            final CompiledNetwork.MovingBlock mb = compiled.movingAt(packed);
++            if ((be == null) != (mb == null)) {
++                detail = pos.toShortString() + " MOVING-BE real=" + (be != null) + " sim=" + (mb != null);
++            } else if (be != null) {
++                if (be.getProgress(0.0F) != mb.progressO) {
++                    detail = pos.toShortString() + " MOVING-PROGRESS real=" + be.getProgress(0.0F) + " sim=" + mb.progressO;
++                } else if (be.isExtending() != mb.extending) {
++                    detail = pos.toShortString() + " MOVING-EXTENDING real=" + be.isExtending() + " sim=" + mb.extending;
++                } else if (be.isSourcePiston() != mb.isSource) {
++                    detail = pos.toShortString() + " MOVING-SOURCE real=" + be.isSourcePiston() + " sim=" + mb.isSource;
++                } else if (!be.getMovedState().equals(mb.movedState)) {
++                    detail = pos.toShortString() + " MOVING-STATE real=" + be.getMovedState() + " sim=" + mb.movedState;
++                }
++            }
++        }
++        return detail;
 +    }
 +
 +    /** Compare the parity-relevant property of a cell; null when identical. */
@@ -4182,6 +4518,25 @@ index 0000000000000000000000000000000000000000..347735946425b4dd7e69f07baca14ada
 +        return -64;
 +    }
 +}
+diff --git a/net/minecraft/commands/Commands.java b/net/minecraft/commands/Commands.java
+index d3ee7323e3e7ff4dd163e4b5bf552df10de77476..ffaa36c66d2614b385e64a448d42f2cc9a7f6914 100644
+--- a/net/minecraft/commands/Commands.java
++++ b/net/minecraft/commands/Commands.java
+@@ -307,6 +307,14 @@ public class Commands {
+             UnpublishCommand.register(this.dispatcher);
+         }
+ 
++        // coderyo start - redstone HDL-compiler runtime differential-validation command. Gated behind
++        // the master compiler flag: with coderyo.redstone.compile.enabled off the command is never
++        // registered (dormant/absent) and the server is vanilla-equivalent. Op-gated inside register().
++        if (com.coderyo.redstone.RedstoneCompileConfig.isEnabled()) {
++            com.coderyo.redstone.RedstoneCommand.register(this.dispatcher);
++        }
++        // coderyo end
++
+         // Paper start - Vanilla command permission fixes
+         for (final CommandNode<CommandSourceStack> node : this.dispatcher.getRoot().getChildren()) {
+             if (node.getRequirement() == com.mojang.brigadier.builder.ArgumentBuilder.<CommandSourceStack>defaultRequirement()) {
 diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
 index 5f34b66f8fef34431e2e0efe7ad7e787206c6046..05e877c93d771a3c47c7fc6f11fd661f7c1b403a 100644
 --- a/net/minecraft/server/MinecraftServer.java
