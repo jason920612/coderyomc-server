@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..339f3ccddf616a4ffd5a9d7af67ee74ffd0b19cf
+index 0000000000000000000000000000000000000000..0cc6180c36f191f43b6481be198be5edc359398d
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,2114 @@
+@@ -0,0 +1,2142 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -166,6 +166,14 @@ index 0000000000000000000000000000000000000000..339f3ccddf616a4ffd5a9d7af67ee74f
 +    private final LongSet comparators = new LongOpenHashSet();
 +    private final LongSet observers = new LongOpenHashSet();
 +    private final LongSet lamps = new LongOpenHashSet();
++    /**
++     * Per-lamp neighbour-signal LATCH, the missing state vanilla's {@link RedstoneLampBlock} never
++     * stores (it keeps only {@code LIT}). Seeded at compile from the live snapshot's settled signal
++     * and updated on each observed edge, so {@link #updateLamp} fires only on a genuine signal
++     * CHANGE — reproducing {@code neighborChanged}'s edge semantics instead of eagerly recomputing
++     * {@code LIT} from a possibly-stale snapshot (a lamp left unlit beside a wire that directs into it).
++     */
++    private final java.util.Map<Long, Boolean> lampLastSignal = new HashMap<>();
 +    private final LongSet buttons = new LongOpenHashSet();
 +    private final LongSet targets = new LongOpenHashSet();
 +    private final LongSet pistons = new LongOpenHashSet();
@@ -384,6 +392,12 @@ index 0000000000000000000000000000000000000000..339f3ccddf616a4ffd5a9d7af67ee74f
 +            c.createCrafter(level, packed);
 +        }
 +        c.recomputeWires();
++        // Seed each lamp's neighbour-signal latch from the SETTLED snapshot, so a lamp whose LIT
++        // is (lazily, vanilla-faithfully) inconsistent with its neighbours is preserved until a
++        // real edge — see lampLastSignal / updateLamp.
++        for (final long packed : c.lamps) {
++            c.lampLastSignal.put(packed, c.vw.hasNeighborSignal(BlockPos.of(packed)));
++        }
 +        return c;
 +    }
 +
@@ -1071,6 +1085,20 @@ index 0000000000000000000000000000000000000000..339f3ccddf616a4ffd5a9d7af67ee74f
 +        final BlockState state = this.state(pos);
 +        final boolean lit = state.getValue(BlockStateProperties.LIT);
 +        final boolean hasSignal = this.vw.hasNeighborSignal(this.m.immutable());
++        // Edge-trigger, mirroring RedstoneLampBlock.neighborChanged: vanilla only RE-EVALUATES a
++        // lamp when a neighbour actually changes, and a lamp stores ONLY its LIT bit — never the
++        // neighbour-signal it last saw. So a lamp whose LIT was left inconsistent with its
++        // neighbours in the snapshot (e.g. a lamp set next to an already-powered wire that directs
++        // into it — vanilla's lazy lamp stays unlit until a real neighbour update) MUST be preserved
++        // as-is, not eagerly "corrected". We therefore gate on a CHANGE in the neighbour signal
++        // since the previous step (seeded at compile from the live snapshot), exactly like a
++        // neighborChanged firing — copper bulbs / note blocks need no such tracking because their
++        // POWERED blockstate already records the last signal. (vanilla parity, not re-derivation.)
++        final Boolean prev = this.lampLastSignal.get(pos);
++        if (prev != null && prev == hasSignal) {
++            return;
++        }
++        this.lampLastSignal.put(pos, hasSignal);
 +        if (lit == hasSignal) {
 +            return;
 +        }
