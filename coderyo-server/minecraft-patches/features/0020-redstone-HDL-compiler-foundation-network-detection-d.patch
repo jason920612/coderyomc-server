@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be24b48bc2c
+index 0000000000000000000000000000000000000000..326d2f244eddd1268bde243812de50bb40346baa
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,2306 @@
+@@ -0,0 +1,2387 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -168,6 +168,22 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +    private final RedStoneWireBlock wireBlock = (RedStoneWireBlock) Blocks.REDSTONE_WIRE;
 +
 +    private final LongSet wires = new LongOpenHashSet();
++    /**
++     * True iff the wire power field may be stale and a {@link #recomputeWires()} relaxation is due.
++     * Seeded {@code false} at compile (the snapshot field is vanilla's held field — see #55) and
++     * set by every grid mutation (source/torch toggle, scheduled tick, detection/mover/container
++     * dynamics). A fully quiescent network never re-relaxes, so a HOLDing bistable loop keeps its
++     * seeded field instead of being re-derived to the opposite fixed point.
++     */
++    private boolean wiresDirty = true;
++    /**
++     * Torches whose last-observed attachment input was HIGH (powered). A torch is (re)scheduled
++     * only on a genuine input EDGE relative to this baseline — mirroring vanilla, which schedules a
++     * torch from {@code neighborChanged} (a real neighbour update), never from a standing
++     * {@code lit==hasSignal} condition. Seeded from the snapshot so a torch HOLDS its compiled LIT
++     * (a frozen Q=0 latch torch is not spuriously re-fired into the other state). See #55.
++     */
++    private final LongSet torchInputHigh = new LongOpenHashSet();
 +    private final LongSet torches = new LongOpenHashSet();
 +    private final LongSet repeaters = new LongOpenHashSet();
 +    private final LongSet comparators = new LongOpenHashSet();
@@ -445,7 +461,20 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +        for (final long packed : c.crafters) {
 +            c.createCrafter(level, packed);
 +        }
-+        c.recomputeWires();
++        // HOLD the snapshot wire field (#55): the footprint was copied verbatim from the SETTLED
++        // live world, so every wire's POWER already IS vanilla's held value — including bistable
++        // torch-latch loops whose held field is not the from-scratch relaxation fixed point. A
++        // global relaxation here would re-derive those strongly-connected loops to the OTHER fixed
++        // point and flip a HOLDing Q=0 latch. So we keep the seeded field and only re-relax later
++        // when an actual change marks it dirty (see recomputeWires / wiresDirty).
++        c.wiresDirty = false;
++        // Seed each torch's attachment-input baseline from the snapshot, so a torch toggles only on
++        // a genuine input EDGE (vanilla neighborChanged) and HOLDS its seeded LIT otherwise (#55).
++        for (final long packed : c.torches) {
++            if (c.torchInput(packed)) {
++                c.torchInputHigh.add(packed);
++            }
++        }
 +        // Seed each lamp's neighbour-signal latch from the SETTLED snapshot, so a lamp whose LIT
 +        // is (lazily, vanilla-faithfully) inconsistent with its neighbours is preserved until a
 +        // real edge — see lampLastSignal / updateLamp.
@@ -568,6 +597,11 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +
 +    /** Apply an external source change (lever toggle / redstone-block placement). */
 +    void setSource(final BlockPos pos, final BlockState state) {
++        // Only a genuine change marks the wire field dirty — the harness re-pushes a held lever's
++        // (unchanged) state every tick, which must NOT force the held loop to be re-derived (#55).
++        if (!this.vw.getBlockState(pos).equals(state)) {
++            this.wiresDirty = true;
++        }
 +        this.vw.set(pos, state);
 +    }
 +
@@ -596,6 +630,7 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +     */
 +    void pressButton(final BlockPos pos, final BlockState pressed, final int ticks, final long nowRel) {
 +        this.vw.set(pos, pressed);
++        this.wiresDirty = true;
 +        this.schedule(pos.asLong(), Kind.BUTTON, ticks, P_NORMAL, nowRel);
 +    }
 +
@@ -607,6 +642,7 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +     */
 +    void hitTarget(final BlockPos pos, final BlockState hit, final int duration, final long nowRel) {
 +        this.vw.set(pos, hit);
++        this.wiresDirty = true;
 +        this.schedule(pos.asLong(), Kind.TARGET, duration, P_NORMAL, nowRel);
 +    }
 +
@@ -618,6 +654,7 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +     */
 +    void strikeLightningRod(final BlockPos pos, final BlockState powered, final long nowRel) {
 +        this.vw.set(pos, powered);
++        this.wiresDirty = true;
 +        this.schedule(pos.asLong(), Kind.LIGHTNING_ROD, LIGHTNING_ROD_ACTIVATION_TICKS, P_NORMAL, nowRel);
 +    }
 +
@@ -626,6 +663,17 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +    /** Advance the compiled model by exactly one game tick. */
 +    void step(final long tick) {
 +        this.currentTick = tick;
++        // Wire-field activity gate (#55): a network re-relaxes its wires only when something can
++        // change this tick — a pending scheduled tick, a live-re-read detection input, an in-flight
++        // piston, or any item/analog dynamic (hopper / dispenser / crafter / comparator / observer).
++        // A purely combinational/latch network at rest stays clean and HOLDS its seeded snapshot
++        // field, so a HOLDing bistable torch loop is never re-derived to the other fixed point.
++        if (!this.queue.isEmpty()
++            || !this.detectionInputs.isEmpty() || !this.moving.isEmpty()
++            || !this.hoppers.isEmpty() || !this.dispensers.isEmpty() || !this.crafters.isEmpty()
++            || !this.comparators.isEmpty() || !this.observers.isEmpty()) {
++            this.wiresDirty = true;
++        }
 +        // Entity-detection INPUT boundary: pull each pressure-plate / weighted-plate /
 +        // tripwire-hook / tripwire-string / detector-rail cell's CURRENT block state from the
 +        // live world (vanilla already updated it from its own entity-detection this tick,
@@ -683,6 +731,7 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +    }
 +
 +    private void run(final ScheduledEntry e, final long tick) {
++        this.wiresDirty = true; // a scheduled component commit mutates the grid → re-relax wires
 +        switch (e.kind()) {
 +            case TORCH -> this.runTorch(e.pos(), tick);
 +            case REPEATER -> this.runRepeater(e.pos());
@@ -752,8 +801,24 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +
 +    // ------------------------------------------------------------------- wires
 +
-+    /** Iterative relaxation to the same converged power field vanilla recursion reaches. */
++    /**
++     * Iterative relaxation to the same converged power field vanilla recursion reaches.
++     *
++     * <p><b>Held-loop authority (#55).</b> Vanilla redstone is event-driven: a wire's POWER is
++     * recomputed only when a neighbour actually changes, so a settled circuit's wires keep their
++     * stored value verbatim — including the bistable feedback loops of a torch RS latch, whose
++     * held field is NOT necessarily the from-scratch relaxation fixed point (vanilla's lazy
++     * propagation can leave a loop in a state the eager relaxation would "correct"). A global
++     * relaxation every tick re-derives that strongly-connected component to the OTHER fixed point,
++     * flipping a HOLDing Q=0 latch and diverging (real=0 / sim=15). So we run the relaxation only
++     * when something actually changed since the last pass ({@link #wiresDirty}); a quiescent
++     * network HOLDS its seeded snapshot field exactly as vanilla holds it.
++     */
 +    private void recomputeWires() {
++        if (!this.wiresDirty) {
++            return;
++        }
++        this.wiresDirty = false;
 +        boolean changed = true;
 +        int guard = 0;
 +        while (changed && guard++ < 256) {
@@ -835,8 +900,23 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +
 +    // Transcribed from RedstoneTorchBlock.neighborChanged.
 +    private void scheduleTorchIfNeeded(final long pos, final long tick) {
++        final boolean input = this.torchInput(pos);
++        // Edge-trigger like vanilla: a torch is scheduled from neighborChanged (a REAL attachment
++        // update), never from a standing lit==hasSignal condition. Re-deriving every tick would
++        // fire a HOLDing latch torch whose seeded LIT happens to equal its (possibly snapshot-
++        // frozen) input, flipping a Q=0 latch to the other fixed point (#55). Only act on a change
++        // to the attachment-signal baseline.
++        final boolean wasHigh = this.torchInputHigh.contains(pos);
++        if (input == wasHigh) {
++            return; // no attachment edge → HOLD the seeded state (vanilla raises no neighbour update)
++        }
++        if (input) {
++            this.torchInputHigh.add(pos);
++        } else {
++            this.torchInputHigh.remove(pos);
++        }
 +        final boolean lit = this.state(pos).getValue(BlockStateProperties.LIT);
-+        if (lit == this.torchInput(pos) && !this.willTick(pos, Kind.TORCH)) {
++        if (lit == input && !this.willTick(pos, Kind.TORCH)) {
 +            this.schedule(pos, Kind.TORCH, 2, P_NORMAL, tick);
 +        }
 +    }
@@ -861,6 +941,7 @@ index 0000000000000000000000000000000000000000..5dc2d024ee3da429ba5ca449ef396be2
 +
 +    private void setLit(final long pos, final boolean lit) {
 +        this.vw.set(pos, this.state(pos).setValue(BlockStateProperties.LIT, lit));
++        this.wiresDirty = true; // a torch (un)lit changes the block signal feeding adjacent wires
 +    }
 +
 +    private void pruneToggleLog(final long tick) {
