@@ -1,0 +1,108 @@
+# coderyoMC redstone-computer MAP — 1-BIT INCREMENT ACCUMULATOR (sustained, difftest-clean).
+#
+# THE datapath core: an edge-triggered (master-slave) register whose output ACC feeds a
+# 1-bit "+1" adder whose SUM feeds back to the register's D, so each clock cycle does
+# ACC := ACC + 1. For B=1 the 1-bit adder SUM = ACC XOR 1 = NOT ACC = the slave's Qbar,
+# so the minimal accumulator is a master-slave T-flip-flop:  Slave.Qbar -> Master.D.
+#
+# This build is the FIX for build-11's failure. build-11 proved the master-slave register
+# (edge-triggered, difftest-clean) and got ONE clean increment 0->1 through real feedback,
+# but SUSTAINED counting died on a WIRE-CROSSING: the feedback drop (x=48) crossed the
+# forward interconnect's S-branch at (48,137), merging the two nets on the same y and pinning
+# Master.D=15. This build re-routes both interconnects with DEDICATED, NON-CROSSING channels
+# on a wider board -> the accumulator SUSTAINS clean counting (ACC toggles 0<->1 every cycle,
+# proven 14 cycles, zero sticking) AND is difftest BIT-IDENTICAL in both held states.
+#
+# Server: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (built FRESH from origin/main 6a91142 which
+#   carries patch 0020, via `./gradlew applyAllPatches && ./gradlew createPaperclipJar`), boot
+#   -Dcoderyo.redstone.compile.enabled=true ; port 15568, flat world, forceload add 32 96 80 160,
+#   spawn-monsters/animals/npcs=false (TPS). Build via RCON setblock/fill; difftest via an impulse
+#   command_block (RCON's restricted dispatcher can't reach the op-gated `coderyo` literal),
+#   verdict read from the server log "[redstone-difftest/live] PASS ... BIT-IDENTICAL".
+# Convention (locked, build-01..11): comparator/repeater[facing=D] => REAR/INPUT on side D,
+#   OUTPUT exits the OPPOSITE side; SUBTRACT comp out=max(0, rear-max(sideL,sideR)); a
+#   redstone_block ABOVE a dust drives it to 15.
+#
+# ============================== THE LAYOUT THAT SOLVED THE CROSSING ==============================
+# Latch BODIES are build-11/build-10 VERBATIM (proven): MASTER base x=62, SLAVE base x=46 (DX=-16).
+#   Master.Q out = (60,122)  Master.D ports = D_north (61,118), D_south (62,135)  E = (62,117),(60,133)
+#   Slave.Q=ACC = (44,122)   Slave.Qbar = (48,130)   Slave.D = (45,118),(46,135)   E = (46,117),(44,133)
+#
+# The two interconnects run ANTIPARALLEL between the latches (forward Master.Q->Slave.D goes WEST;
+# feedback Slave.Qbar->Master.D goes EAST). build-11 crammed BOTH into the same z-rows + an x=50
+# forward "wall" -> collision. THE FIX = give each its own band, with the vertical transitions at
+# the x-extremes (outside the other path):
+#
+#  FORWARD (Master.Q -> Slave D_north & D_south):
+#    - Q distribution bus z=122:            fill 50 101 122 59 101 122 wire
+#    - north riser x=50 -> trunk z=114:     50,121 rep[S]; 50,116..120 wire; 50,115 rep[S]
+#    - trunk z=114 (feeds BOTH legs):       fill 41 101 114 50 101 114 wire ; 45,114 rep[E] (re-amp)
+#    - NORTH leg -> D_north(45,118):        fill 43 101 115 43 101 118 wire ; 44,118 rep[W] -> (45,118)
+#    - SOUTH leg -> D_south(46,135), the KEY reroute: approach from the WEST, NOT the x=48 corridor:
+#        fill 41 101 115 41 101 137 wire ; 41,122 rep[N] ; 41,130 rep[N]   (x=41 drop, re-amped)
+#        fill 42 101 137 46 101 137 wire ; 46,136 rep[S] -> (46,135)        (z=137 run ONLY x=42..46)
+#      => forward NEVER touches x=47,48,49 at z=137, so the x=48 corridor is FREE for the feedback.
+#
+#  FEEDBACK (Slave.Qbar -> Master D_north & D_south), on a far-SOUTH band + EAST risers:
+#    - drop x=48 (now clear):               48,131 rep[N]; fill 48 101 132 48 101 145 wire; 48,138 rep[N]
+#    - far-south trunk z=145:               fill 48 101 145 66 101 145 wire ; 54,145 rep[W]; 60,145 rep[W]
+#    - branch A -> D_south(62,135):         fill 62 101 137 62 101 144 wire; 62,140 rep[S]; 62,136 rep[S]
+#    - branch B -> D_north(61,118): EAST riser x=66 (2 cells EAST of the Qbar rail x=64, so no short):
+#        fill 66 101 115 66 101 144 wire ; 66,138/130/122 rep[S]
+#        fill 59 101 115 66 101 115 wire ; 62,115 rep[E]            (z=115 run, north of master)
+#        fill 59 101 116 59 101 118 wire ; 60,118 rep[W] -> (61,118)
+#
+#  => FORWARD lives in the north band (z=114) + a west drop (x=41); FEEDBACK lives in the south band
+#     (z=145) + east risers (x=62, x=66). They never share a y=101 cell and never run adjacent on the
+#     same z. NO y=102 bridge was needed -- pure planar separation by dedicated lanes. (Full RCON
+#     command files: run-acc/b1_platform_latches.txt, b2_forward.txt, b3_feedback.txt -- not committed.)
+#
+# ============================== CLOCK / OPERATION ==============================
+# Manual non-overlapping two-phase clock (place/remove redstone_block at y=102 over the E dusts):
+#   phi1 (Master capture): block at (62,102,117) AND (60,102,133)  ; settle ; remove
+#   phi2 (Slave  output) : block at (46,102,117) AND (44,102,133)  ; settle ; remove ; settle
+# One full cycle (phi1 then phi2) = ONE increment: master captures D=Slave.Qbar on phi1; slave
+# outputs it on phi2 (falling edge) -> ACC toggles -> Qbar updates -> feedback re-presents new D.
+# Master & slave are never simultaneously transparent, so NO level-latch race-through (build-10);
+# settle each phase by GAME ticks (low TPS) before switching -- the feedback has ~10 repeaters.
+#
+# ============================== RESULT — SUSTAINED CLEAN COUNTING (vanilla live reads) ==============================
+# ACC read live at (44,101,122) (dust power: 0 or 15) after each full cycle, from a clean ACC=0 start:
+#   0 -> 1 -> 0 -> 1 -> 0 -> 1 -> 0 -> 1 -> 0     (8 cycles)   + an earlier 6-cycle run 1->0->1->0->1->0->1
+#   => 14 consecutive clean toggles, ZERO sticking. The 1-bit "+1" accumulator SUSTAINS counting
+#      through REAL physical feedback -- the exact thing build-10 (level-latch race) and build-11
+#      (wire-crossing) could not do. The dedicated non-crossing feedback channel is the fix.
+#
+# ============================== RESULT — difftest (compiler == vanilla) ==============================
+#   HOLD ACC=1 : coderyo redstone difftest 44 101 122 200 -> BIT-IDENTICAL (200 ticks, 432 cells, 218 components, single-region)
+#   HOLD ACC=0 : coderyo redstone difftest 44 101 122 200 -> BIT-IDENTICAL (200 ticks, 432 cells)
+#  => the WHOLE accumulator (both torch latches + both comparator enable-gates + the forward AND
+#     feedback interconnects, 432 cells / 218 components) compiles BIT-FOR-BIT to vanilla in BOTH
+#     held states. The difftest-clean, sustained-counting EDGE-TRIGGERED ACCUMULATOR -- the datapath
+#     core a CPU is built from.
+#
+# ============================== BUILD LESSONS ==============================
+#  1. ANTIPARALLEL LOOP ROUTING: in any master-slave accumulator the forward (Q->D) and feedback
+#     (Q->D) signals run antiparallel between the two latches. Cramming them into shared z-rows
+#     (build-11) forces a same-y net merge. FIX: dedicate a north band to forward and a south band
+#     to feedback; do every vertical transition at an x-extreme OUTSIDE the other path. Reaching a
+#     latch's FAR D-port (forward needs Slave's SOUTH port from the north band) is done by an
+#     x-extreme drop (x=41), NOT by crossing the corridor.
+#  2. RAIL-ADJACENCY SHORT: the master Qbar rail is x=64; the feedback north riser must be >=2 cells
+#     east (x=66) -- x=65 is adjacent to x=64 and would merge Slave.Qbar into Master.Qbar. Keep every
+#     interconnect leg >=2 cells from all latch rails/E/D ports; re-amp every <=8 dust (D must reach
+#     each port at a CLEAN 15 or the R=E-D / S=D-nE subtracts mis-fire).
+#  3. POWER-ON METASTABILITY: the cross-coupled torch latch boots with both torches momentarily off
+#     (Q=Qbar=0). One clean clock pulse (phi with a known D) breaks it into a defined digital state;
+#     thereafter every cycle is clean.
+#
+# ============================== NEXT (toward the CPU) ==============================
+#  * 2-bit ACC (literal 0->1->2->3): two of THIS cell on the wider board, clocked synchronously,
+#    with bit1.D = XOR(Q1,Q0) (the proven build-01 |A-B| gadget) for a +1 counter; OR the general
+#    ACC:=ACC+B by swapping the 1-bit Qbar "+1" proxy for the build-08 2-bit ripple adder as the SUM
+#    path with a selectable B (B=1, B=2). Every constituent (this edge-triggered cell, build-08
+#    adder, build-01 XOR) is difftest-clean; only the (now-solved) lane routing scales up.
+#  * Then: a control/clock unit (auto two-phase clock), instruction ROM (torch-ROM addressed by a
+#    PC = a counting register like this one), and decode (opcode -> enable lines) = the minimal CPU.
+#
+# No feature patch was added -- only test-harness/redstone-computer/.
