@@ -1,0 +1,61 @@
+# coderyoMC redstone-computer MAP — 1-bit MEMORY: TORCH RS-NOR latch — WORKS (HOLD clean).
+#
+# This is the fix for build-04 (the comparator-NOR latch that ATTENUATED to an analog
+# fixed point ~9/15 and never held a clean digital bit). A redstone TORCH is a pure
+# digital inverter: its attachment block "powered" -> torch OFF (0); unpowered -> ON (15),
+# at ANY input level >=1, so it is immune to dust attenuation. Two cross-coupled torch
+# NOR gates make a robust RS latch.
+#
+# RESULT (vanilla, live power reads on port 15568):
+#   RESET (R=1,S=0) -> Q=0,Qb=1 ; HOLD (R=0,S=0) -> Q=0,Qb=1 (held)
+#   SET   (R=0,S=1) -> Q=1,Qb=0 ; HOLD (R=0,S=0) -> Q=1,Qb=0 (held)  <<< MEMORY
+#   Output dust at HOLD reads a CLEAN 15 (Q=1) or 0 (Q=0) — the property build-04 failed.
+#
+# MECHANIC NOTES (verified live, decisive for any torch circuit on this fork):
+#   * A redstone_wall_torch[facing=D] attaches to the block on the OPPOSITE side of D and
+#     emits toward D; it turns OFF iff its attachment block is powered.
+#   * A solid gate block is turned "powered" (torch off) by: dust ON TOP of it (needs a
+#     y=101 support + y=102 dust), OR a REPEATER pointing its OUTPUT into it (strong power).
+#     NOT by: an adjacent redstone_block, NOT by dust pointing horizontally into its side,
+#     NOT by a strongly-powered solid block above a dust. (All four tested live.)
+#   * This build drives each gate block with REPEATERS (clean, planar, attenuation-immune).
+#   * Repeater convention (same as build-01..03): facing = REAR/INPUT side; output = opposite.
+#
+# !! DIFFTEST CAVEAT (important compiler finding) !!
+#   The redstone HDL compiler (patch 0020) does NOT yet model redstone-torch inversion:
+#   a standalone torch inverter with input ON gives vanilla out=0 but compiled sim=15
+#   (verified: difftest DIVERGENCE real=0 sim=15; input-OFF case is BIT-IDENTICAL). Hence
+#   any torch/feedback latch DIVERGES under difftest — not a circuit fault (the latch HOLDs
+#   perfectly in vanilla, proven above) but a missing compiler primitive. Adding torch
+#   support (block-powered -> torch off; bistable-loop stored-state seeding) to the compiler
+#   is the prerequisite to difftest-validate sequential memory. The latch correctness here
+#   is proven by VANILLA behaviour (live SET/RESET/HOLD reads), the way build-04 was diagnosed.
+#
+# y=100 stone support (already present), y=101 logic. Two gate blocks 8 apart in z.
+
+fill 55 100 116 80 100 140 minecraft:stone
+fill 55 101 116 80 103 140 minecraft:air
+
+# --- Gate A (top): GA block, torch TA(=Q) on WEST face, driven by R-rep (north) + Qbar-fb-rep (east) ---
+setblock 62 101 122 minecraft:stone
+setblock 61 101 122 minecraft:redstone_wall_torch[facing=west]   # TA = Q  (out dust 60,101,122)
+setblock 62 101 121 minecraft:repeater[facing=north]            # R input: rear=(62,120), out south into GA
+setblock 63 101 122 minecraft:repeater[facing=east]             # Qbar feedback: rear=(64,122), out west into GA
+
+# --- Gate B (bottom): GB block, torch TB(=Qbar) on EAST face, driven by S-rep (south) + Q-fb-rep (west) ---
+setblock 62 101 130 minecraft:stone
+setblock 63 101 130 minecraft:redstone_wall_torch[facing=east]   # TB = Qbar (out dust 64,101,130)
+setblock 62 101 131 minecraft:repeater[facing=south]            # S input: rear=(62,132), out north into GB
+setblock 61 101 130 minecraft:repeater[facing=west]             # Q feedback: rear=(60,130), out east into GB
+
+# --- Feedback rails (no crossover: Q on west x=60, Qbar on east x=64) ---
+setblock 60 101 122 minecraft:redstone_wire                     # Q out
+fill     60 101 123 60 101 130 minecraft:redstone_wire          # Q -> Q-fb-rep rear (60,130)
+setblock 64 101 130 minecraft:redstone_wire                     # Qbar out
+fill     64 101 122 64 101 129 minecraft:redstone_wire          # Qbar -> Qbar-fb-rep rear (64,122)
+
+# Inputs (external sources the difftest re-reads): redstone_block ON / air OFF.
+#   R : (62,101,120)   S : (62,101,132)
+# Read state: Q = torch lit at (61,101,122)  [Q=1] ; Qbar at (63,101,130).
+#   Q output dust = (60,101,122)  (15 when Q=1, 0 when Q=0).
+# Drive: RESET R=1 S=0 ; HOLD R=0 S=0 ; SET R=0 S=1 ; HOLD R=0 S=0 (bit persists clean).
