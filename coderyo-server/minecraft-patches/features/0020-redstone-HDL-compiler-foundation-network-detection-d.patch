@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..0a3e11df0cdba2364046bbfae7b00cff2673eabf
+index 0000000000000000000000000000000000000000..2495e0d2847de9e117f5694b97ac5751e1c800f3
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,1101 @@
+@@ -0,0 +1,1266 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -783,10 +783,13 @@ index 0000000000000000000000000000000000000000..0a3e11df0cdba2364046bbfae7b00cff
 +    // through the grid's SignalGetter — so QC activation and the BUD behaviour that falls out
 +    // of it are identical to vanilla.
 +    //
-+    // DEFERRED (NOT modelled — noted, not attempted): slime/honey multi-block drag &
-+    // branching (PistonStructureResolver.addBranchingBlocks / the sticky back-extension loop),
-+    // 0-tick pistons & the TRIGGER_DROP fast-retract path (b0==2), flying machines / piston
-+    // tape, observer-0-tick-piston combos. Core single/chain push + sticky pull + QC is here.
++    // MODELLED: single/chain push, sticky pull, QC, AND slime/honey multi-block drag &
++    // recursive branching (full PistonStructureResolver — see GridStructureResolver below) plus
++    // the 0-tick / TRIGGER_DROP fast-retract path (an in-flight extend head finalised early on
++    // retract — see retract()).
++    // DEFERRED (NOT modelled — noted, not attempted): self-propelled flying machines / piston
++    // tape, observer-0-tick free-running engines (the harness snapshots block states but not the
++    // in-flight scheduled-tick phase, so a circuit already oscillating at snapshot can't be seeded).
 +
 +    /** The live {@link MovingBlock} for a cell (grid == MOVING_PISTON), or null; for the harness. */
 +    MovingBlock movingAt(final long packed) {
@@ -895,55 +898,104 @@ index 0000000000000000000000000000000000000000..0a3e11df0cdba2364046bbfae7b00cff
 +        // it is only needed for the head's TYPE (no head is created on a retract pull).
 +        final boolean sticky = extending && this.pistonSticky(pistonPos.asLong());
 +        final Direction pushDir = extending ? dir : dir.getOpposite();
-+        // Snapshot the moved states before mutating.
++        // Snapshot the moved states before mutating, and seed the deleteAfterMove map exactly
++        // like vanilla PistonBaseBlock.moveBlocks: every toPush cell starts as "to be aired",
++        // and is removed from the map iff some moved block (or the head) lands on it. This is
++        // the collision-safe placement for a BRANCHING slime/honey structure — a moved block's
++        // destination cell is never re-aired, and only the trailing vacated cells become air,
++        // regardless of the (non-linear) order of toPush.
 +        final List<BlockPos> toPush = res.toPush;
 +        final BlockState[] shapes = new BlockState[toPush.size()];
++        final java.util.Map<Long, BlockState> deleteAfterMove = new HashMap<>();
 +        for (int i = 0; i < toPush.size(); i++) {
 +            shapes[i] = this.vw.getBlockState(toPush.get(i));
++            deleteAfterMove.put(toPush.get(i).asLong(), shapes[i]);
 +        }
 +        // Destroyed blocks (PushReaction.DESTROY, e.g. redstone dust) just vanish.
 +        for (final BlockPos d : res.toDestroy) {
 +            this.vw.set(d, AIR);
 +        }
-+        // Shift the line forward, far end first so we never clobber an un-moved cell. Vanilla
-+        // gives pushed blocks a TYPE=DEFAULT MOVING_PISTON (only the head/body get the real type).
++        // Place every moved block as a MOVING_PISTON at its destination (far end first, matching
++        // vanilla's iteration order). Each destination is removed from deleteAfterMove so a cell
++        // occupied by a moved block is never cleared. Vanilla gives pushed blocks a TYPE=DEFAULT
++        // MOVING_PISTON (only the head/body carry the real piston type).
 +        for (int i = toPush.size() - 1; i >= 0; i--) {
-+            final BlockPos oldPos = toPush.get(i);
-+            final BlockPos newPos = oldPos.relative(pushDir);
++            final BlockPos newPos = toPush.get(i).relative(pushDir);
++            deleteAfterMove.remove(newPos.asLong());
 +            this.setMoving(newPos, shapes[i], dir, extending, false, false);
-+            this.vw.set(oldPos, AIR);
 +        }
 +        if (extending) {
 +            final BlockState head = Blocks.PISTON_HEAD.defaultBlockState()
 +                .setValue(PistonHeadBlock.FACING, dir)
 +                .setValue(PistonHeadBlock.TYPE, sticky ? PistonType.STICKY : PistonType.DEFAULT);
++            deleteAfterMove.remove(armPos.asLong());
 +            this.setMoving(armPos, head, dir, true, true, sticky);
++        }
++        // Air out every vacated cell that no moved block now occupies.
++        for (final long key : deleteAfterMove.keySet()) {
++            this.vw.set(key, AIR);
 +        }
 +        return true;
 +    }
 +
-+    // Transcribed from PistonBaseBlock.triggerEvent contract branch (b0 == TRIGGER_CONTRACT).
++    // Transcribed from PistonBaseBlock.triggerEvent contract branch (b0 == TRIGGER_CONTRACT /
++    // TRIGGER_DROP). The 0-tick / fast-retract path (b0 == TRIGGER_DROP) is the SAME contract
++    // code, distinguished only by an extend head still being in flight when the retract runs;
++    // vanilla finalises that in-flight mover EARLY via PistonMovingBlockEntity.finalTick() (a
++    // SOURCE mover resolves to AIR, dropping the block), which is what {@link #finalTickMover}
++    // does here.
 +    private void retract(final BlockPos pistonPos, final Direction dir, final boolean sticky) {
 +        final BlockPos head = pistonPos.relative(dir);
++        // Fast-retract: an extend head still animating at the arm cell is finalised early (-> AIR).
++        if (this.moving.containsKey(head.asLong())) {
++            this.finalTickMover(head.asLong());
++        }
 +        // Body becomes a MOVING_PISTON source that animates back to a normal (unextended) piston.
 +        final BlockState movedSource = (sticky ? Blocks.STICKY_PISTON : Blocks.PISTON)
 +            .defaultBlockState().setValue(BlockStateProperties.FACING, dir);
 +        this.setMoving(pistonPos, movedSource, dir, false, true, sticky);
 +        if (sticky) {
 +            final BlockPos twoPos = pistonPos.relative(dir, 2);
-+            final BlockState pulled = this.vw.getBlockState(twoPos);
-+            final boolean canPull = !pulled.isAir()
-+                && isPushable(pulled, twoPos, dir.getOpposite(), false, dir)
-+                && !(pulled.getPistonPushReaction() != PushReaction.NORMAL
-+                    && !pulled.is(Blocks.PISTON) && !pulled.is(Blocks.STICKY_PISTON));
-+            if (canPull) {
-+                this.moveBlocks(pistonPos, dir, false); // pulls twoPos -> head cell
-+            } else {
-+                this.vw.set(head, AIR);
++            // A still-extending mover at twoPos (a same-tick extend head) is a "piston piece":
++            // finalise it early and do NOT pull (mirrors the pistonPiece branch).
++            final MovingBlock mbTwo = this.moving.get(twoPos.asLong());
++            boolean pistonPiece = false;
++            if (this.vw.getBlockState(twoPos).is(Blocks.MOVING_PISTON)
++                && mbTwo != null && mbTwo.direction == dir && mbTwo.extending) {
++                this.finalTickMover(twoPos.asLong());
++                pistonPiece = true;
++            }
++            if (!pistonPiece) {
++                final BlockState pulled = this.vw.getBlockState(twoPos);
++                final boolean canPull = !pulled.isAir()
++                    && isPushable(pulled, twoPos, dir.getOpposite(), false, dir)
++                    && !(pulled.getPistonPushReaction() != PushReaction.NORMAL
++                        && !pulled.is(Blocks.PISTON) && !pulled.is(Blocks.STICKY_PISTON));
++                if (canPull) {
++                    this.moveBlocks(pistonPos, dir, false); // pulls twoPos -> head cell
++                } else {
++                    this.vw.set(head, AIR);
++                }
 +            }
 +        } else {
 +            this.vw.set(head, AIR);
 +        }
++    }
++
++    // Transcribed from PistonMovingBlockEntity.finalTick (the EARLY finalise used when a new
++    // piston action interrupts an in-flight mover): a SOURCE piston resolves to AIR, any other
++    // moved block to its moved state. Distinct from finalizeMover (the normal tick() completion,
++    // which always places the moved state — e.g. a head completing into a real PISTON_HEAD).
++    private void finalTickMover(final long key) {
++        final MovingBlock mb = this.moving.remove(key);
++        if (mb == null) {
++            return;
++        }
++        final BlockPos pos = BlockPos.of(key);
++        if (!this.vw.getBlockState(pos).is(Blocks.MOVING_PISTON)) {
++            return;
++        }
++        this.vw.set(pos, mb.isSource ? AIR : mb.movedState);
 +    }
 +
 +    // Transcribed from PistonMovingBlockEntity.tick (server branch): advance progress 0->0.5->1,
@@ -982,72 +1034,190 @@ index 0000000000000000000000000000000000000000..0a3e11df0cdba2364046bbfae7b00cff
 +
 +    // ------------------------------------------------------- piston structure resolver
 +    //
-+    // Transcribed from PistonStructureResolver (non-slime path) + PistonBaseBlock.isPushable,
-+    // evaluated over the grid. Slime/honey branching is DEFERRED (see header).
++    // {@link GridStructureResolver} below is a line-for-line transcription of vanilla
++    // {@code PistonStructureResolver} (INCLUDING the slime/honey sticky back-extension loop,
++    // {@code addBranchingBlocks} recursion, {@code canStickToEachOther} adhesion and
++    // {@code reorderListAtCollision}) evaluated over the in-memory grid via the shared
++    // {@link #isPushable}. So a slime/honey block drags its stuck neighbours in all 6
++    // directions, recursively branching, up to the 12-block limit — bit-identical to vanilla.
 +
 +    private record Resolve(List<BlockPos> toPush, List<BlockPos> toDestroy) {
 +    }
 +
 +    private Resolve resolve(final BlockPos pistonPos, final Direction dir, final boolean extending) {
-+        final Direction pushDir = extending ? dir : dir.getOpposite();
-+        final BlockPos startPos = extending ? pistonPos.relative(dir) : pistonPos.relative(dir, 2);
-+        final List<BlockPos> toPush = new ArrayList<>();
-+        final List<BlockPos> toDestroy = new ArrayList<>();
-+        final BlockState nextState = this.vw.getBlockState(startPos);
-+        if (!isPushable(nextState, startPos, pushDir, false, dir)) {
-+            if (extending && nextState.getPistonPushReaction() == PushReaction.DESTROY) {
-+                toDestroy.add(startPos);
-+                return new Resolve(toPush, toDestroy);
-+            }
++        final GridStructureResolver r = new GridStructureResolver(this.vw, pistonPos, dir, extending);
++        if (!r.resolve()) {
 +            return null;
 +        }
-+        if (!this.addBlockLine(startPos, pushDir, dir, pistonPos, toPush, toDestroy)) {
-+            return null;
-+        }
-+        return new Resolve(toPush, toDestroy);
++        return new Resolve(r.toPush, r.toDestroy);
 +    }
 +
-+    // Transcribed from PistonStructureResolver.addBlockLine (non-slime: blockCount is always 1).
-+    private boolean addBlockLine(final BlockPos start, final Direction pushDir, final Direction pistonDir,
-+                                 final BlockPos pistonPos, final List<BlockPos> toPush, final List<BlockPos> toDestroy) {
-+        BlockState nextState = this.vw.getBlockState(start);
-+        if (nextState.isAir()) {
-+            return true;
-+        }
-+        if (!isPushable(nextState, start, pushDir, false, pistonDir)) {
-+            return true;
-+        }
-+        if (start.equals(pistonPos) || toPush.contains(start)) {
-+            return true;
-+        }
-+        if (1 + toPush.size() > PistonStructureResolverConstants.MAX_PUSH_DEPTH) {
-+            return false;
-+        }
-+        toPush.add(start);
-+        int i = 1;
-+        while (true) {
-+            final BlockPos pos = start.relative(pushDir, i);
-+            if (toPush.indexOf(pos) > -1) {
-+                return true; // collision reordering (slime only) — unreachable for a straight line
++    /**
++     * The full vanilla {@code PistonStructureResolver}, transcribed verbatim onto the compiled
++     * grid (reads {@link VirtualRedstoneWorld} instead of {@code Level}). Carries the slime/honey
++     * multi-block drag: the sticky back-extension {@code while} loop in {@link #addBlockLine},
++     * the per-sticky-block {@link #addBranchingBlocks} recursion across the two perpendicular
++     * axes, {@link #canStickToEachOther} (with the slime↔honey non-stick rule) and the
++     * {@link #reorderListAtCollision} reordering — none re-derived, all transcribed.
++     */
++    private static final class GridStructureResolver {
++        private final VirtualRedstoneWorld level;
++        private final BlockPos pistonPos;
++        private final boolean extending;
++        private final BlockPos startPos;
++        private final Direction pushDirection;
++        private final List<BlockPos> toPush = new ArrayList<>();
++        private final List<BlockPos> toDestroy = new ArrayList<>();
++        private final Direction pistonDirection;
++
++        GridStructureResolver(final VirtualRedstoneWorld level, final BlockPos pistonPos,
++                              final Direction direction, final boolean extending) {
++            this.level = level;
++            this.pistonPos = pistonPos;
++            this.pistonDirection = direction;
++            this.extending = extending;
++            if (extending) {
++                this.pushDirection = direction;
++                this.startPos = pistonPos.relative(direction);
++            } else {
++                this.pushDirection = direction.getOpposite();
++                this.startPos = pistonPos.relative(direction, 2);
 +            }
-+            nextState = this.vw.getBlockState(pos);
++        }
++
++        boolean resolve() {
++            this.toPush.clear();
++            this.toDestroy.clear();
++            final BlockState nextState = this.level.getBlockState(this.startPos);
++            if (!isPushable(nextState, this.startPos, this.pushDirection, false, this.pistonDirection)) {
++                if (this.extending && nextState.getPistonPushReaction() == PushReaction.DESTROY) {
++                    this.toDestroy.add(this.startPos);
++                    return true;
++                }
++                return false;
++            }
++            if (!this.addBlockLine(this.startPos, this.pushDirection)) {
++                return false;
++            }
++            for (int i = 0; i < this.toPush.size(); i++) {
++                final BlockPos pos = this.toPush.get(i);
++                if (isSticky(this.level.getBlockState(pos)) && !this.addBranchingBlocks(pos)) {
++                    return false;
++                }
++            }
++            return true;
++        }
++
++        private static boolean isSticky(final BlockState state) {
++            return state.is(Blocks.SLIME_BLOCK) || state.is(Blocks.HONEY_BLOCK);
++        }
++
++        private static boolean canStickToEachOther(final BlockState state1, final BlockState state2) {
++            return (!state1.is(Blocks.HONEY_BLOCK) || !state2.is(Blocks.SLIME_BLOCK))
++                && (!state1.is(Blocks.SLIME_BLOCK) || !state2.is(Blocks.HONEY_BLOCK))
++                && (isSticky(state1) || isSticky(state2));
++        }
++
++        private boolean addBlockLine(final BlockPos start, final Direction direction) {
++            BlockState nextState = this.level.getBlockState(start);
 +            if (nextState.isAir()) {
 +                return true;
 +            }
-+            if (!isPushable(nextState, pos, pushDir, true, pushDir) || pos.equals(pistonPos)) {
-+                return false;
-+            }
-+            if (nextState.getPistonPushReaction() == PushReaction.DESTROY) {
-+                toDestroy.add(pos);
++            if (!isPushable(nextState, start, this.pushDirection, false, direction)) {
 +                return true;
 +            }
-+            if (toPush.size() >= PistonStructureResolverConstants.MAX_PUSH_DEPTH) {
++            if (start.equals(this.pistonPos)) {
++                return true;
++            }
++            if (this.toPush.contains(start)) {
++                return true;
++            }
++            int blockCount = 1;
++            if (blockCount + this.toPush.size() > MAX_PUSH_DEPTH) {
 +                return false;
 +            }
-+            toPush.add(pos);
-+            i++;
++            while (isSticky(nextState)) {
++                final BlockPos pos = start.relative(this.pushDirection.getOpposite(), blockCount);
++                final BlockState previousState = nextState;
++                nextState = this.level.getBlockState(pos);
++                if (nextState.isAir()
++                    || !canStickToEachOther(previousState, nextState)
++                    || !isPushable(nextState, pos, this.pushDirection, false, this.pushDirection.getOpposite())
++                    || pos.equals(this.pistonPos)) {
++                    break;
++                }
++                if (++blockCount + this.toPush.size() > MAX_PUSH_DEPTH) {
++                    return false;
++                }
++            }
++            int blocksAdded = 0;
++            for (int i = blockCount - 1; i >= 0; i--) {
++                this.toPush.add(start.relative(this.pushDirection.getOpposite(), i));
++                blocksAdded++;
++            }
++            int i = 1;
++            while (true) {
++                final BlockPos pos = start.relative(this.pushDirection, i);
++                final int collisionPos = this.toPush.indexOf(pos);
++                if (collisionPos > -1) {
++                    this.reorderListAtCollision(blocksAdded, collisionPos);
++                    for (int j = 0; j <= collisionPos + blocksAdded; j++) {
++                        final BlockPos blockPos = this.toPush.get(j);
++                        if (isSticky(this.level.getBlockState(blockPos)) && !this.addBranchingBlocks(blockPos)) {
++                            return false;
++                        }
++                    }
++                    return true;
++                }
++                nextState = this.level.getBlockState(pos);
++                if (nextState.isAir()) {
++                    return true;
++                }
++                if (!isPushable(nextState, pos, this.pushDirection, true, this.pushDirection) || pos.equals(this.pistonPos)) {
++                    return false;
++                }
++                if (nextState.getPistonPushReaction() == PushReaction.DESTROY) {
++                    this.toDestroy.add(pos);
++                    return true;
++                }
++                if (this.toPush.size() >= MAX_PUSH_DEPTH) {
++                    return false;
++                }
++                this.toPush.add(pos);
++                blocksAdded++;
++                i++;
++            }
++        }
++
++        private void reorderListAtCollision(final int blocksAdded, final int collisionPos) {
++            final List<BlockPos> head = new ArrayList<>();
++            final List<BlockPos> lastLineAdded = new ArrayList<>();
++            final List<BlockPos> collisionToLine = new ArrayList<>();
++            head.addAll(this.toPush.subList(0, collisionPos));
++            lastLineAdded.addAll(this.toPush.subList(this.toPush.size() - blocksAdded, this.toPush.size()));
++            collisionToLine.addAll(this.toPush.subList(collisionPos, this.toPush.size() - blocksAdded));
++            this.toPush.clear();
++            this.toPush.addAll(head);
++            this.toPush.addAll(lastLineAdded);
++            this.toPush.addAll(collisionToLine);
++        }
++
++        private boolean addBranchingBlocks(final BlockPos fromPos) {
++            final BlockState fromState = this.level.getBlockState(fromPos);
++            for (final Direction direction : Direction.values()) {
++                if (direction.getAxis() != this.pushDirection.getAxis()) {
++                    final BlockPos neighbourPos = fromPos.relative(direction);
++                    final BlockState neighbourState = this.level.getBlockState(neighbourPos);
++                    if (canStickToEachOther(neighbourState, fromState) && !this.addBlockLine(neighbourPos, direction)) {
++                        return false;
++                    }
++                }
++            }
++            return true;
 +        }
 +    }
++
++    private static final int MAX_PUSH_DEPTH = 12;
 +
 +    // Transcribed from PistonBaseBlock.isPushable (grid form; getDestroySpeed==-1 unbreakables
 +    // are covered by the explicit obsidian family + PushReaction.BLOCK, sufficient for the corpus).
@@ -1084,11 +1254,6 @@ index 0000000000000000000000000000000000000000..0a3e11df0cdba2364046bbfae7b00cff
 +            return false;
 +        }
 +        return !state.hasBlockEntity();
-+    }
-+
-+    /** Mirror of {@code PistonStructureResolver.MAX_PUSH_DEPTH} (avoids importing for one constant). */
-+    private static final class PistonStructureResolverConstants {
-+        static final int MAX_PUSH_DEPTH = 12;
 +    }
 +
 +    // -------------------------------------------------------------- scheduling
@@ -1209,10 +1374,10 @@ index 0000000000000000000000000000000000000000..ec9c5d745189d3ec1b62a75dbf740783
 +}
 diff --git a/com/coderyo/redstone/RedstoneDiffTestHarness.java b/com/coderyo/redstone/RedstoneDiffTestHarness.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..53af240aefbe85d278b9afa7c651d50807f4bc74
+index 0000000000000000000000000000000000000000..ee38674b69e4a1829707c45c9be3a1bcd2126b9c
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneDiffTestHarness.java
-@@ -0,0 +1,789 @@
+@@ -0,0 +1,880 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -1289,7 +1454,7 @@ index 0000000000000000000000000000000000000000..53af240aefbe85d278b9afa7c651d508
 +                if (!forced) {
 +                    forced = true;
 +                    for (int cx = -1; cx <= 5; cx++) {
-+                        for (int cz = -1; cz <= 3; cz++) {
++                        for (int cz = -1; cz <= 6; cz++) {
 +                            level.setChunkForced(cx, cz, true);
 +                        }
 +                    }
@@ -1329,7 +1494,7 @@ index 0000000000000000000000000000000000000000..53af240aefbe85d278b9afa7c651d508
 +
 +    private static boolean areaLoaded(final ServerLevel level) {
 +        for (int cx = 0; cx <= 5; cx++) {
-+            for (int cz = 0; cz <= 3; cz++) {
++            for (int cz = 0; cz <= 6; cz++) {
 +                if (!level.getChunkSource().hasChunk(cx, cz)) {
 +                    return false;
 +                }
@@ -1403,6 +1568,8 @@ index 0000000000000000000000000000000000000000..53af240aefbe85d278b9afa7c651d508
 +    }
 +    private static final BlockState PISTON_E = pistonE(false);
 +    private static final BlockState STICKY_E = pistonE(true);
++    private static final BlockState SLIME = Blocks.SLIME_BLOCK.defaultBlockState();
++    private static final BlockState HONEY = Blocks.HONEY_BLOCK.defaultBlockState();
 +
 +    private static void put(final ServerLevel level, final int x, final int y, final int z, final BlockState state) {
 +        level.setBlockAndUpdate(new BlockPos(x, y, z), state);
@@ -1795,6 +1962,95 @@ index 0000000000000000000000000000000000000000..53af240aefbe85d278b9afa7c651d508
 +                setBoth(lvl, c, new BlockPos(67, 102, 45), AIR);
 +            }
 +        }));
++
++        // =================================================================
++        //  SLIME / HONEY MULTI-BLOCK DRAG — the second wall: a pushed sticky
++        //  block drags its stuck neighbours, branching in all perpendicular
++        //  directions (full PistonStructureResolver), up to the 12-block limit.
++        // =================================================================
++
++        // ---- Circuit 20: SLIME push with 2 stuck blocks (multi-block drag) ----
++        // Piston faces EAST into a slime block; a stone sits ON TOP of the slime and another to
++        // its NORTH. Both stick to the slime, so extending drags the whole 3-block structure +1.
++        // Exercises addBranchingBlocks across two perpendicular axes + simultaneous N-mover motion.
++        put(level, 68, 101, 66, PISTON_E);
++        put(level, 69, 101, 66, SLIME);            // pushed slime
++        put(level, 69, 102, 66, STONE);            // stuck above (UP branch)
++        put(level, 69, 101, 65, STONE);            // stuck north (NORTH branch)
++        SCENARIOS.add(new Scenario("slime-drag-push", new BlockPos(68, 101, 66), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(68, 100, 66), REDBLOCK); // power -> extend, drag all 3
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(68, 100, 66), AIR);      // unpower -> retract (non-sticky)
++            }
++        }));
++
++        // ---- Circuit 21: HONEY drag — verifies the slime<->honey NON-STICK rule ----
++        // Piston faces EAST into a honey block. A stone to its NORTH sticks (honey is sticky) and
++        // MUST drag; a slime block ON TOP of the honey MUST NOT drag (canStickToEachOther excludes
++        // the honey<->slime pair). So the honey + north stone move +1 while the slime stays put —
++        // a precise differential test of the adhesion exclusion.
++        put(level, 68, 101, 70, PISTON_E);
++        put(level, 69, 101, 70, HONEY);            // pushed honey
++        put(level, 69, 102, 70, SLIME);            // ABOVE honey: must NOT drag (honey<->slime)
++        put(level, 69, 101, 69, STONE);            // NORTH of honey: must drag (honey sticks stone)
++        SCENARIOS.add(new Scenario("honey-nonstick-drag", new BlockPos(68, 101, 70), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(68, 100, 70), REDBLOCK);
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(68, 100, 70), AIR);
++            }
++        }));
++
++        // ---- Circuit 22: SLIME pull by a STICKY piston (multi-block pull-drag) ----
++        // Sticky piston faces EAST into a slime block with a stone stuck to its NORTH. Extending
++        // pushes the 2-block structure +1; un-powering RETRACTS and the sticky head PULLS the whole
++        // structure back -1 (pull-side branching via addBranchingBlocks on the retract resolve).
++        put(level, 68, 101, 74, STICKY_E);
++        put(level, 69, 101, 74, SLIME);            // pushed + pulled slime
++        put(level, 69, 101, 73, STONE);            // stuck north: dragged on push AND pull
++        SCENARIOS.add(new Scenario("slime-sticky-pull", new BlockPos(68, 101, 74), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(68, 100, 74), REDBLOCK);
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(68, 100, 74), AIR);
++            }
++        }));
++
++        // ---- Circuit 23: SLIME push-LIMIT — branch makes the structure exceed 12 = NO FIRE ----
++        // Slime in front, then 11 inline stones (12 in the straight line), PLUS a stone stuck on
++        // top of the slime. The branch pushes the structure to 13 blocks > the 12-block limit, so
++        // resolve() fails and vanilla never fires — NOTHING moves. Proves branching counts toward
++        // the limit and the all-or-nothing immovability rule for slime structures.
++        put(level, 68, 101, 78, PISTON_E);
++        put(level, 69, 101, 78, SLIME);            // slime head of the structure
++        for (int x = 70; x <= 80; x++) {           // 11 inline stones -> 12 in the straight line
++            put(level, x, 101, 78, STONE);
++        }
++        put(level, 69, 102, 78, STONE);            // branch on top of slime -> 13th block -> no fire
++        SCENARIOS.add(new Scenario("slime-push-limit", new BlockPos(68, 101, 78), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(68, 100, 78), REDBLOCK); // power, but must NOT fire
++            } else if (rel == 90) {
++                setBoth(lvl, c, new BlockPos(68, 100, 78), AIR);
++            }
++        }));
++
++        // ---- Circuit 24: 0-TICK fast-retract (sticky piston drops the block) ----
++        // A sticky piston is powered for a SHORT pulse: it extends (head + pushed block become
++        // in-flight movers) and is un-powered again before the extension finalises, so the retract
++        // catches the head mid-flight (TRIGGER_DROP). Vanilla finalises the in-flight head early
++        // (source -> AIR) and the pushed block is "dropped" at its mid position. Exercises the
++        // fast-retract path; a tight differential test of mover finalisation timing.
++        put(level, 68, 101, 82, STICKY_E);
++        put(level, 69, 101, 82, STONE);            // pushed then dropped block
++        SCENARIOS.add(new Scenario("piston-0tick-drop", new BlockPos(68, 101, 82), (lvl, c, rel) -> {
++            if (rel == 30) {
++                setBoth(lvl, c, new BlockPos(68, 100, 82), REDBLOCK); // power on
++            } else if (rel == 32) {
++                setBoth(lvl, c, new BlockPos(68, 100, 82), AIR);      // power off ~2 ticks later
++            }
++        }));
 +    }
 +
 +    /** (rear, side) strength pairs swept across the analog range for the subtractor. */
@@ -2004,10 +2260,10 @@ index 0000000000000000000000000000000000000000..53af240aefbe85d278b9afa7c651d508
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..1bfc8d1c5f15a31257f46738796eebf79b8bdf3d
+index 0000000000000000000000000000000000000000..09309955ed71c89ce732294f0a9de7fc87990c88
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,241 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -2150,6 +2406,22 @@ index 0000000000000000000000000000000000000000..1bfc8d1c5f15a31257f46738796eebf7
 +                forceCell(forced, visited, frontier, above);
 +                for (final Direction dir : Direction.values()) {
 +                    forceCell(forced, visited, frontier, above.relative(dir));
++                }
++                // Slime/honey multi-block drag can pull blocks OFF the straight lane (branching
++                // in the two perpendicular axes). Run vanilla's real PistonStructureResolver on
++                // the LIVE world to discover the exact static structure this piston would move,
++                // and force every moved/destroyed cell AND its destination into the footprint so
++                // the whole dragged contraption is snapshotted into the compiled grid and
++                // differential-compared every tick. (Exact, structure-sized — no blind halo.)
++                final PistonStructureResolver r = new PistonStructureResolver(level, pos, f, true);
++                if (r.resolve()) {
++                    for (final BlockPos pushed : r.getToPush()) {
++                        forceCell(forced, visited, frontier, pushed);
++                        forceCell(forced, visited, frontier, pushed.relative(f));
++                    }
++                    for (final BlockPos destroyed : r.getToDestroy()) {
++                        forceCell(forced, visited, frontier, destroyed);
++                    }
 +                }
 +            }
 +
