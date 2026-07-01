@@ -1,0 +1,51 @@
+# coderyoMC redstone-computer MAP — 2-BIT REAL-ADD ACCUMULATOR (build-25).
+#
+# Widens the build-24 EXECUTE stage from a 1-bit XOR to a REAL 2-bit ADD:
+#   ACC := (ACC + operand) mod 4, with a genuine physical carry ripple bit0 -> bit1.
+# The 1-bit XOR-accumulator (build-24) did ACC:=ACC^b0; this does genuine 2-bit arithmetic.
+#
+# DATAPATH (all constituents are PROVEN, difftest-clean, placed verbatim):
+#   * ADD  = build-08 2-bit ripple-carry adder = build-07 side-entry-Cin full-adder tile
+#            placed at x+0 (bit0) and x+60 (bit1) + build-08 carry interconnect
+#            (Cout0 -> bit1 Cin bus). A = ACC, B = operand, Cin0 = 0.
+#            SUM0=(30,101,z0) SUM1=(90,101,z0) Cout1=(104,101,z0-3), z0 = 374 in the run world.
+#   * ACC  = a 2-bit register = TWO master-slave D flip-flops (build-24 ring stage-0 geometry,
+#            = build-11/build-12 edge-triggered latch): FF0 (bit0) at (dx=0,dz=190),
+#            FF1 (bit1) at (dx=80,dz=190). Ports per FF (base master x=62 / slave x=46):
+#              D inject : y=102 block over (61,118) & (62,135)  (=D)
+#              clock E  : master (62,117)&(60,133) ; slave (46,117)&(44,133)  (y=102 blocks)
+#              Q (ACC)  : (44,101,122)     Qbar : (48,101,130)
+#            Power-on: the torch latch boots metastable; ONE clock with D=0 defines ACC=0.
+#
+# ONE CLOCK = ACC := ACC + operand:
+#   1. adder A := ACC (register Q, fed back), adder B := operand (ROM-style word).
+#   2. the real ripple adder physically computes SUM (2-bit) + Cout (carry ripples bit0->bit1).
+#   3. two-phase clock (master capture, then slave output) latches SUM into the 2-bit register.
+#   4. new ACC = SUM = (ACC + operand) mod 4.
+# In this build the Q->A feedback and the operand are presented per-clock by the driver
+# (build-25-acc.py), i.e. the ADD is DRIVEN PER-CLOCK with the register latching the SUM
+# (the milestone). The SUM->D and Q->A physical fan-out wiring + a 2-bit ROM front-end are
+# the next step toward full autonomy (see RESULTS build-25 + NEXT).
+#
+# SERVER: reuse the existing coderyo-bundler-26.2 jar (patch-0020, NO rebuild), boot
+#   -Dcoderyo.redstone.compile.enabled=true ; port 15568, RCON 25581, flat world,
+#   spawn-monsters=false. setblock/fill/probe via RCON; `coderyo redstone difftest x y z ticks`
+#   runs via RCON on THIS jar (verdict read from the "[redstone-difftest/live]" server log).
+#   Reads use `tick sprint N` to settle in GAME ticks (TPS-independent under the deep cascade).
+#
+# RUN (in a scratch run dir alongside build-07/build-08 from this harness):
+#   build-25-drv.py    RCON driver (sprint / probe / setblock helpers)   [run name: drv.py]
+#   build-25-adder.py  place + drive the 2-bit ripple adder              [run name: adder.py]
+#   build-25-ff.py     place + verify one master-slave D flip-flop       [run name: ff.py]
+#   build-25-acc.py    the accumulator loop: python acc.py 1 1 2 0       [run name: acc.py]
+#
+# RESULT (difftest BIT-IDENTICAL to vanilla, all three sub-networks):
+#   * 2-bit ripple adder  : difftest 30 101 374 60 -> BIT-IDENTICAL (648 cells, 332 comp)
+#   * FF0 (bit0 register) : difftest 44 101 312 60 -> BIT-IDENTICAL (268 cells)
+#   * FF1 (bit1 register) : difftest 124 101 312 60 -> BIT-IDENTICAL (268 cells)
+#   * physical arithmetic (register Q read live each clock):
+#       program [1,1,1,1] : ACC 0->1->2->3->0   (full carry wrap 3+1=4 mod4, Cout=1)
+#       program [1,1,2,0] : ACC 0->1->2->0->0   (2+2=4 mod4=0, Cout=1)
+#       adder truth (7 vectors): 1+1=2,3+1=0/c,2+2=0/c,1+2=3,3+3=2/c,0+0=0,2+1=3 all CORRECT.
+#
+# No feature patch was added -- only test-harness/redstone-computer/.

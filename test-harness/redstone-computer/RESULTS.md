@@ -1236,3 +1236,58 @@ A LOAD variant (`D=op`, no feedback — `build-24-load.commands.txt`) was valida
 stepping stone (ACC = fetched b0 delayed one clock, difftest BIT-IDENTICAL, 3150 cells). The XOR accumulate
 is the real capstone. The regionized multithreaded compiler is bit-for-bit transparent to a genuine running
 stored-program machine. No feature patch — only `test-harness/redstone-computer/`.
+
+---
+
+## Rung 25 — EXECUTE widened 1-bit XOR → 2-bit REAL ADD accumulator (build-25) — difftest-clean, physical carry
+
+The build-24 minimal CPU executes `ACC := ACC XOR b0` (1 bit). **build-25 widens the EXECUTE datapath to a
+genuine 2-bit ADD**: `ACC := (ACC + operand) mod 4`, with a real physical carry that ripples bit0 → bit1.
+Every constituent is a PROVEN, difftest-clean tile placed verbatim; only the datapath is widened.
+
+**Reused the patch-0020 `coderyo-bundler-26.2` jar — NO rebuild.** Booted
+`-Dcoderyo.redstone.compile.enabled=true`, **port 15568** (RCON 25581), flat world, `spawn-monsters=false`.
+`coderyo redstone difftest x y z ticks` runs via RCON on this jar; verdict from the `[redstone-difftest/live]`
+log. Physical reads settle by `tick sprint` (GAME ticks — TPS-independent under the deep comparator cascade).
+
+**Datapath.**
+- **ADD = build-08 2-bit ripple-carry adder** = the build-07 side-entry-Cin full-adder tile placed at `x+0`
+  (bit0) and `x+60` (bit1) + the build-08 carry interconnect (Cout0 → bit1 Cin bus). `A = ACC`, `B = operand`,
+  `Cin0 = 0`. SUM0 `(30,101,374)`, SUM1 `(90,101,374)`, Cout1 `(104,101,371)`.
+- **ACC = 2-bit register = two master-slave D flip-flops** (build-24 ring stage-0 geometry = build-11/12
+  edge-triggered latch): **FF0 (bit0)** at `(dx=0,dz=190)` Q0=`(44,101,312)`; **FF1 (bit1)** at
+  `(dx=80,dz=190)` Q1=`(124,101,312)`. Per FF: D inject = y=102 block over `(61,118)&(62,135)`; clock E =
+  master `(62,117)&(60,133)`, slave `(46,117)&(44,133)`. Power-on metastability is broken by one D=0 clock.
+- **One clock = `ACC := ACC + operand`:** adder A ← ACC (Q fed back), adder B ← operand → the real ripple
+  adder physically computes the 2-bit SUM with carry → two-phase clock latches SUM into the register → new
+  ACC = SUM. In build-25 the Q→A feedback and the operand are presented **per-clock by the driver**
+  (`build-25-acc.py`): the ADD is **driven per-clock with the register latching the physical SUM** — the
+  2-bit real-arithmetic milestone. (Physical SUM→D + Q→A fan-out and a 2-bit ROM front-end are NEXT.)
+
+**difftest verdicts (compiler == vanilla, BIT-IDENTICAL).**
+
+| network | seed | ticks | verdict |
+|---|---|---|---|
+| 2-bit ripple adder (A=3,B=3=6) | `30 101 374` | 60 | **PASS — 648 cells / 332 components** |
+| FF0 bit0 register (ACC=3) | `44 101 312` | 60 | **PASS — 268 cells / 137 comp** |
+| FF1 bit1 register (ACC=3) | `124 101 312` | 60 | **PASS — 268 cells / 137 comp** |
+
+**Physical arithmetic (register Q read live each clock, real adder computing each sum).**
+
+| program (operands) | ACC trajectory | note |
+|---|---|---|
+| `[1,1,1,1]` | `0 → 1 → 2 → 3 → 0` | full carry wrap: `3+1 = 4 mod 4 = 0`, Cout=1 |
+| `[1,1,2,0]` | `0 → 1 → 2 → 0 → 0` | `2+2 = 4 mod 4 = 0`, Cout=1 |
+| adder truth (7 vectors) | `1+1=2, 3+1=0/c, 2+2=0/c, 1+2=3, 3+3=2/c, 0+0=0, 2+1=3` | all CORRECT, carry ripples bit0→bit1 |
+
+Every step satisfies `ACC_next = (ACC_prev + operand) mod 4` with the carry physically rippling from bit0's
+Cout into bit1 — genuine 2-bit arithmetic, not the 1-bit XOR of build-24. The regionized multithreaded
+redstone compiler is **bit-for-bit transparent** to the whole 2-bit adder (648 cells) and both register FFs
+(268 cells each). **This is the 1-bit XOR → 2-bit real ADD datapath widening — the first real arithmetic step
+toward a programmable CPU.**
+
+**NEXT.** (1) physical SUM→D and Q→A fan-out (autonomous feedback loop, no per-clock driver) — the
+build-12 non-crossing-lane discipline extended to the 2-bit board; (2) a **2-bit ROM front-end** (reuse the
+build-24 ring-PC + one-hot ROM, widened to a 2-bit operand word) driving B; (3) **opcode decode** (LOAD vs
+ADD select on the adder B / register D) → the minimal programmable CPU; then wider (4-bit ACC + ALU).
+No feature patch — only `test-harness/redstone-computer/`.
