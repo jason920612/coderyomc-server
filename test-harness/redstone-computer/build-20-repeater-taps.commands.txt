@@ -1,0 +1,14 @@
+setblock 52 101 146 minecraft:repeater[facing=north]
+fill 52 101 147 52 101 150 minecraft:redstone_wire
+setblock 52 101 151 minecraft:redstone_lamp
+# --- cleaning re-amp variant ---
+fill 52 101 146 52 101 160 minecraft:air
+setblock 52 101 146 minecraft:repeater[facing=north]
+fill 52 101 147 52 101 150 minecraft:redstone_wire
+setblock 52 101 151 minecraft:repeater[facing=north]
+setblock 52 101 152 minecraft:redstone_wire
+# --- bit1 Qbar1 tap ---
+setblock 88 101 131 minecraft:repeater[facing=north]
+fill 88 101 132 88 101 135 minecraft:redstone_wire
+setblock 88 101 136 minecraft:repeater[facing=north]
+setblock 88 101 137 minecraft:redstone_wire

@@ -976,3 +976,54 @@ bit1.D, and the **PC→ROM fetch walk**. **Next:** tune bit0's feedback rails to
 0↔1, add bit1 + the build-17 dual-rail XOR gate → Master1.D for the physical 2-bit self-advance, then tap
 Q1,Q0 into build-15's ROM `{a1,a0}` for the fetch walk. **No feature patch was added — only
 `test-harness/redstone-computer/`.**
+
+---
+
+## build-20 — 2-bit PC: REPEATER-ISOLATED FAN-OUT solves the recurring attenuation blocker
+
+**The one physical issue that stuck builds 16–19:** adding a fan-out tap to bit0's feedback loop broke its
+clean digital toggle — a raw-dust tap **loads/attenuates** the feedback net so the loop settles to an
+**analog fixed point** (build-19: `D=15 while Qbar=0`) instead of toggling. **The fix tested here: tap every
+fan-out through a REPEATER** (one-way, re-amplifying — it READS the source without loading the net) and
+**start from build-12's EXACT clean-toggling bit0 verbatim**. Fresh jar from **origin/main @53fd5e7**
+(PR#69 + patch-0020), console-driven on port 15568; difftest verdicts from the `[redstone-difftest/live]` log.
+
+**(1) bit0 = build-12 T-flip-flop verbatim — clean physical toggle REPRODUCED ✅.** Latch bodies + forward
+are build-11/12 verbatim; the **feedback is build-12's EXACT non-crossing route** (drop x=48 → far-south
+trunk **z=145** → east risers x=62/x=66), *not* build-19's z=139 shortcut that hit the fixed point. On the
+two-phase manual clock, Q0 @(44,101,122) from the metastable boot: `c1=15 (break) c2=15 c3=0 c4=15 c5=0 c6=15
+c7=0 c8=15 c9=0 c10=15` → **9 consecutive clean toggles, zero sticking — bit0 physically self-advances.**
+**difftest `44 101 122 200` → BIT-IDENTICAL (200 ticks, 440 cells, 218 components).** The build-19 analog
+fixed point was a **construction miswire (its z=139 route), not build-12 and not the compiler** — build-12's
+exact route toggles cleanly on this jar, exactly as the operator said.
+
+**(2) REPEATER-isolated fan-out off the FEEDBACK rail — bit0 KEEPS toggling ✅ (THE KEY TEST).** A diode
+repeater on the feedback trunk `52,146 rep[N]` (rear reads trunk (52,145)=Qbar0) → `52,147..150` wire →
+cleaning `52,151 rep[N]` → port `52,152`. With the tap attached, Q0 = `0,15,0,15,0,15,0,15,0` — **still a
+clean toggle**; bus mid @(52,150)=**12/0** (re-amplified, tracks Qbar0), cleaning-repeater PORT
+@(52,152)=**15/0** (clean, ready to feed an XOR subtract comparator). **difftest → BIT-IDENTICAL: 451 cells
+(tap), 454 cells (tap + re-amp).** The repeater tap **does not disturb the feedback net** — the recurring
+blocker is **solved**.
+
+**(3) Controlled contrast — RAW-DUST tap at the same point ATTENUATES to nothing ✅.** Single-variable swap
+(repeater→raw dust, same route extended to z=160): the fan-out is **dead** — `BUSnear (52,147)=3`,
+`BUSfar (52,160)=0` — vs the repeater tap's **12 → 15**. Raw dust decays 15→3→0 over the run (a downstream
+`15 − attenuated` subtract-XOR would never null); the repeater re-amplifies. This is the mechanism behind
+build-18's XOR misfire and the rule: **a cleaning repeater at every comparator port, fed by a repeater tap.**
+
+**(4) bit1 = build-11 master-slave D-FF (+40x) + repeater fan-out — difftest-clean ✅.** Body+forward at
+MASTER1 x=102 / SLAVE1 x=86 (Q1=(84,122), Qbar1=(88,130)), shared clock. A floating-D latch boots metastable
+and difftests **DIVERGENT** (real=15/sim=0 @tick120 — the torch pair oscillates); clocking once with D=0
+drives a **defined Q1=0** → **difftest `84 101 122 200` → BIT-IDENTICAL (252 cells).** Its rail also fans out
+via a repeater (south open): `88,131 rep[N]` → `88,136` cleaning rep → port `88,137`=**15 clean**;
+**difftest → BIT-IDENTICAL (264 cells).**
+
+**Verdict.** The KEY physical unknown that blocked every prior PC build — *does a fan-out tap kill bit0's
+toggle?* — is **answered: NO, if the tap is a REPEATER.** bit0 reproduces build-12's clean physical toggle
+(9 toggles, difftest-clean 440); the repeater-isolated feedback tap keeps it toggling and stays difftest-clean
+(451/454); a raw-dust control dies 3→0 where the repeater delivers a clean 15; bit1 is difftest-clean (252) and
+fans out via its own repeater (264). **Not landed in-budget:** assembling the four repeater-tapped rails into
+build-17's dual-rail XOR (`max(Q1−Q0, Qbar1−Qbar0)`) → Master1.D for the full physical 00→01→10→11→00
+self-advance, and the PC→ROM fetch walk — now a routing exercise on **proven** parts (this repeater fan-out +
+build-17's difftest-clean XOR + build-15 ROM) with the port discipline established. **No feature patch — only
+`test-harness/redstone-computer/`.**
