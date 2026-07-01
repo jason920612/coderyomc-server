@@ -1392,3 +1392,62 @@ wire-drivable D node** (the wire-can-only-OR limit is the crux; build-26's "D-ce
 latch-state coincidence, not a controllable input); (2) **Q→A 4-way fan-out**, gated behind (1). **NEXT:**
 give the D-FF a clean combinational D input (or strong-power the D cell), then wire Q→A; then the ROM/variable
 operand. **No feature patch — only `test-harness/redstone-computer/`.**
+
+## build-28 — WIRE-DRIVABLE-D master-slave FLIP-FLOP: a wire forces D (and Q) to BOTH 0 and 1 — the blocker CLOSED, difftest BIT-IDENTICAL ✅
+
+The build-27 blocker — *a wire could only OR the register's D to 1, never force 0, so the 2-bit
+accumulator could not capture a SUM of 0* — is **fixed**, and the fix is **difftest-clean in both
+captured states**. This is THE unblock for all autonomous feedback (registers, accumulators, the CPU).
+
+**Root cause (and it is NOT an FF-logic fault — build-27's diagnosis was wrong).** The FF (build-10/-11
+gated D-latch) already exposes a **clean, combinational, wire-drivable D** — as **two** input cells:
+`D_north (61,118)` = the **R comparator's WEST SIDE** (`R = E − D_north`) and `D_south (62,135)` = the
+**S comparator's REAR** (`S = D_south − nE`). build-27 (a) fed the SUM bridge into **only D_south**, leaving
+`D_north` undriven — so `R = E − D_north` could never fire and the latch could never **RESET** (D "stuck at
+1"); and (b) hit a **wire-congestion short** (reproduced & fixed live here): a D-feed riser laid one cell
+from the S-gadget's **nE 15-source block at `(59,134)`** leaks 15 into the whole D net — riser at `x=58` →
+D net pinned at **15** (build-27's "floats to 15 by default"); riser moved to a clear lane → D net follows
+**0/1**. So the "15-default" was a construction short + a one-port feed, **not** an internal comparator
+output. The D cells are genuine inputs.
+
+**The fix (build-28-wireff.py, WireFF extends ff.FF).** Drive the D **input wire** (one toggleable source
+block emulating the incoming adder SUM) into **BOTH** master D-ports through **repeater-cleaned** branches:
+- Branch A `source → D_south`: west `z=140` → north `x=62` → 2 cleaning repeaters → `D_south (62,135)`.
+- Branch B `source → D_north`: the master body + Q-rail + forward-interconnect bus **wall off `z=122`
+  across `x=50..64`**, so the only clear N-S lane is **`x=66`** (east of the Qbar rail `x=64`); `D_north` is
+  then reached from the **NORTH (`z=115` row)** to dodge the R-gadget and the `E_north` enable dust (which
+  would short Enable into D). Re-amp so D arrives at a **clean 15** (else `R=E−D` subtract mis-fires).
+
+**RESULT — a WIRE forces Q to BOTH 0 and 1 (vanilla live reads, Q @`244,101,622`).** Toggling **only** the
+source block (D via wire), two-phase clock, reading Q:
+
+| D_wire | D_north | D_south | Q | verdict |
+|--------|---------|---------|---|---------|
+| 0 | 0 | 0 | **0** | RESET through the wire — OK |
+| 1 | 15 | 15 | **1** | SET through the wire — OK |
+| 0→1→1→0 | tracks | tracks | **0→1→1→0** | all OK, bidirectional |
+
+Then driven with the **exact per-bit SUM streams of a full `ACC = 0→1→2→3→0` count**: bit0 LSB stream
+`D=0,1,0,1,0 → Q=0,1,0,1,0` (5/5 OK); bit1 MSB stream `D=0,0,1,1,0 → Q=0,0,1,1,0` (5/5 OK). **The
+wire-driven register captures every ACC state, including every forced-0** — the precise
+*register-capture-through-a-wire* link build-27 lacked is proven for the whole count.
+
+**RESULT — difftest (compiler == vanilla), verdict from the `[redstone-difftest/live]` log:**
+
+| held state | command | verdict |
+|------------|---------|---------|
+| Q = 1 | `coderyo redstone difftest 244 101 622 200` | **PASS BIT-IDENTICAL (200 ticks, 369 cells, 183 components, single-region)** |
+| Q = 0 | `coderyo redstone difftest 244 101 622 200` | **PASS BIT-IDENTICAL (200 ticks, 368 cells, 182 components)** |
+
+=> the whole wire-drivable-D master-slave register (torch latches + comparator enable-gates + forward
+interconnect + the two repeater-cleaned D-feed branches) compiles **bit-for-bit to vanilla in BOTH captured
+states**. An ordinary wire (the adder SUM) now drives the register's D to **both 0 and 1** — the build-27
+D-injection blocker (the last *logic* gap) is **closed**.
+
+**What remains for the physical 2-bit self-count (honest).** With the wire-drivable D proven and
+difftest-clean, closing the full `ACC := ACC + 1` loop over the **build-25 ripple adder** is now purely a
+**dedicated-lane routing** exercise — `SUM[1:0] → each FF's BOTH D-ports` and `Q[1:0] → adder A[1:0]` over
+the adder↔register gap (the same class of wide-board, non-crossing feedback routing that build-12 already
+solved for the 1-bit accumulator, and that build-27 framed as the open link). No new logic or compiler work
+remains; the wire-drivable-D register is the crux that unblocks it. **No feature patch — only
+`test-harness/redstone-computer/`.**
