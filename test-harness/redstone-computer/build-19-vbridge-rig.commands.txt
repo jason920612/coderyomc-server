@@ -1,0 +1,27 @@
+# PR#69 vertical-bridge-under-load reproduction rig (build-18 Q0-bridge topology, +160x, z=200).
+# A redstone_block-fed LOADED HIGH signal wire-climbs a y=101->102->103->102->101 bridge OVER a
+# powered crossing wire, then propagates out. Difftest seeds: 197 101 200 (bridge net) & 201 101 200
+# (crossed-wire net). PR#69 jar: BIT-IDENTICAL 32 cells. Pre-PR#69 (showcase 9e2343d): 29/30 cells
+# (the support-stone cells PR#69's flood-fill fix restores are dropped), values still matched here.
+fill 195 100 195 210 100 205 minecraft:stone
+fill 195 101 195 210 103 205 minecraft:air
+fill 195 100 195 210 100 205 minecraft:stone
+setblock 201 101 198 minecraft:redstone_block
+setblock 201 101 199 minecraft:redstone_wire
+setblock 201 101 200 minecraft:redstone_wire
+setblock 201 101 201 minecraft:redstone_wire
+setblock 201 101 202 minecraft:redstone_wire
+setblock 207 101 200 minecraft:redstone_block
+setblock 206 101 200 minecraft:redstone_wire
+setblock 205 101 200 minecraft:redstone_wire
+setblock 204 101 200 minecraft:redstone_wire
+setblock 203 101 200 minecraft:redstone_wire
+setblock 202 101 200 minecraft:stone
+setblock 202 102 200 minecraft:redstone_wire
+setblock 201 102 200 minecraft:stone
+setblock 201 103 200 minecraft:redstone_wire
+setblock 200 101 200 minecraft:stone
+setblock 200 102 200 minecraft:redstone_wire
+setblock 199 101 200 minecraft:redstone_wire
+setblock 198 101 200 minecraft:redstone_wire
+setblock 197 101 200 minecraft:redstone_wire
