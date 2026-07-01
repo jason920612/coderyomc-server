@@ -783,3 +783,63 @@ server rebooted on the **same world** with the patch-0020 jar to run every difft
 D; (2) wire the PC's `{Q1,Q0}` onto build-15's ROM `{a1,a0}` address rails → each clock the ROM output walks
 the program W0..W3 in order = the **CPU fetch walk**; (3) then decode + register file + integrate. **No
 feature patch was added — only `test-harness/redstone-computer/`.**
+
+## Rung 5 — FETCH FRONT-END: physical dual-rail XOR gate + self-advancing bit0 + both PC flip-flops (build-17) — XOR gate & both FFs difftest-clean; 2-bit self-advance routing deferred ⚠️
+
+Toward making build-16's PC **autonomous**: land the physical `bit1.D = Q1 XOR Q0` gate and the second
+flip-flop, then wire the self-advancing feedback + the PC→ROM address bus. This build **lands and
+difftest-validates the three constituents** (the new XOR gate + both edge-triggered flip-flops, bit0
+physically self-advancing) and reports the **root-cause routing finding** that gates the final two-cell
+integration. Full geometry in `build-17-fetch-frontend.txt`. (Jar: the patch-0020 compiler reused
+byte-for-byte from the showcase build of `origin/main` 9e2343d — the only commits from there to the fetch
+base 4b6b8b5 are test-harness-only build-15/16, so the compiler is identical; no rebuild needed.)
+
+**(A) Physical dual-rail XOR gate — the item-1 gate, difftest-clean ✅.** `bit1.D = Q1 XOR Q0 =
+max(Q1−Q0, Qbar1−Qbar0)`: two subtract comparators facing one shared merge, each fed **two DISTINCT rails**
+(comp_a rear=Q1/side=Q0; comp_b rear=Qbar1/side=Qbar0) — no input appears twice → **no fanout crossover**,
+the build-07/13 planar-XOR problem solved by using the slaves' both-rail outputs. Built standalone at
+x≈204, output `XV @(208,101,206)`, driven by 4 dual-rail drivers.
+
+| (Q1,Q0) | Q1−Q0 | Qbar1−Qbar0 | XV = max | XOR |
+|---------|-------|-------------|----------|-----|
+| (0,0) | 0 | 0 | **0** | 0 ✅ |
+| (0,1) | 0 | 15 | **15** | 1 ✅ |
+| (1,0) | 15 | 0 | **15** | 1 ✅ |
+| (1,1) | 0 | 0 | **0** | 0 ✅ |
+
+**4/4 correct = XOR** (live power). **difftest** (`difftest 208 101 206 100`): (1,0) HI → **BIT-IDENTICAL
+(100t, 32 cells, 17 components)**; (1,1) LO → **BIT-IDENTICAL (100t, 32 cells)**. The exact bit1.D gate the
+self-advancing PC needs, proven bit-for-bit on a single planar layer.
+
+**(B) Both PC flip-flops rebuilt fresh; bit0 self-advances physically ✅.** bit0 = the build-12 T-flip-flop
+verbatim (Master base x=62, Slave base x=46, `Q0@44,101,122`) with its `Qbar0→Master0.D` "+1" feedback
+**fully physical**. bit1 = a build-11 master-slave D flip-flop translated +40x (`Q1@84,101,122`,
+`Qbar1@88,101,130`, Master1.D at (101,118)/(102,135)), body + forward only.
+
+- **bit0 SELF-ADVANCES** on the shared two-phase clock with **no manual D** — live `0→1→0→1→0` over 4
+  cycles (@44,101,122), zero sticking, through real Qbar0→D feedback.
+- **difftest:** bit0 held ACC0=0 → **BIT-IDENTICAL (200t, 432 cells, 218 components)** (identical footprint
+  to build-12's physical T-loop); bit1 held Q1=0 → **BIT-IDENTICAL (200t, 244 cells, 124 components)**.
+
+**(C) Integration status — the root-cause routing finding (honest).** Both remaining items need the SAME
+thing: bit0's **Q0/Qbar0 fanned to a SECOND consumer** — the XOR gate (for bit1.D) in item-1, and the ROM
+address `{a1,a0}` in item-2 (Q1 = a1, Q0 = a0). bit1's Q1/Qbar1 are reachable (no T-feedback), but bit0's
+`Q0@(44,122)`/`Qbar0@(48,130)` are **enclosed by bit0's own two interconnects** — which build-12 packed into
+every clean lane to make bit0's T-loop non-crossing: the **forward** net (z=114 trunk x41–50 + x=41 drop
+z115–137) seals the north/west exits, and the **feedback** net (x=48 drop z131–145 + z=145 trunk x48–66 +
+x=66 riser) seals the south/east exits. So a **retrofit** tap of Q0/Qbar0 collides with a live bit0 net on
+the same y=101 layer (exactly the build-11 wire-crossing mode, and why build-16 applied bit1.D by a driver).
+The fix is **not** a local reroute: the whole PC must be **rebuilt on a wider platform** that brings
+Q0/Qbar0/Q1/Qbar1 out to a **shared fan-out bus** from the start — one clean tap fanning to BOTH the bit1.D
+XOR gate AND the ROM address rails, with bit0's forward+feedback lanes shifted to leave that bus clear. Every
+**constituent is difftest-clean** on this jar (the XOR gate, both flip-flops, and build-15's ROM); what
+remains is purely that wider-platform non-crossing fan-out — a build-11/12-scale layout effort, deferred
+(anti-stall: the difftest-clean XOR gate + a physically self-advancing bit0 + both FFs are the landed wins).
+
+**Landed:** the physical dual-rail XOR gate (bit1.D) difftest-clean; bit0 self-advancing physically +
+difftest-clean; bit1 flip-flop difftest-clean. **Deferred:** the two-cell physical self-advance and the
+PC→ROM address bus, both gated by the single Q0/Qbar0 second-consumer fan-out (needs the wider platform).
+**NEXT:** rebuild the 2-bit PC on a wide platform with a Q0/Qbar0/Q1/Qbar1 fan-out bus → connect to (i) the
+XOR gate → Master1.D (self-advance) and (ii) build-15's ROM `{a1,a0}` (fetch walk); then decode opcode →
+control lines + register file + integrate the build-14 ALU + build-12 accumulator. **No feature patch was
+added — only `test-harness/redstone-computer/`.**
