@@ -1,0 +1,87 @@
+# coderyoMC redstone-computer MAP — 2-BIT PC INTEGRATION: dual-rail XOR difftest-clean + LIVE-RAIL drive proven (build-21)
+#
+# GOAL (operator spec): assemble build-20's PROVEN parts into the self-advancing 2-bit Program Counter:
+#   feed bit1.D = XOR(Q1,Q0) from the register rails so the PC advances 00->01->10->11->00 with NO driver,
+#   then tap {Q1,Q0} into build-15's ROM for the fetch walk. Physically probe the toggle (difftest-clean-
+#   but-stuck is the failure mode), difftest each state.
+#
+# JAR: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (patch-0020 compiler = origin/main; pc3 branch base).
+#   Booted -Dcoderyo.redstone.compile.enabled=true, port 15568, RCON 25579, flat world, difficulty
+#   peaceful, gamerule dispatcher rejects `gamerule` (harmless, as prior builds). forceload add 38 108 322 320
+#   (split into two <=256-chunk regions). Driven entirely over RCON (rc.py). Two-phase manual clock driven
+#   by clock.py (place redstone_block over the enable dusts, `/tick sprint N` to settle DETERMINISTICALLY
+#   by GAME TICKS + a wait for the async sprint to complete, remove, settle). Live power reads via probe.py
+#   (`execute if block <pos> minecraft:redstone_wire[power=N] run say` scanned 0..15, read from the log).
+#   difftest verdict from the log "[redstone-difftest/live] PASS ... BIT-IDENTICAL".
+# Convention CALIBRATED empirically on this jar (test rig at 100,101,160): repeater/comparator[facing=D]
+#   has its REAR/INPUT on side D and OUTPUT on the OPPOSITE side (matches build-01..20). NOTE: a freshly
+#   setblock'd repeater does not re-evaluate its input until a neighbor update arrives — drive the input
+#   LAST (or re-place it) so updates propagate, else it reads stale/false.
+#
+# =====================================================================================
+# (1) bit0 = build-12 T-FLIP-FLOP VERBATIM — CLEAN PHYSICAL SELF-ADVANCE reproduced on this jar  ✅
+# =====================================================================================
+# Applied build-20-bit0.commands.txt VERBATIM (MASTER base x=62, SLAVE base x=46; Q0=(44,101,122),
+# Qbar0=(48,101,130); Qbar0->Master0.D "+1" feedback FULLY PHYSICAL on build-12's z=145 non-crossing route).
+# Two-phase clock (clock.py), Q0 read live @(44,101,122) after each settled full cycle:
+#   PHYSICAL TOGGLE PROBE SEQUENCE (Q0):  15 -> 0 -> 15 -> 0 -> 15 -> 0   (6 consecutive CLEAN toggles, 0 stick)
+#   bit0 PHYSICALLY SELF-ADVANCES with NO manual D — the 1-bit counter, reproduced fresh.
+#   difftest 44 101 122 200 -> PASS BIT-IDENTICAL (200 ticks, 440 cells, 218 components) — matches build-20.
+#
+# =====================================================================================
+# (2) DUAL-RAIL XOR GATE  (bit1.D = Q1 XOR Q0 = max(Q1-Q0, Qbar1-Qbar0))  — 4/4 truth + difftest-clean  ✅
+# =====================================================================================
+# build-17's dual-rail XOR, translated onto the floor (base 100,101,163), two subtract comparators facing a
+# shared merge, each fed TWO DISTINCT rails (no fanout crossover):
+#   comp_a 100,101,163 comparator[facing=west,subtract]  rear(99,163)=Q1  side-N(100,162)=Q0  out(101,163)=Q1-Q0
+#   comp_b 100,101,167 comparator[facing=west,subtract]  rear(99,167)=Qbar1 side-N(100,166)=Qbar0 out(101,167)=Qbar1-Qbar0
+#   merge column 102,101,163..167 (dust max); cleaning repeater 103,101,165[facing=west] -> XV (104,101,165)
+#   drivers (redstone_block y=102 over each input dust): Q1@99,102,163 Q0@100,102,162 Qbar1@99,102,167 Qbar0@100,102,166
+# TRUTH TABLE (live reads at XV=104,101,165), dual-rail drivers set per (Q1,Q0):
+#   (0,0)->XV=0 (LO)   (0,1)->XV=15 (HI)   (1,0)->XV=15 (HI)   (1,1)->XV=0 (LO)   = XOR, 4/4 correct.
+#   difftest 104 101 165 100 (HI, state 1,0) -> PASS BIT-IDENTICAL (100 ticks, 32 cells)
+#   difftest 104 101 165 100 (LO, state 1,1) -> PASS BIT-IDENTICAL (100 ticks, 32 cells)
+# => the exact bit1.D gate the self-advancing PC needs compiles BIT-FOR-BIT to vanilla on this jar, both states.
+#
+# =====================================================================================
+# (3) LIVE-RAIL DRIVE — the repeater tap ACTUALLY DRIVES a downstream comparator from the SELF-ADVANCING bit0 ✅ (NEW)
+# =====================================================================================
+# Prior builds proved the repeater tap PORT reads a clean 15 statically. build-21 proves the tap DRIVES a
+# real comparator correctly from the LIVE toggling rail — the integration mechanism, end to end:
+#   Qbar0 tap off feedback trunk (52,145): rep 52,146[facing=north] -> 52,147..150 -> clean rep 52,151 -> port 52,152
+#   haul EAST on z=152 (repeaters facing=west @66,80,93) then SOUTH x=97 (clean rep @97,161) to a comparator:
+#   comp_b' 100,101,170 comparator[facing=north,subtract]: rear-N(100,169)=Qbar1(driver HI), side-W(99,170)=Qbar0(LIVE),
+#     out-S(100,171) = 15 - Qbar0.
+# Toggling bit0 (clock.py), reading Qbar0(48,130) and comp_b'_out(100,171):
+#   Qbar0=15 -> out=0 ;  Qbar0=0 -> out=15   (4 cycles, out = 15 - Qbar0 = Q0, tracks the live rail cleanly)
+#   difftest 100 101 171 200 -> PASS BIT-IDENTICAL (200 ticks, 593 cells, 295 components)
+# PORT-DISCIPLINE confirmed the hard way: with the cleaning repeater NOT immediately at the comparator port
+#   the side input arrived attenuated to 5 -> out=15-5=10 (a WRONG "HI"); adding a re-amplifying repeater at
+#   the port (98,170)[facing=west] lifted the side to a clean 15 -> out=0/15 correct. This IS build-18/20's
+#   rule proven in an integrated context: a cleaning repeater must sit AT every comparator port.
+#
+# =====================================================================================
+# (4) HONEST STATUS — full 4-state self-advance + ROM walk NOT landed; the concrete blocker  (honest)
+# =====================================================================================
+# NOT reached in budget: the full physical 00->01->10->11->00 self-advance (bit1.D = XV wired to Master1.D
+# with all four register rails feeding one XOR) and the PC->ROM fetch walk. Two concrete blockers, both
+# now pinned to COORDINATES (this is the same "needs a wider platform" finding builds 16-19 named, confirmed
+# hands-on today):
+#   (a) INPUT PACKING of the compact dual-rail XOR: its four input dusts sit at 99-100 / 162-167, mutually
+#       adjacent (comp_a rear 99,163; comp_b rear 99,167; comp_a side 100,162; comp_b side 100,166). A hauled
+#       real rail cannot be wire-fed to ONE of them without an adjacency short into a neighbouring rear/side.
+#       (Driver blocks from y=102 above each dust avoid this — which is why (2) verifies with drivers, and (3)
+#       verifies a SINGLE spread-out comparator fed by a real rail — but not all four at once in the compact gate.)
+#   (b) bit0's Q0/Qbar0 are ENCLOSED by build-12's own forward (z=114 + x=41) and feedback (x=48 + z=145 + x=66)
+#       interconnects; only Qbar0 escapes (via the far-south trunk tap used in (3)). Q0 must be DERIVED (15-Qbar0)
+#       and bit1.D=XV must fan to Master1's TWO D-feed points (north ~101,118 and south ~102,135).
+#   The fix is a from-scratch WIDE-PLATFORM PC that brings Q0/Qbar0/Q1/Qbar1 out to a shared fan-out bus with
+#   spread comparator ports from the start (a build-11/12-scale layout effort), then: XV -> Master1.D (self-
+#   advance) and {Q1,Q0} -> build-15 ROM {a1,a0} (fetch walk).
+#
+# LANDED build-21 (all on this jar, all difftest BIT-IDENTICAL): bit0 physical self-advance (6 clean toggles,
+#   440 cells); dual-rail XOR gate 4/4 truth + both states (32 cells); and — NEW — the repeater tap DRIVING a
+#   downstream comparator correctly from the LIVE self-advancing rail (593 cells), with the port-discipline
+#   rule proven in-context. The remaining work is purely the wide-platform non-crossing fan-out routing.
+#
+# No feature patch was added — only test-harness/redstone-computer/.
