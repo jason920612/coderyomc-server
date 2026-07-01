@@ -1121,3 +1121,64 @@ dense return lane (same class as builds 16–21). The one-hot ROM fetch walk (ea
 column — no decoder) depends on the closed ring and was not reached. **The ring counter sidestepped the
 XOR-fanout death-loop and delivered a difftest-clean, physically-shifting one-hot PC.** No feature patch —
 only `test-harness/redstone-computer/`.
+
+## Rung 23 — CLOSED SELF-RECIRCULATING RING-PC + ONE-HOT ROM FETCH WALK (build-23-ring-pc.txt)
+
+**Lands the two things build-22 left open.** The 4 FFs + 3 shift links are build-22 verbatim; build-23 adds
+a corrected loop link `Q3->D0` and a decoder-less one-hot ROM. Generators: `build-23-gen_loop_close.py`,
+`build-23-gen_rom.py`; controller `build-23-ctl.py`; command streams `build-23-{loop-close,rom}.commands.txt`.
+
+**(1) The loop CLOSES — the ring self-recirculates forever, no driver ✅ THE MILESTONE.** build-22's
+"long-haul staleness" was **not** staleness: its loop reused the short-link invert (comparator `facing=east`,
+output exits WEST) and then hauled EAST back to stage0, so the eastward `fill west..east` **ran through and
+overwrote the comparator + its 15-source rear block** with plain dust — no inversion, so `D0 = Qbar3 = NOT Q3`
+(stuck high, ring fills `1000->1100->1110->1111`). difftest was still BIT-IDENTICAL because the degenerate
+wiring compiles identically to vanilla — the compiler was never at fault. **Fix A:** for an eastward haul the
+invert comparator must face **WEST** (rear 15-block on the WEST, output exits EAST) so the haul starts east of
+it and never overwrites it. **Fix B:** the ~110-cell return haul at re-amp-every-≤5 has ~22 repeaters
+(≥44 game-ticks delay) > one D-settle window, so `D0` lagged `Q3` and a **phantom** second `1` appeared — cured
+by **sparse** re-amp on the output haul (every 12 < the 15-cell decay limit, to minimise delay) + a **generous
+120-tick D pre-settle** (> total loop delay). (The ≤5 rule still governs the Qbar **drop** feeding the
+comparator side, where 15−Qbar *strength* matters.)
+
+| clock | Q0 Q1 Q2 Q3 |
+|-------|-------------|
+| init  | **1 0 0 0** |
+| clk 1 | **0 1 0 0** |
+| clk 2 | **0 0 1 0** |
+| clk 3 | **0 0 0 1** |
+| clk 4 | **1 0 0 0** (WRAP) |
+
+The one-hot `1` recirculates `1000->0100->0010->0001->1000` **forever** on the clock — no driver, nothing
+falling off, no phantom (probed all four Q's over 3+ full wraps). difftest whole closed ring: held `1000`,
+`difftest 44 101 122 200` → **PASS BIT-IDENTICAL (200 ticks, 2014 cells, 999 components, 26 chunks)**.
+
+**(2) One-hot ROM fetch WALK — no decoder ✅ THE CAPSTONE.** 4 words `Q0=100 Q1=110 Q2=011 Q3=001` (bits
+b2 b1 b0), `out_j = OR_i (Q_i AND word_i[j])`. Words chosen with the **consecutive-ones** property (each bit
+= an *adjacent* stage pair) so the one-hot OR-matrix routes with **zero wire crossings** in the single y=101
+plane. Each `Q_i` is **repeater-tapped** off its link's invert output and dropped **straight down** in its own
+x-column (columns 30 apart → never adjacent, no corridors). Each output bus = two re-amped half-lines from its
+two source columns meeting at a read cell; side **injector** repeaters (diode) read each column. Discovered
+physical rules: taps N of the loop haul cross it via a **Y-bridge** (dust climbs to y=103 over the haul and
+back; a landing dust after the down-ramp is mandatory); the flat-world **floor only reached z=165** — redstone
+south of it pops off, so extend the stone floor first; re-amp **every 4** on drops (bridge decay is severe);
+re-amp must **not** land on a bus tap row (injector side-read needs plain dust); long buses need **two-half**
+re-amp to stay above the HI threshold.
+
+| ring  | ROM out | word |
+|-------|---------|------|
+| 1000  | **100** | W0 ✅ |
+| 0100  | **110** | W1 ✅ |
+| 0010  | **011** | W2 ✅ |
+| 0001  | **001** | W3 ✅ |
+
+The ROM output **walks `100->110->011->001->100`** per clock, driven **only** by the recirculating one-hot PC
+(no driver, no decoder), clean for 3 full cycles. difftest whole ring + ROM (single connected region): held
+`1000`, `difftest 44 101 122 200` → **PASS BIT-IDENTICAL (200 ticks, 2548 cells, 1266 components, 39 chunks)**;
+held `0010`, `difftest -27 101 196 150` (from the ROM b0 read corner) → **PASS BIT-IDENTICAL (150 ticks, 2548
+cells)**.
+
+**This is the autonomous instruction-fetch heart of the CPU** — a difftest-clean self-recirculating one-hot
+program counter that walks a decoder-less ROM. Next CPU step: decode is trivial with one-hot (the ROM words
+ARE the micro-ops); add a register file + integrate the ALU/accumulator. No feature patch — only
+`test-harness/redstone-computer/`.

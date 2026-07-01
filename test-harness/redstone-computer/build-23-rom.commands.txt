@@ -1,0 +1,88 @@
+setblock 47 101 146 minecraft:repeater[facing=north]
+fill 47 101 147 47 101 156 minecraft:redstone_wire
+setblock 47 101 151 minecraft:repeater[facing=north]
+setblock 47 101 155 minecraft:repeater[facing=north]
+setblock 47 101 157 minecraft:stone
+setblock 47 102 157 minecraft:redstone_wire
+setblock 47 102 158 minecraft:stone
+setblock 47 103 158 minecraft:redstone_wire
+setblock 47 101 159 minecraft:stone
+setblock 47 102 159 minecraft:redstone_wire
+setblock 47 101 160 minecraft:redstone_wire
+setblock 47 101 161 minecraft:repeater[facing=north]
+fill 47 101 162 47 101 190 minecraft:redstone_wire
+setblock 47 101 166 minecraft:repeater[facing=north]
+setblock 47 101 170 minecraft:repeater[facing=north]
+setblock 47 101 174 minecraft:repeater[facing=north]
+setblock 47 101 178 minecraft:repeater[facing=north]
+setblock 47 101 182 minecraft:repeater[facing=north]
+setblock 47 101 186 minecraft:repeater[facing=north]
+setblock 17 101 146 minecraft:repeater[facing=north]
+fill 17 101 147 17 101 156 minecraft:redstone_wire
+setblock 17 101 151 minecraft:repeater[facing=north]
+setblock 17 101 155 minecraft:repeater[facing=north]
+setblock 17 101 157 minecraft:stone
+setblock 17 102 157 minecraft:redstone_wire
+setblock 17 102 158 minecraft:stone
+setblock 17 103 158 minecraft:redstone_wire
+setblock 17 101 159 minecraft:stone
+setblock 17 102 159 minecraft:redstone_wire
+setblock 17 101 160 minecraft:redstone_wire
+setblock 17 101 161 minecraft:repeater[facing=north]
+fill 17 101 162 17 101 193 minecraft:redstone_wire
+setblock 17 101 166 minecraft:repeater[facing=north]
+setblock 17 101 170 minecraft:repeater[facing=north]
+setblock 17 101 174 minecraft:repeater[facing=north]
+setblock 17 101 178 minecraft:repeater[facing=north]
+setblock 17 101 182 minecraft:repeater[facing=north]
+setblock 17 101 186 minecraft:repeater[facing=north]
+setblock 17 101 189 minecraft:repeater[facing=north]
+setblock -13 101 146 minecraft:repeater[facing=north]
+fill -13 101 147 -13 101 156 minecraft:redstone_wire
+setblock -13 101 151 minecraft:repeater[facing=north]
+setblock -13 101 155 minecraft:repeater[facing=north]
+setblock -13 101 157 minecraft:stone
+setblock -13 102 157 minecraft:redstone_wire
+setblock -13 102 158 minecraft:stone
+setblock -13 103 158 minecraft:redstone_wire
+setblock -13 101 159 minecraft:stone
+setblock -13 102 159 minecraft:redstone_wire
+setblock -13 101 160 minecraft:redstone_wire
+setblock -13 101 161 minecraft:repeater[facing=north]
+fill -13 101 162 -13 101 196 minecraft:redstone_wire
+setblock -13 101 166 minecraft:repeater[facing=north]
+setblock -13 101 170 minecraft:repeater[facing=north]
+setblock -13 101 174 minecraft:repeater[facing=north]
+setblock -13 101 178 minecraft:repeater[facing=north]
+setblock -13 101 182 minecraft:repeater[facing=north]
+setblock -13 101 186 minecraft:repeater[facing=north]
+setblock -13 101 189 minecraft:repeater[facing=north]
+setblock -13 101 194 minecraft:repeater[facing=north]
+setblock -41 101 159 minecraft:repeater[facing=north]
+fill -41 101 160 -41 101 196 minecraft:redstone_wire
+setblock -41 101 164 minecraft:repeater[facing=north]
+setblock -41 101 168 minecraft:repeater[facing=north]
+setblock -41 101 172 minecraft:repeater[facing=north]
+setblock -41 101 176 minecraft:repeater[facing=north]
+setblock -41 101 180 minecraft:repeater[facing=north]
+setblock -41 101 184 minecraft:repeater[facing=north]
+setblock -41 101 188 minecraft:repeater[facing=north]
+setblock -41 101 192 minecraft:repeater[facing=north]
+setblock 46 101 190 minecraft:repeater[facing=east]
+fill 32 101 190 45 101 190 minecraft:redstone_wire
+setblock 40 101 190 minecraft:repeater[facing=east]
+setblock 18 101 190 minecraft:repeater[facing=west]
+fill 19 101 190 32 101 190 minecraft:redstone_wire
+setblock 27 101 190 minecraft:repeater[facing=west]
+setblock 16 101 193 minecraft:repeater[facing=east]
+fill 2 101 193 15 101 193 minecraft:redstone_wire
+setblock 10 101 193 minecraft:repeater[facing=east]
+setblock -12 101 193 minecraft:repeater[facing=west]
+fill -11 101 193 2 101 193 minecraft:redstone_wire
+setblock -3 101 193 minecraft:repeater[facing=west]
+setblock -14 101 196 minecraft:repeater[facing=east]
+fill -27 101 196 -15 101 196 minecraft:redstone_wire
+setblock -19 101 196 minecraft:repeater[facing=east]
+setblock -40 101 196 minecraft:repeater[facing=west]
+fill -39 101 196 -27 101 196 minecraft:redstone_wire
+setblock -31 101 196 minecraft:repeater[facing=west]

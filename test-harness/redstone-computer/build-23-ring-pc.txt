@@ -1,0 +1,89 @@
+# coderyoMC redstone-computer MAP — RING-PC: CLOSED SELF-RECIRCULATING RING + ONE-HOT ROM FETCH WALK (build-23)
+#
+# Builds directly on build-22 (PR#75): the 4-stage one-hot ring counter that SHIFTS cleanly
+#   1000->0100->0010->0001 (difftest BIT-IDENTICAL, no driver, XOR-fanout blocker gone). build-22
+#   left TWO things open: (1) close the loop 0001->1000 (the ~110-cell return haul went "stale"),
+#   and (2) the one-hot ROM fetch walk. build-23 LANDS BOTH.
+#
+# JAR: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (patch-0020 compiler = origin/main; REUSED, not rebuilt).
+#   Boot -Dcoderyo.redstone.compile.enabled=true ; port 15568, RCON 25579, flat world, peaceful,
+#   doMobSpawning=false, randomTickSpeed=0. Placement + power reads over RCON; two-phase clock via
+#   redstone_block over the enable dusts, settled by GAME TICKS (`tick sprint N` polled on gametime).
+#   difftest: `coderyo redstone difftest <x> <y> <z> <t>` (op-gated), verdict from the server log
+#   "[redstone-difftest/live] PASS ... BIT-IDENTICAL".  Controller: build-23-ctl.py.
+# Convention (fork, calibrated): repeater/comparator[facing=D] => REAR/INPUT on side D, OUTPUT exits
+#   the OPPOSITE side.  A redstone_block over/beside a dust drives it to 15.
+#
+# =========================== (1) CLOSING THE RING LOOP  Q3 -> D0  ✅ THE MILESTONE ==========================
+# The 4 FFs + 3 short shift links are build-22 VERBATIM (build-22-gen_ring.py: floor/ffs/links).  The loop
+# link Q3->D0 is a fresh generator, build-23-gen_loop_close.py (produces build-23-loop-close.commands.txt).
+#
+# ROOT CAUSE of build-22's "long-haul staleness" — it was NOT staleness. build-22's loop reused link()'s
+#   invert (comparator[facing=east], OUTPUT exits WEST) and then hauled the signal EAST back to stage0. The
+#   eastward haul `fill west..east` RAN THROUGH the comparator's own cell and its 15-source rear block,
+#   OVERWRITING both with plain dust. With no comparator there is no inversion: D0 = Qbar3 (NOT Q3), which
+#   is stuck HIGH whenever Q3=0 -> the ring fills 1000->1100->1110->1111 (or, with the harness mis-cutting
+#   the loop, the '1' falls off). difftest was still BIT-IDENTICAL because the *degenerate* wiring compiles
+#   identically to vanilla — the compiler was never at fault.
+# FIX A (invert orientation): for an EASTWARD haul the invert comparator must face WEST (rear 15-block on
+#   the WEST, OUTPUT exits EAST) so the haul starts EAST of the comparator and never overwrites it.
+#   Loop invert @(-42,101,158) comparator[facing=west,subtract]; rear 15-block @(-43,158) placed AFTER the
+#   comparator (re-evaluates its rear each clock); side(north)=Qbar3 drop @(-42,157); OUT east @(-41,158).
+# FIX B (delay, not strength): the ~110-cell return haul with re-amp every <=5 has ~22 repeaters
+#   (>=44 game-ticks of delay) — MORE than one D-settle window, so D0 lagged Q3 by >1 clock and a PHANTOM
+#   second '1' appeared. Cure = SPARSE re-amp on the OUTPUT haul (every 12 < the 15-cell dust-decay limit)
+#   to MINIMISE repeater delay + a GENEROUS D pre-settle (120 game-ticks, > total loop-haul delay) so D0
+#   fully settles to the current Q3 before phi1. (The <=5 re-amp rule still applies to the Qbar DROP feeding
+#   the comparator SIDE, where signal STRENGTH — 15-Qbar — is what matters.)  Isolating 1-dust Qbar stub as
+#   in build-22 (a repeater rear directly on the Qbar rail unbalances the cross-coupled latch).
+#
+# RESULT — self-recirculation (clock.py two-phase, D0 RELEASED, NO driver):
+#     init  1000 ; clk-> 0100 -> 0010 -> 0001 -> 1000 -> 0100 -> 0010 -> 0001 -> 1000 -> ...  (3+ full wraps)
+#   The one-hot '1' recirculates 1000->0100->0010->0001->1000 FOREVER on the clock — no driver, nothing
+#   falling off, no phantom.  Probed all four Q's every clock.  (init: cut the loop invert's 15-source
+#   @(-43,158), flush D0=0 x6, inject D0=1 for one clock, restore the 15-source.)
+# RESULT — difftest (whole closed ring, single-region):
+#   held 1000, difftest 44 101 122 200 -> PASS BIT-IDENTICAL (200 ticks, 2014 cells, 999 components, 26 chunks)
+#
+# ============================ (2) ONE-HOT ROM FETCH WALK (NO decoder)  ✅ THE CAPSTONE ============================
+# Generator build-23-gen_rom.py (produces build-23-rom.commands.txt).  4 words, one-hot select, diode-OR:
+#   Q0=100  Q1=110  Q2=011  Q3=001   (bits b2 b1 b0)   =>   output_j = OR over i of (Q_i AND word_i[j])
+#   => b2 driven by {Q0,Q1}, b1 by {Q1,Q2}, b0 by {Q2,Q3}.  Words chosen with the CONSECUTIVE-ONES property
+#   so the one-hot OR-matrix routes with ZERO wire crossings in the single y=101 plane (each bit = an
+#   ADJACENT stage pair -> its bus spans only between two adjacent columns and crosses no other column).
+# Q_i is repeater-TAPPED off each link's invert output (=Q_i): Q0@(47,145) Q1@(17,145) Q2@(-13,145)
+#   Q3@(-41,158) and dropped STRAIGHT DOWN in its own x-column (columns are the tap x's, 30 apart -> never
+#   adjacent, no corridors, no crossing).  Each bus (z=190/193/196) = two re-amped half-lines from its two
+#   source columns meeting at a central read cell; side injector repeaters (diode) read each column.
+# PHYSICAL RULES discovered wiring the ROM (all e2e, probed):
+#   - The ROM sits SOUTH of the ring; Q0/Q1/Q2 taps are NORTH of the loop haul (z=158). Two dust lines
+#     CANNOT cross in one y-plane, so each crossing uses a Y-BRIDGE: the tap dust climbs to y=103 over the
+#     haul dust and back down (stone supports @y101/157, y102/158, y101/159); the haul stays plain wire.
+#     A one-cell LANDING dust (x,101,160) after the down-ramp is mandatory (the bridge exits at y102/159).
+#   - The flat world's FLOOR only reached z=165; redstone at z>165 has no support and POPS OFF -> extend
+#     the stone floor to z=205 first (silent failure otherwise: `fill` "succeeds" then the wire vanishes).
+#   - Cumulative decay over bridge+haul is severe: re-amp every 4 cells on the vertical drops (+ a re-amp
+#     right after each bridge) or the signal dies before the bus.
+#   - A re-amp repeater must NOT land on a bus tap row (190/193/196): the injector side-reads the column
+#     there and a repeater has no side output -> nudge re-amp off those rows (keep plain dust).
+#   - Long OR buses decay below the HI threshold at the midpoint -> build each bus as two re-amped
+#     half-lines meeting at the read cell (a plain single-ended dust bus reads ~2 at 13 cells).
+#
+# RESULT — the ROM output WALKS with the ring, driven ONLY by the recirculating one-hot PC (no driver, no
+#   decoder), probed at the three bus read cells b2@(32,190) b1@(2,193) b0@(-27,196):
+#     ring 1000 -> ROM 100   (word0)
+#     ring 0100 -> ROM 110   (word1)
+#     ring 0010 -> ROM 011   (word2)
+#     ring 0001 -> ROM 001   (word3)
+#     ring 1000 -> ROM 100   ... repeats cleanly for 3 full cycles (12 clocks).
+# RESULT — difftest (whole ring + ROM, single connected region, single-region=true):
+#   held 1000, difftest 44 101 122 200      -> PASS BIT-IDENTICAL (200 ticks, 2548 cells, 1266 components, 39 chunks)
+#   held 0010, difftest -27 101 196 150      -> PASS BIT-IDENTICAL (150 ticks, 2548 cells)  [from the ROM b0 read corner]
+#
+# ================================ SUMMARY ================================
+# The ring loop CLOSES and self-recirculates 1000->0100->0010->0001->1000 forever with NO driver, difftest
+# BIT-IDENTICAL — and it drives a decoder-less one-hot ROM whose output WALKS W0->W1->W2->W3->W0 per clock,
+# also difftest BIT-IDENTICAL. This is the autonomous instruction-fetch heart of the CPU. The build-22
+# "long-haul staleness" was a fill-overwrite bug in the loop generator (no inversion) compounded by
+# loop-haul delay > D-settle; fixed by west-facing invert + sparse-reamp haul + generous pre-settle.
+# No feature patch was added — only test-harness/redstone-computer/.
