@@ -504,3 +504,63 @@ accumulator — the datapath core** a CPU is built from. (The literal 2-bit `0�
 5. From the accumulator: a **control unit** (clock/step + opcode), **instruction memory**
    (torch-ROM addressed by a program counter = a counting register), **decode** (opcode → enable
    lines), and a small **register file** (several build-09 registers) — the minimal CPU.
+
+## Rung 4 — ALU OP-SELECT CORE: XOR operator + 2:1 mux (build-13) — both difftest-clean ✅ (integration pending)
+
+Toward the 4-bit ALU (the CPU **compute core**). This build lands and BIT-IDENTICAL-validates the
+two hardest-to-route primitives the op-select ALU is assembled from — a logic **operator** gadget
+and the **multiplexer** that routes the selected operation to the output — and re-confirms the
+comparator convention empirically on this jar. It stops HONESTLY short of a fully-wired ALU: the
+operators and the mux are each difftest-clean, but the operator→mux interconnect (dense comparator
+ports; wants spaced lanes) was not routed in budget.
+
+**Convention re-confirmed EMPIRICALLY this run (the "facing probe").** A single comparator was
+built and read: `redstone_block` west of `comparator[facing=west]`, output dust to the east read
+**power 15** (`fill 96 100 96 180 100 140 stone` floor first — dust with no support pops). So
+`facing=D` ⇒ REAR/INPUT on side D, OUTPUT exits the opposite side (subtract: `out = rear −
+max(sides)`). This matches every prior build and removed all guesswork before laying comparators.
+
+**Harness finding (supersedes the build-10 note): `/coderyo redstone difftest` runs straight from
+the server CONSOLE (stdin).** The operator console is permission level 4, which satisfies the
+command's `LEVEL_GAMEMASTERS` gate — no impulse `command_block` was needed. The persistent server
+was driven by `tail -f cmds.txt | java …`, so each `difftest` was issued by appending to `cmds.txt`
+and its verdict read from the log line `[redstone-difftest/live] PASS … BIT-IDENTICAL`. (The earlier
+command_block requirement was an RCON limitation, not a console one.)
+
+**(1) XOR OPERATOR** — two subtract comparators facing each other into a shared merge cell
+(`comp1 = A−B`, `comp2 = B−A`, merge = `|A−B|`). Output/seed `(101,101,100)`.
+
+| A B | XV = A XOR B | | A B | XV |
+|-----|------|--|-----|------|
+| 1 0 | **15** | | 1 1 | **0** |
+| 0 1 | **15** | | 0 0 | **0** |
+
+All 4 combos correct (live power read). **difftest `101 101 100 100` → BIT-IDENTICAL (100 ticks,
+14 cells), 0 divergences.**
+
+**(2) 2:1 OP-SELECT MULTIPLEXER** — `out = (D0−S0) OR (D1−S1)` with a **dual-rail one-hot-LOW**
+opcode: to select operand k, drive its select rail `Sk=0` and the other rail `=1`. Seed/read
+`(123,101,122)`.
+
+| select | D0 D1 | OUT | meaning |
+|--------|-------|-----|---------|
+| D0 (S0=0,S1=1) | 1 0 | **12** | D0 passed (12 = 15 attenuated over the OR merge) |
+| D1 (S0=1,S1=0) | 0 1 | **12** | D1 passed |
+| D0 (S0=0,S1=1) | 0 1 | **0**  | **ISOLATION: non-selected HIGH operand blocked** |
+
+Selection + isolation both correct. **difftest `123 101 122 100` → BIT-IDENTICAL (100 ticks, 28
+cells), 0 divergences.** (First attempt used a single-rail select with an on-board `NOT(S)` gadget;
+its output cell was adjacent to the D1 rear and **shorted** — power read caught `g1=9` where 0 was
+expected. Dual-rail select removes the on-board NOT and the short — and is exactly how a real opcode
+**decoder** feeds a mux: one-hot select lines. A power read localized the bug in one probe; no
+difftest was needed to find it.)
+
+**Honest status.** The op-select **mux** (the ALU's operation-router) and a logic **operator** (XOR)
+are each **difftest-clean and functionally verified**; the ADD path already exists difftest-clean as
+the build-08 2-bit ripple adder. What remains for a full ALU is **integration**: drive the mux rears
+from the *real* operator outputs (D0←XOR, D1←AND/OR/ADD-sum), stack two 2:1 muxes (or one 4:1) per
+output bit under a 2-bit opcode decoded to one-hot select rails, and ripple the ADD across bit
+slices. That is collision-free **routing** work (operator→mux interconnect through dense comparator
+clusters — the build-12 lane discipline applies), not new logic: every constituent is proven
+BIT-IDENTICAL. This build did **not** reach a selectable ADD+logic ALU output; it validated the two
+pillars that make one assemblable. **No feature patch was added — only `test-harness/redstone-computer/`.**

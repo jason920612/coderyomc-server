@@ -1,0 +1,79 @@
+# coderyoMC redstone-computer MAP — ALU op-select core: XOR operator + 2:1 MUX.
+#
+# Toward the 4-bit ALU (the CPU compute core). This build lands the two hardest-to-
+# get-right primitives the ALU is assembled from and validates each BIT-IDENTICAL to
+# vanilla with `/coderyo redstone difftest`:
+#   (1) a comparator-XOR OPERATOR gadget (one ALU logic op), and
+#   (2) a 2:1 op-select MULTIPLEXER (the element that routes the chosen operation's
+#       result to the ALU output — a 4:1 op-select is two layers of these).
+#
+# CONVENTION (re-confirmed EMPIRICALLY on this jar this run — see RESULTS.md "facing
+# probe"): comparator/repeater[facing=D] => REAR/INPUT is on side D; OUTPUT exits the
+# OPPOSITE side; the two perpendicular cells are the SIDES. SUBTRACT comparator:
+#   out = max(0, rear - max(sideL, sideR)).
+# A redstone_block placed ONE BLOCK ABOVE a dust (y+1) drives that dust to 15 (=1);
+# remove it -> 0. Those driver blocks are in the network footprint and are RE-READ live
+# each tick by the difftest harness (they are its external INPUT nodes).
+#
+# Platform: y=100 stone floor, y=101 logic, y=102 input drivers.
+# Boot -Dcoderyo.redstone.compile.enabled=true on port 15568, then:
+#   forceload add 96 96 180 140
+#   fill 96 100 96 180 100 140 minecraft:stone
+#   fill 96 101 96 180 103 140 minecraft:air
+# NOTE: on this run `/coderyo redstone difftest` ran fine straight from the server
+# CONSOLE (stdin) — the operator console is permission level 4, which satisfies the
+# command's LEVEL_GAMEMASTERS gate; no command_block impulse was needed. Verdict is read
+# from the server log line `[redstone-difftest/live] PASS ... BIT-IDENTICAL`.
+
+# ============================ (1) XOR OPERATOR  out = |A-B| ============================
+# Two SUBTRACT comparators facing each other into one shared merge cell (101,100):
+#   comp1 = A - B  (rear=A, side=B) ; comp2 = B - A  (rear=B, side=A) ; merge = |A-B|.
+# For 0/15 inputs |A-B| = 15 iff A!=B (XOR).  Output/seed = (101,101,100).
+setblock 100 101 100 minecraft:comparator[facing=west,mode=subtract]
+setblock 102 101 100 minecraft:comparator[facing=east,mode=subtract]
+setblock 99  101 100 minecraft:redstone_wire   # A  (rear of comp1)
+setblock 102 101 101 minecraft:redstone_wire   # A  (side of comp2)
+setblock 103 101 100 minecraft:redstone_wire   # B  (rear of comp2)
+setblock 100 101 101 minecraft:redstone_wire   # B  (side of comp1)
+setblock 101 101 100 minecraft:redstone_wire   # XV = |A-B| = A XOR B   (OUTPUT / difftest seed)
+# Drivers (y=102):  A over (99,100) & (102,101) ;  B over (103,100) & (100,101).
+#   VERIFIED truth table (live power read at 101,101,100):
+#     A B -> XV :  1 0 -> 15 ,  0 1 -> 15 ,  1 1 -> 0 ,  0 0 -> 0   (= XOR, all 4)
+#   difftest 101 101 100 100  ->  BIT-IDENTICAL (100 ticks, 14 cells), 0 divergences.
+
+# ============================ (2) 2:1 OP-SELECT MULTIPLEXER ============================
+# out = (D0 gated by select-rail S0) OR (D1 gated by select-rail S1), one-hot LOW select:
+#   g0 = D0 - S0   (rear=D0, side=S0)  -> passes D0 when S0=0
+#   g1 = D1 - S1   (rear=D1, side=S1)  -> passes D1 when S1=0
+#   OUT = OR(g0,g1)  (dust merge on the x=123 column)  ->  seed/read (123,101,122)
+# The opcode is supplied DUAL-RAIL (S0,S1): to select operand k, drive Sk=0 and the
+# other select rail=1. (Dual-rail avoids an on-board NOT gadget whose output cell
+# collided with the D1 rear — the first single-rail attempt shorted there; dual-rail is
+# the clean fix and is how a real opcode decoder feeds a mux anyway: one-hot select lines.)
+setblock 121 101 120 minecraft:comparator[facing=west,mode=subtract]   # g0 = D0 - S0
+setblock 120 101 120 minecraft:redstone_wire   # D0  (rear of g0)
+setblock 121 101 121 minecraft:redstone_wire   # S0  (side of g0 = select rail 0)
+setblock 122 101 120 minecraft:redstone_wire   # g0 out
+setblock 121 101 124 minecraft:comparator[facing=west,mode=subtract]   # g1 = D1 - S1
+setblock 120 101 124 minecraft:redstone_wire   # D1  (rear of g1)
+setblock 121 101 123 minecraft:redstone_wire   # S1  (side of g1 = select rail 1)
+setblock 122 101 124 minecraft:redstone_wire   # g1 out
+setblock 123 101 120 minecraft:redstone_wire   # OR merge column x=123 ...
+setblock 123 101 121 minecraft:redstone_wire
+setblock 123 101 122 minecraft:redstone_wire   # OUT  (difftest seed / read cell)
+setblock 123 101 123 minecraft:redstone_wire
+setblock 123 101 124 minecraft:redstone_wire
+# Drivers (y=102):  D0 over (120,120) ; D1 over (120,124) ; S0 over (121,121) ; S1 over (121,123).
+#   VERIFIED live (power read at 123,101,122):
+#     select D0 (S0=0,S1=1), D0=1,D1=0  -> OUT = 12  (D0 passed; 12 = 15 attenuated over the merge)
+#     select D1 (S0=1,S1=0), D0=0,D1=1  -> OUT = 12  (D1 passed)
+#     select D0 (S0=0,S1=1), D0=0,D1=1  -> OUT = 0   (ISOLATION: non-selected HIGH operand blocked)
+#   difftest 123 101 122 100  ->  BIT-IDENTICAL (100 ticks, 28 cells), 0 divergences.
+#
+# NEXT (documented, not yet wired): replace D0/D1 with real operator outputs — D0<-XOR,
+# D1<-AND/OR/ADD-sum — and stack two 2:1 muxes (or one 4:1) driven by a 2-bit opcode
+# decoded to one-hot select rails, per output bit; ripple the ADD across bit slices
+# (build-08). The op-select MUX and the operators are each difftest-clean HERE; the
+# remaining work is collision-free ROUTING of each operator's output into the mux rears
+# (the comparator ports sit in dense clusters, so operator->mux interconnect wants its
+# own spaced lanes — the same routing discipline build-12 used for the accumulator).
