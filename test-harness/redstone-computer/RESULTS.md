@@ -563,4 +563,85 @@ output bit under a 2-bit opcode decoded to one-hot select rails, and ripple the 
 slices. That is collision-free **routing** work (operator→mux interconnect through dense comparator
 clusters — the build-12 lane discipline applies), not new logic: every constituent is proven
 BIT-IDENTICAL. This build did **not** reach a selectable ADD+logic ALU output; it validated the two
-pillars that make one assemblable. **No feature patch was added — only `test-harness/redstone-computer/`.**
+pillars that make one assemblable. **This build did not reach a selectable ADD+logic ALU output; it validated the two
+pillars that make one assemblable.** **No feature patch was added — only `test-harness/redstone-computer/`.**
+
+## Rung 5 — INTEGRATED 2-BIT OPCODE-SELECTABLE ALU (build-14) — difftest BIT-IDENTICAL ✅
+
+The integration build-13 stopped short of: real operator outputs routed **through a real opcode-decoded
+select into a mux, per output bit**, difftest-clean. **build-14 wires it.** This is the CPU **compute core
+integrated** — the pillars from build-13 (an operator + a 2:1 op-select mux) are no longer separate; they
+form **one selectable ALU output** validated BIT-IDENTICAL over the whole connected network, per opcode.
+
+```
+  OUT_i = MUX( XOR(A_i,B_i), AND(A_i,B_i) ; op )     for bit i in {0,1}
+  op = 0  ->  ALU result = A XOR B   (per bit)
+  op = 1  ->  ALU result = A AND B   (per bit)
+```
+
+**2 operations (XOR, AND), 1-bit opcode, 2-bit datapath A[1:0],B[1:0].** XOR and AND are per-bit
+COMBINATIONAL (no carry), so bit0 and bit1 are independent symmetric slices — the clean starting point
+the FLOOR PLAN prescribed. Each slice is self-contained: **{ XOR operator, AND operator, 1→2 NOT-gate
+decoder, 2:1 one-hot-LOW mux }**. Bit1 is the bit0 slice with every z +20 (≥2-cell clear gap in the dense
+x=231/232 mux column → zero cross-talk). Full geometry + coords in `build-14-alu-integrated-2bit.txt`.
+
+**Integration pieces wired (all NEW this build):**
+- **operator → mux-rear routing** on spaced lanes (XV0 lane z=208, AN0 lane z=220 — 12 apart), each
+  ending in a cleaning repeater that refreshes the operator output to 15 at the mux gate rear;
+- a **1→2 opcode DECODER**: a real NOT gate produces `S_and = ¬op`; the other one-hot-LOW rail
+  `S_xor = op` is the opcode line itself (dual-rail one-hot select — exactly build-13's note), feeding
+  the two mux gate SIDES;
+- the **2:1 mux per bit** (`g_xor = XV_i − S_xor`, `g_and = AN_i − S_and`, `OUT_i = OR`).
+
+**Per-bit truth matrix** (bit0 @232,101,214 and bit1 @232,101,234, identical; power 9 = logical 1
+attenuated across the OR-merge column):
+
+| op | 00 | 01 | 10 | 11 | = |
+|----|----|----|----|----|---|
+| 0 (XOR) | 0 | 1 | 1 | 0 | A XOR B |
+| 1 (AND) | 0 | 0 | 0 | 1 | A AND B |
+
+Both **isolation** directions verified live: the NON-selected HIGH operand is blocked to 0 at OUT.
+
+**2-bit ALU showcase** (both output bits read):
+
+| op | operation | result | OUT1 OUT0 |
+|----|-----------|--------|-----------|
+| 1 | AND  11(3) & 10(2) | 10(2) | 1 0 ✅ |
+| 0 | XOR  11(3) ^ 01(1) | 10(2) | 1 0 ✅ |
+| 1 | AND  11 & 11       | 11    | 1 1 ✅ |
+| 0 | XOR  11 ^ 11       | 00    | 0 0 ✅ |
+
+**difftest** (`/coderyo redstone difftest <OUT_i> 100`, from the server console, verdict from the log)
+over the **whole connected slice** (operators + decoder + mux):
+
+| case | seed | verdict |
+|------|------|---------|
+| bit0 op=0/XOR (A=1,B=0) | 232 101 214 | **BIT-IDENTICAL (100t, 105 cells)** |
+| bit0 op=1/AND (A=1,B=1) | 232 101 214 | **BIT-IDENTICAL (100t, 110 cells)** |
+| bit0 op=0/XOR (A=1,B=1) — AND-operand isolation | 232 101 214 | **BIT-IDENTICAL (100t, 108 cells)** |
+| 2-bit AND — OUT0 / OUT1 | 232 101 214 / 232 101 234 | **BIT-IDENTICAL (107 / 110 cells)** |
+| 2-bit XOR — OUT0 / OUT1 | 232 101 214 / 232 101 234 | **BIT-IDENTICAL (108 / 105 cells)** |
+
+**7 / 7 difftests BIT-IDENTICAL, 0 divergences.** The ~105-cell footprint per difftest confirms each
+seed detects the ENTIRE slice (both operators + decoder + mux) as one connected network — this is a
+genuinely *integrated* ALU, not co-located pieces.
+
+**Opcodes that route cleanly: BOTH (op=0→XOR, op=1→AND), on BOTH bits.** The integrated,
+difftest-clean, opcode-SELECTABLE ALU output is the milestone build-13 named and did not reach.
+
+**Routing lesson (build-12/13 discipline, re-learned live).** The first attempt spaced the XOR and AND
+clusters only 2 apart in z (206 / 210): the XOR-output exit lane at z=208 ran orthogonally adjacent to
+the AND cluster's A0-input dust at (223,209) → the AND rear (15) **shorted** into the XOR output lane and
+leaked to OUT even when XOR was selected. A single power read localized it (XV merge read 12 where
+XOR(1,1)=0 was expected). **Fix:** relocate the AND slice to z=217-219 so the two operator→mux lanes are
+12 cells apart with ≥2 empty cells from every driver. No logic/compiler fault — pure lane spacing.
+
+**Honest scope.** 2 ops (XOR, AND) — both per-bit logic. **ADD was NOT folded in**: the build-08 ripple
+adder is ~600 cells and routing its SUM/Cout into the mux under budget was the large risk the anti-stall
+guidance said to avoid; the integration milestone is equally proven by XOR+AND. **Next operators**
+(documented in build-14): fold in **OR** (widen to a 2-bit opcode + 2:4 active-low one-hot decoder, 4:1
+mux per bit) and **ADD** (route the difftest-clean build-08 SUM_i into the mux data rears — collision-free
+routing, no new logic). Then latch OUT into an accumulator (build-11 edge-triggered register) and drive
+the opcode from an instruction ROM addressed by a program counter → the minimal CPU. **No feature patch
+was added — only `test-harness/redstone-computer/`.**

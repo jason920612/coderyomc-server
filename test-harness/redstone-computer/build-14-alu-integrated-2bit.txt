@@ -1,0 +1,136 @@
+# coderyoMC redstone-computer MAP — INTEGRATED 2-BIT OPCODE-SELECTABLE ALU (XOR / AND).
+#
+# The integration build-13 documented as "next, not yet wired": real operator outputs
+# routed THROUGH a real opcode-decoded select into a mux, per output bit, difftest-clean.
+# build-13 had the two pillars (an XOR operator + a 2:1 op-select mux) each difftest-clean
+# but SEPARATE. THIS build wires them into ONE selectable ALU output and difftests the whole
+# connected network per output bit, for each opcode:
+#
+#   OUT_i = MUX( XOR(A_i,B_i), AND(A_i,B_i) ; op )        for bit i in {0,1}
+#   op = 0 -> ALU result = A XOR B   (per bit)
+#   op = 1 -> ALU result = A AND B   (per bit)
+#
+# 2 operations (XOR, AND) selected by a 1-bit opcode, over a 2-bit datapath A[1:0],B[1:0].
+# XOR and AND are per-bit COMBINATIONAL (no carry) so bit0 and bit1 are independent symmetric
+# slices — the clean starting point the FLOOR PLAN prescribed (spaced lanes, no shared-y
+# crossings). Each slice is a self-contained { XOR op, AND op, NOT-gate decoder, 2:1 mux }.
+# (ADD via the build-08 ripple adder + OR are the documented next operators — see END.)
+#
+# CONVENTION (re-confirmed live this run, all four gadgets): comparator[facing=D] => REAR/
+# INPUT on side D, OUTPUT exits the OPPOSITE side; the two perpendicular cells are the SIDES.
+# SUBTRACT comparator out = max(0, rear - max(sideL,sideR)). A redstone_block ONE BLOCK ABOVE
+# a dust drives it to 15; those driver blocks are in the network footprint and are the difftest's
+# live external INPUT nodes. A logical input feeding several gadgets is REPLICATED as several
+# co-driven driver cells (build-08 convention) so each gadget is self-contained with NO
+# inter-lane operand wiring — the only inter-lane wires are operator-output -> mux-rear lanes
+# and decoder -> mux-side select rails.
+#
+# Platform: y=100 stone floor, y=101 logic, y=102 input drivers.
+# Boot -Dcoderyo.redstone.compile.enabled=true on port 15568, then:
+#   forceload add 192 192 288 256
+#   fill 196 100 196 284 100 252 minecraft:stone
+#   fill 196 101 196 284 104 252 minecraft:air
+# difftest runs straight from the server CONSOLE (stdin) — console is permission level 4 which
+# satisfies LEVEL_GAMEMASTERS; verdict from the log line `[redstone-difftest/live] PASS ...`.
+# Live power was READ with `execute if block <p> minecraft:redstone_wire[power=N] run say` (the
+# wire's `power` blockstate; `data get block` fails on a wire — it is not a block entity).
+
+# ============================ BIT-0 SLICE (z = 205..223) ============================
+# ----- XOR0 operator:  XV0 = |A0-B0|  (two subtract comps -> shared merge 223,206) -----
+setblock 222 101 206 minecraft:comparator[facing=west,mode=subtract]   # comp1 = A0 - B0
+setblock 224 101 206 minecraft:comparator[facing=east,mode=subtract]   # comp2 = B0 - A0
+setblock 221 101 206 minecraft:redstone_wire   # A0  (rear of comp1)
+setblock 225 101 206 minecraft:redstone_wire   # B0  (rear of comp2)
+setblock 222 101 205 minecraft:redstone_wire   # B0  (NORTH side of comp1)
+setblock 224 101 205 minecraft:redstone_wire   # A0  (NORTH side of comp2)   [both sides NORTH -> south exit free]
+setblock 223 101 206 minecraft:redstone_wire   # XV0 = A0 XOR B0  (merge)
+setblock 223 101 207 minecraft:redstone_wire   # south exit stub
+# XV0 lane -> g_xor rear (lane z=208, cleaning repeater at the mux rear)
+setblock 223 101 208 minecraft:redstone_wire
+setblock 224 101 208 minecraft:redstone_wire
+setblock 225 101 208 minecraft:redstone_wire
+setblock 226 101 208 minecraft:redstone_wire
+setblock 227 101 208 minecraft:redstone_wire
+setblock 228 101 208 minecraft:redstone_wire
+setblock 229 101 208 minecraft:repeater[facing=west]   # clean-refresh XV0 to 15 at mux rear
+setblock 230 101 208 minecraft:redstone_wire           # g_xor rear
+# ----- AND0 operator:  AN0 = A0 AND B0  (build-01 AND: NOT(B0) then A0 - NOT(B0)) -----
+setblock 220 101 218 minecraft:redstone_block   # 15 source (rear of comp1)
+setblock 221 101 218 minecraft:comparator[facing=west,mode=subtract]   # comp1 = 15 - B0 = NOT(B0)
+setblock 221 101 217 minecraft:redstone_wire   # B0  (NORTH side of comp1)
+setblock 222 101 218 minecraft:redstone_wire   # NOT(B0)
+setblock 223 101 218 minecraft:comparator[facing=north,mode=subtract]  # comp2 = A0 - NOT(B0)
+setblock 223 101 217 minecraft:redstone_wire   # A0  (rear=NORTH of comp2)
+setblock 223 101 219 minecraft:redstone_wire   # AN0 = A0 AND B0  (south out)
+# AN0 lane -> g_and rear (lane z=220, spaced 12 cells from XV0 lane -> no cross-talk)
+setblock 223 101 220 minecraft:redstone_wire
+setblock 224 101 220 minecraft:redstone_wire
+setblock 225 101 220 minecraft:redstone_wire
+setblock 226 101 220 minecraft:redstone_wire
+setblock 227 101 220 minecraft:redstone_wire
+setblock 228 101 220 minecraft:redstone_wire
+setblock 229 101 220 minecraft:repeater[facing=west]   # clean-refresh AN0 to 15 at mux rear
+setblock 230 101 220 minecraft:redstone_wire           # g_and rear
+# ----- 2:1 op-select MUX:  OUT0 = (XV0 - S_xor) OR (AN0 - S_and) ----- (one-hot-LOW select)
+setblock 231 101 208 minecraft:comparator[facing=west,mode=subtract]   # g_xor = XV0 - S_xor
+setblock 232 101 208 minecraft:redstone_wire   # g_xor out
+setblock 231 101 207 minecraft:redstone_wire   # S_xor side (= opcode line, driven direct)
+setblock 231 101 220 minecraft:comparator[facing=west,mode=subtract]   # g_and = AN0 - S_and
+setblock 232 101 220 minecraft:redstone_wire   # g_and out
+setblock 231 101 221 minecraft:redstone_wire   # S_and side (= NOT-gate output below)
+fill    232 101 208 232 101 220 minecraft:redstone_wire   # OR merge column; OUT0 read @ 232,101,214
+# ----- 1->2 opcode DECODER (NOT gate): S_xor = op, S_and = NOT(op) -----
+setblock 231 101 222 minecraft:comparator[facing=south,mode=subtract]  # NOT = 15 - op -> S_and
+setblock 231 101 223 minecraft:redstone_block   # 15 source (rear=SOUTH of NOT)
+setblock 230 101 222 minecraft:redstone_wire    # op  (WEST side of NOT)
+# BIT-0 driver cells (redstone_block @ y=102 over the dust; place=1, remove=0):
+#   A0 : (221,206)(224,205)(223,217)     B0 : (225,206)(222,205)(221,217)
+#   op : (231,207)  and  (230,222)   [replicated: g_xor select side + NOT-gate op side]
+# OUT0 read/difftest seed = (232,101,214).
+
+# ============================ BIT-1 SLICE (z = 225..243) ============================
+# EXACT copy of the bit-0 slice with every z coordinate +20 (>=2-cell clear gap from bit-0 in the
+# dense x=231/232 mux column -> zero cross-talk). Operates on A1,B1 with the SAME opcode op.
+#   XOR1 comps (222,226)W (224,226)E ; XV1 merge (223,226) ; XV1 lane z=228 -> rep (229,228) -> (230,228)
+#   AND1 src (220,238) comp1 (221,238)W comp2 (223,238)N ; AN1 (223,239) ; AN1 lane z=240 -> rep (229,240) -> (230,240)
+#   g_xor (231,228)W out (232,228) S_xor (231,227) ; g_and (231,240)W out (232,240) S_and (231,241)
+#   OR merge  fill 232 101 228 232 101 240   ; OUT1 read @ (232,101,234)
+#   NOT gate (231,242)S  src (231,243)  op-side (230,242)
+# BIT-1 driver cells:
+#   A1 : (221,226)(224,225)(223,237)     B1 : (225,226)(222,225)(221,237)
+#   op : (231,227)  and  (230,242)
+# OUT1 read/difftest seed = (232,101,234).
+
+# ================================ VALIDATION (port 15568, compiler ON) ================================
+# Live power read at OUT_i (9 = logical 1 attenuated across the OR-merge column; 0 = logical 0).
+# Per-bit truth matrix (bit0 @232,101,214 and bit1 @232,101,234 identical), all 8 (A,B,op):
+#     op=0 (XOR): 00->0  01->1  10->1  11->0        op=1 (AND): 00->0  01->0  10->0  11->1
+#   Both isolation directions verified: the NON-selected HIGH operand is blocked to 0 at OUT.
+# 2-bit ALU showcase operations (both output bits read):
+#     AND  A=11(3) & B=10(2) = 10(2)   -> OUT1=1 OUT0=0   CORRECT
+#     XOR  A=11(3) ^ B=01(1) = 10(2)   -> OUT1=1 OUT0=0   CORRECT
+#     AND  A=11    & B=11    = 11       -> OUT1=1 OUT0=1   CORRECT
+#     XOR  A=11    ^ B=11    = 00       -> OUT1=0 OUT0=0   CORRECT
+# `/coderyo redstone difftest` over the whole connected slice (operators + decoder + mux):
+#     bit0 op=0/XOR (A=1,B=0)  @232 101 214 100t -> BIT-IDENTICAL (105 cells)
+#     bit0 op=1/AND (A=1,B=1)  @232 101 214 100t -> BIT-IDENTICAL (110 cells)
+#     bit0 op=0/XOR (A=1,B=1)  @232 101 214 100t -> BIT-IDENTICAL (108 cells)  [AND-operand isolation]
+#     2bit AND OUT0 @232 101 214 -> BIT-IDENTICAL (107)   OUT1 @232 101 234 -> BIT-IDENTICAL (110)
+#     2bit XOR OUT0 @232 101 214 -> BIT-IDENTICAL (108)   OUT1 @232 101 234 -> BIT-IDENTICAL (105)
+#   0 divergences, every case. The compiled model == vanilla for the full integrated ALU.
+#
+# KEY ROUTING LESSON (the build-12/13 discipline, re-learned live). First attempt spaced the XOR
+# and AND clusters only 2 apart in z (206 / 210): the XOR-output exit lane at z=208 ran ORTHOGONALLY
+# adjacent to the AND cluster's A0-input dust at (223,209) -> the AND rear (15) SHORTED into the XOR
+# output lane and leaked to OUT even when XOR was selected. A single power read localized it (the XV
+# merge read 12 where XOR(1,1)=0 was expected). FIX: relocate the AND slice to z=217-219 so the XV0
+# lane (z=208) and AN0 lane (z=220) are 12 cells apart with >=2 empty cells from every driver. No
+# logic/compiler fault — pure lane spacing, exactly what the floor plan warned about.
+#
+# NEXT operators to fold into the select (documented, not yet wired):
+#  * OR_i (build-01 OR, per bit) -> widen the 1-bit opcode to 2 bits + a 2:4 active-low one-hot
+#    decoder (NAND of the opcode literals) feeding a 3:1/4:1 one-hot mux per bit.
+#  * ADD -> route the build-08 2-bit ripple adder's SUM_i (and Cout) into the mux data rears on
+#    their own spaced lanes; the adder is already difftest-clean, this is collision-free routing.
+#  Then: latch OUT into an accumulator register (build-11 edge-triggered), and drive the opcode
+#  from an instruction ROM addressed by a program counter -> the minimal CPU.
