@@ -1,0 +1,102 @@
+# coderyoMC redstone-computer MAP — FETCH FRONT-END on the PR#69 jar (build-19)
+#
+# GOAL (operator spec, "finish the CPU fetch front-end" now that PR#69 landed the vertical-bridge
+# / footprint fix that build-18 said was the routing blocker):
+#   1. Full 2-bit self-advancing PC: bit0 T-flip-flop (Qbar0->Master0.D physical) + bit1 D-FF fed by
+#      the dual-rail XOR (Q1 XOR Q0) -> 00->01->10->11->00 with NO driver block. difftest each state.
+#   2. PC->ROM fetch walk: tap Q1,Q0 into build-15 ROM {a1,a0}; each clock the ROM walks W0..W3.
+#
+# JAR — the whole point of this build: a FRESH paperclip jar built from origin/main @19f1682 (the
+#   PR#69 merge "fix vertical-dust wire connectivity/attenuation under load"). NEITHER pre-existing
+#   on-disk jar carries PR#69 (showcase=9e2343d, main-worktree=8bd0170 are both older), so it was
+#   rebuilt: warmed .gradle/caches/paperweight copied from a sibling worktree, then
+#   `./gradlew applyAllPatches && ./gradlew createPaperclipJar` (BUILD SUCCESSFUL, no checkoutPaperRepo
+#   fetch needed). Boot -Dcoderyo.redstone.compile.enabled=true ; port 15568, flat world, RCON 25579.
+#   forceload add 32 100 132 176 (build area) + 192 192 207 207 (bridge rig) + 296 296 328 320 (ROM).
+#   Driven: setblock/fill/execute-power-reads via RCON (probe.py/drv.py); `coderyo redstone difftest`
+#   via the CONSOLE stdin pipe (`tail -f cmds.txt | java ... --nogui`) — RCON's dispatcher omits the
+#   op-gated `coderyo` literal, the console (level 4) does not. Verdict read from the log line
+#   "[redstone-difftest/live] PASS/FAIL ... BIT-IDENTICAL / DIVERGENCE".
+#   (Harness note: this fork's `gamerule` is rejected by the console/RCON dispatcher — "Incorrect
+#   argument"; harmless here, the build area has no random-tick or daylight-sensitive blocks and the
+#   difftest steps in GAME ticks deterministically. spawn-monsters/animals/npcs already off in
+#   server.properties.)
+# Convention (locked, build-01..18): comparator/repeater[facing=D] => REAR on side D, OUTPUT opposite;
+#   SUBTRACT out=max(0, rear-max(sides)); redstone_block ABOVE a dust => 15; a torch's gate block is
+#   powered (torch off) by a repeater into it or dust on top.
+#
+# =====================================================================================
+# (A) bit0 MASTER-SLAVE FLIP-FLOP rebuilt fresh on the PR#69 jar — difftest BIT-IDENTICAL ✅
+# =====================================================================================
+# The build-11/12 edge-triggered cell (MASTER base x=62, SLAVE base x=46, Q0=(44,101,122)), built from
+# the tested runnable `build-19-bit0-masterslave.commands.txt` (two torch RS-NOR latches + enable-gates
+# R=E-D / S=D-(15-E) + the forward Master.Q->Slave.D interconnect). Loaded/held a bit via the two-phase
+# clock (ME/SE enable blocks) + the master D driver (MD blocks at 61,102,118 / 62,102,135).
+#   difftest 44 101 122 200  ->  BIT-IDENTICAL (200 ticks, 254 cells, 126 components, single-region)
+# The edge-triggered register a PC bit is built from compiles BIT-FOR-BIT to vanilla on the PR#69 jar.
+#
+# =====================================================================================
+# (B) bit0 T-FLIP-FLOP — Slave.Qbar -> Master.D feedback wired; whole loop difftest BIT-IDENTICAL ✅
+#     (physical clean-toggle NOT settled in-budget — a construction fixed-point, not a compiler fault)
+# =====================================================================================
+# The self-advance step: remove the manual master-D drivers and wire Slave.Qbar (48,130) around the
+# build-12 non-crossing feedback channel (south trunk z=139 + D_south riser x=62 and D_north branch up
+# x=52 -> z=118) into Master.D_north (61,118) & D_south (62,135) — from the tested runnable
+# `build-19-bit0-Tfeedback.commands.txt` (feedback.py, the corrected build-12 wiring with the z=118
+# re-amp fb.txt omitted). For B=1 the 1-bit adder SUM = ACC XOR 1 = NOT ACC = Qbar, so Qbar->D makes a
+# 1-bit "+1" counter that toggles once per clock cycle.
+#   difftest 44 101 122 200  ->  BIT-IDENTICAL (200 ticks, 358 cells, 177 components, single-region)
+# => the WHOLE self-advancing T-flip-flop TOPOLOGY (both latches + both enable-gates + forward AND
+#    feedback bus) compiles BIT-FOR-BIT to vanilla on the PR#69 jar. The compiler handles the full
+#    physical feedback loop.
+# HONEST: the physical clean toggle did NOT settle. Clocking the two-phase clock left Q0 pinned at 1
+#    (D read 15 while Qbar read 0 — an analog fixed point in the feedback bus). Because the difftest is
+#    BIT-IDENTICAL, VANILLA behaves the SAME (compiled==vanilla, both non-toggling), so this is a
+#    CONSTRUCTION miswire — the build_ms.txt (build-11 layout) + feedback.py (build-12-layout) rails do
+#    not line up cleanly on this fresh reconstruction (the same analog-attenuation / lane-tuning problem
+#    build-04 and build-12 spent whole builds solving), NOT a compiler/PR#69 fault. build-12 proved 14
+#    clean toggles on its own tuned board; reproducing that tuning on this board is the remaining work.
+#
+# =====================================================================================
+# (C) PR#69 VERTICAL-BRIDGE-UNDER-LOAD — the routing blocker build-18 hit, re-tested BEFORE/AFTER ✅
+# =====================================================================================
+# build-18's ONLY difftest divergence was the y=102/103 fan-out BRIDGE carrying a HIGH loaded rail over
+# a crossing wire (real=9 / sim=11, 800 mism). PR#69's root cause: a support-conductor stone under the
+# bridge, first reached DIAGONALLY (fromConductor=true) in the network flood-fill, was marked-visited-
+# but-never-added, so it was MISSING from the compiled footprint, read back as AIR, and flipped the
+# wire relaxation's up/down climb (over-powering the loaded bridge). Fix: drop the !fromConductor gate.
+#
+# Reproduction rig `build-19-vbridge-rig.commands.txt` (build-18 Q0-bridge topology, +160x, z=200): a
+# redstone_block-fed LOADED HIGH signal (bridgeIn=12) wire-climbs a 101->102->103->102->101 bridge OVER
+# a powered crossing wire (crossWire=14; bridgeTop=10) and propagates out (out=6). Same world, jar swap:
+#   | jar                         | difftest 197 101 200 | difftest 201 101 200 |
+#   | PR#69  (origin/main 19f1682)| BIT-IDENTICAL 32 cells | BIT-IDENTICAL 32 cells |
+#   | pre-PR#69 (showcase 9e2343d)| BIT-IDENTICAL 29 cells | BIT-IDENTICAL 30 cells |
+# => on the pre-PR#69 jar the compiled network is MISSING 2-3 cells (exactly the support-stone cells the
+#    flood-fill dropped — PR#69's bug, made visible); the PR#69 jar detects the FULL 32-cell footprint.
+#    So PR#69's footprint fix is demonstrated on the SAME world by a before/after jar swap. HONEST: in
+#    this SIMPLIFIED (single-layer, isolated) geometry the dropped stones did not flip a VALUE (both
+#    report BIT-IDENTICAL) — the dramatic real=9/sim=11 needed build-18's T-loop-RING context around the
+#    bridge, which requires a settled physical T-flip-flop (see (B)). The footprint delta is the direct,
+#    reproducible before/after signature of the fix.
+#
+# =====================================================================================
+# VERDICT + NEXT
+# =====================================================================================
+# LANDED on the PR#69 jar: bit0 master-slave flip-flop difftest BIT-IDENTICAL (254 cells); the FULL
+#   self-advancing T-flip-flop TOPOLOGY (bit0 + physical Slave.Qbar->Master.D feedback) difftest
+#   BIT-IDENTICAL (358 cells, 177 comp); and the vertical-bridge-under-load fan-out shortcut is
+#   difftest-clean on PR#69 (32 cells) with the pre-PR#69 footprint-drop (29/30) shown by a same-world
+#   jar swap = the routing blocker is gone at the compiler level.
+# NOT landed: the PHYSICAL clean 2-bit self-advance (bit0's T-loop did not settle to toggling on this
+#   fresh board — a construction fixed-point / lane-tuning task, difftest confirms it is NOT a compiler
+#   fault), the physical XOR consume -> bit1.D, and the PC->ROM fetch walk.
+# NEXT: (1) tune bit0's feedback rails so Qbar actually reaches Master.D at a clean level (the build-04/
+#   build-12 analog-attenuation discipline: a cleaning repeater AT the D port, feedback lane >=2 clear of
+#   every latch E/D port) so it toggles 0<->1; (2) add bit1 (+40x) + the build-17 dual-rail XOR gate
+#   (Q1 XOR Q0 = max(Q1-Q0, Qbar1-Qbar0)) consuming the rails, merge clear of the input rows + a cleaning
+#   repeater at every port, -> Master1.D -> physical 2-bit self-advance; (3) tap Q1,Q0 into build-15 ROM
+#   {a1,a0} -> the fetch walk; then decode opcode -> control lines + register file + integrate the
+#   build-14 ALU + build-12 accumulator.
+#
+# No feature patch was added — only test-harness/redstone-computer/.
