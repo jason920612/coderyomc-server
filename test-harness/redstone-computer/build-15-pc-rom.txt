@@ -1,0 +1,127 @@
+# coderyoMC redstone-computer MAP — INSTRUCTION-FETCH FRONT-END: Program Counter + Instruction ROM
+#
+# THE front-end a CPU fetch cycle needs: a Program Counter (address source, an edge-triggered
+# COUNTING register) and an Instruction ROM (a torch/diode-matrix memory addressed by the PC).
+# This build LANDS and difftest-validates the INSTRUCTION ROM (the 2->4 address decoder + the
+# word matrix); it documents the PC design (assembled from the already-proven build-11/12
+# edge-triggered accumulator) as the next build. The ROM is validated with the PC's job done by
+# a manually-driven dual-rail address (exactly item-2's spec: "set the PC to each address 0..3,
+# read the ROM output"), so ROM correctness is independent of the PC's feedback routing.
+#
+# Server: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (built FRESH from origin/main 9e2343d which
+#   carries patch 0020, via `./gradlew applyAllPatches && ./gradlew createPaperclipJar`), boot
+#   -Dcoderyo.redstone.compile.enabled=true ; port 15568, flat world, forceload add 288 288 400 400,
+#   spawn-monsters/animals/npcs=false. Driven from the server CONSOLE (stdin) via
+#   `tail -f cmds.txt | java -jar server.jar nogui` (build-13/14 method): each setblock/fill/difftest
+#   is appended to cmds.txt; difftest verdict read from the log "[redstone-difftest/live] PASS ... BIT-IDENTICAL".
+#   Live power reads via `execute if block <pos> minecraft:redstone_wire[power=N] run say ...`.
+# Convention (locked, build-01..14): comparator/repeater[facing=D] => REAR/INPUT on side D,
+#   OUTPUT exits the OPPOSITE side; SUBTRACT comp out=max(0, rear-max(sideL,sideR)); a
+#   redstone_block ABOVE a dust drives it to 15. LESSON RE-LEARNED: plain dust attenuates 1/block,
+#   so every run >~9 cells needs a cleaning repeater, and deep repeater chains must be SETTLED BY
+#   GAME TICKS (a probe taken ~3 s after an address change on the low-TPS regionized server reads a
+#   half-propagated state and looks like a wrong bit) — every ROM sweep below used a ~9 s settle.
+#
+# =====================================================================================
+# ============================ INSTRUCTION ROM (built + difftest-clean) ================
+# =====================================================================================
+# 4 words x 3 bits, stored contents  W0=101  W1=011  W2=110  W3=001  (bit2 bit1 bit0).
+# Addressed by a 2-bit dual-rail address {a0,na0,a1,na1} (four redstone_block-driven cells;
+# for address k the correct rails are driven HIGH). Two stages: a 2->4 one-hot DECODER and the
+# word MATRIX (diode-OR per output bit). y=100 stone floor, y=101 logic, y=102 driver blocks.
+#
+# ---- (1) 2->4 ONE-HOT ADDRESS DECODER -------------------------------------------------
+# Because both address rails and their complements are available, each minterm AND(x,y)=x-(15-y)
+# collapses to a SINGLE subtract comparator x - (complement of y):
+#   W0 = AND(na1,na0) = na1 - a0     W1 = AND(na1,a0) = na1 - na0
+#   W2 = AND(a1,na0)  = a1  - a0     W3 = AND(a1,a0)  = a1  - na0
+# 4 comparators facing WEST at x=306, z = 300/304/308/312; rear dust at x=305 (the 'a1/na1' rail),
+# side dust at x=306,z-1 (the 'a0/na0' rail), output east at x=307 = W0..W3.
+#   setblock 306 101 300 comparator[facing=west,mode=subtract]  ; 305,300 rear(na1) ; 306,299 side(a0) ; 307,300 = W0
+#   setblock 306 101 304 comparator[facing=west,mode=subtract]  ; 305,304 rear(na1) ; 306,303 side(na0); 307,304 = W1
+#   setblock 306 101 308 comparator[facing=west,mode=subtract]  ; 305,308 rear(a1)  ; 306,307 side(a0) ; 307,308 = W2
+#   setblock 306 101 312 comparator[facing=west,mode=subtract]  ; 305,312 rear(a1)  ; 306,311 side(na0); 307,312 = W3
+# Address drivers (redstone_block at y=102 over the rear/side dust) placed per address:
+#   rear drivers  R_W0=305,102,300(na1) R_W1=305,102,304(na1) R_W2=305,102,308(a1) R_W3=305,102,312(a1)
+#   side drivers  S_W0=306,102,299(a0)  S_W1=306,102,303(na0) S_W2=306,102,307(a0) S_W3=306,102,311(na0)
+# Per address (a0,na0,a1,na1): place blocks where the signal=1 (na1=1 -> R_W0,R_W1 ; a1=1 -> R_W2,R_W3 ;
+#   a0=1 -> S_W0,S_W2 ; na0=1 -> S_W1,S_W3).
+#   addr0(00): R_W0 R_W1 S_W1 S_W3     addr1(01): R_W0 R_W1 S_W0 S_W2
+#   addr2(10): R_W2 R_W3 S_W1 S_W3     addr3(11): R_W2 R_W3 S_W0 S_W2
+# RESULT — ONE-HOT verified live at W0..W3 (307,101,{300,304,308,312}), all 4 addresses:
+#   addr0 -> W0=HI, rest LO ; addr1 -> W1=HI ; addr2 -> W2=HI ; addr3 -> W3=HI.  4/4 correct one-hot.
+#
+# ---- (2) WORD MATRIX (diode-OR per output bit) ---------------------------------------
+# OUT_b = OR over words k that store bit b of the (one-hot) word line W_k:
+#   OUT0(bit0)= W0|W1|W3   OUT1(bit1)= W1|W2   OUT2(bit2)= W0|W2.
+# OUT0 : W0,W1,W3 east runs (z=300/304/312, x 308..317, each re-amped by a repeater at x=318) feed a
+#        short vertical MERGE COLUMN at x=319 (z300..312); a cleaning repeater 320,101,300[facing=west]
+#        -> OUT0 read at 321,101,300.
+# OUT1 : merged BETWEEN the W1(z304) and W2(z308) rows at z=306 so it crosses NEITHER W0 nor W3:
+#        W1 tap = repeater 311,101,305[facing=north] (rear=W1 run 311,304); W2 tap = repeater
+#        311,101,307[facing=south] (rear=W2 run 311,308); DIODE repeaters keep W1/W2 from back-feeding
+#        each other or leaking into OUT0. Merge 311,306 -> cleaning repeater 312,101,306[facing=west]
+#        -> OUT1 read at 313,101,306.
+# RESULT — ROM WORD READ, all 4 addresses (live power, ~9 s settle):
+#   | addr | selected word | stored | OUT1 OUT0 (read) |
+#   |  0   |  W0 = 1 0 1   | bit1=0,bit0=1 |  LO  HI  |  -> 01  correct
+#   |  1   |  W1 = 0 1 1   | bit1=1,bit0=1 |  HI  HI  |  -> 11  correct
+#   |  2   |  W2 = 1 1 0   | bit1=1,bit0=0 |  HI  LO  |  -> 10  correct
+#   |  3   |  W3 = 0 0 1   | bit1=0,bit0=1 |  LO  HI  |  -> 01  correct
+#   OUT0 sweep = {1,1,0,1} = bit0 of all four words  ; OUT1 sweep = {0,1,1,0} = bit1 of all four words.
+#   Both LOW-order bit-planes read the stored word BIT-CORRECT for every address.
+#
+# ---- difftest (compiler == vanilla), from the console; verdict from the log --------------
+#   addr0, seed OUT0 net  : coderyo redstone difftest 321 101 300 100 -> BIT-IDENTICAL (100t, 124 cells, 64 components, single-region)  [bit0 HI]
+#   addr2, seed OUT0 net  : coderyo redstone difftest 321 101 300 100 -> BIT-IDENTICAL (100t, 126 cells)                                 [bit0 LO]
+#   addr1, seed OUT1 net  : coderyo redstone difftest 313 101 306 100 -> BIT-IDENTICAL (100t, 128 cells)                                 [bit1 HI]
+#   addr3, seed OUT1 net  : coderyo redstone difftest 313 101 306 100 -> BIT-IDENTICAL (100t, 127 cells)                                 [bit1 LO]
+# 4/4 BIT-IDENTICAL, 0 divergences. The ~126-cell footprint = the WHOLE connected decoder+matrix
+# network (64 components) detected at each seed -> a genuinely integrated ROM, BIT-FOR-BIT to vanilla
+# in both HI and LO output states, on both validated bit-planes.
+#
+# ---- BUILD LESSONS (cost real debug) --------------------------------------------------
+#  1. ATTENUATION: the first OUT0 (bare 12-cell dust runs into a long merge column) read correct
+#     ONLY for the nearest word (addr0). Dust drops 1/block, so W1/W3 died before the merge. FIX:
+#     re-amp each word with a repeater right before a SHORT merge column. (build-06/11 rule.)
+#  2. SETTLE BY GAME TICKS: after re-amping, addr1/addr3 still first read LO — a 3 s probe caught the
+#     multi-repeater path half-propagated. A ~9 s settle (or the game-tick-stepped difftest) reads the
+#     true steady state. (build-07 rule, re-confirmed.)
+#  3. DIODE ISOLATION + THE ROM "TRIANGLE": a shared dust merge for OUT1 let W2 back-feed W1's run and
+#     leak into OUT0; and routing OUT1's W2 tap SOUTH crossed W3's east run at (313,312), leaking W3
+#     into OUT1 at addr3 (a wire-congestion collision, NOT a logic fault). FIX: one-way DIODE repeaters
+#     on every matrix tap, and merge OUT1 BETWEEN the W1/W2 rows (z306) so it crosses no other word row.
+#
+# ---- HONEST STATUS: OUT2 (bit2 = W0|W2) NOT landed --------------------------------------
+# OUT0(bit0) and OUT1(bit1) are difftest-clean on all 4 addresses. The 3rd bit-plane OUT2 = W0|W2 hits
+# the fundamental single-layer ROM-MATRIX CROSSING: the three OR-merges share the words as the triangle
+# O0={W0,W1,W3} O1={W1,W2} O2={W0,W2}, and W2 (row z308) is BOXED — north crosses W1's row (z304), south
+# crosses W3's row (z312), east is walled by the OUT0 merge column (x319, z300..312), west is the decoder.
+# So W0|W2 cannot reach a common merge on ONE y=101 layer without a crossing. A clean planar fix EXISTS
+# (re-route W1 to OUT0 on an offset row z302 to vacate z304, freeing W2's north crossing; or a single
+# y=102 dust bridge over one row — vertical-redstone compiler-parity to be spot-checked first). Landing
+# OUT2 makes it the full 4-word x 3-bit ROM. Recorded not forced (anti-stall: a difftest-clean multi-word
+# ROM read is the milestone; this delivers it on 2 of 3 planes + the full 2->4 decoder).
+#
+# =====================================================================================
+# ============================ PROGRAM COUNTER (design; next build) ====================
+# =====================================================================================
+# A 2-bit edge-triggered COUNTING register = TWO build-11 master-slave D flip-flops sharing ONE
+# non-overlapping two-phase manual clock, with COUNTER next-state feedback:
+#   bit0.D = NOT Q0 = Slave0.Qbar              (a T flip-flop = the difftest-clean build-12 cell VERBATIM)
+#   bit1.D = Q1 XOR Q0                          (the build-01 |A-B| XOR gadget fed by the two slave Qs)
+# Because both flip-flops are edge-triggered (master captures on phi1 while the slaves still hold the OLD
+# Q; both slaves update together on phi2's falling edge), the D's are sampled from the OLD state and the
+# pair advances SYNCHRONOUSLY 00->01->10->11->00 — exactly item-1's 0->1->2->3->0. Each held state is
+# then difftest-validated bit-identical (the build-11/12 register HOLDs difftest BIT-IDENTICAL).
+# Every constituent is already difftest-clean on main: the master-slave register (build-11, 246 cells),
+# the sustained 1-bit +1 accumulator (build-12, 432 cells, 14 clean toggles), and the XOR gadget (build-01).
+# What remains is purely the build-12 lane discipline scaled to two cells + the XOR feedback net: the
+# forward Q->slave.D and feedback (Qbar/XOR)->master.D run antiparallel and MUST get dedicated non-crossing
+# bands (build-12's north-forward / south-feedback split), and bit1's XOR net must reach master1.D on its
+# own lane clear of both cells' E/D ports. Not built here (a sustained 2-bit counter is a multi-cell feedback
+# build on the scale of the whole build-11+build-12 arc); documented as the immediate next build. Wiring the
+# PC's 2-bit output onto this ROM's {a1,a0} address rails (replacing the manual drivers) is the item-3 PC->ROM
+# walk: each clock pulse steps the PC and the ROM output walks 01->11->10->01 (the program W0..W3 read in order).
+#
+# No feature patch was added — only test-harness/redstone-computer/.

@@ -645,3 +645,70 @@ mux per bit) and **ADD** (route the difftest-clean build-08 SUM_i into the mux d
 routing, no new logic). Then latch OUT into an accumulator (build-11 edge-triggered register) and drive
 the opcode from an instruction ROM addressed by a program counter → the minimal CPU. **No feature patch
 was added — only `test-harness/redstone-computer/`.**
+
+## Rung 5 — INSTRUCTION-FETCH FRONT-END: Program Counter + Instruction ROM (build-15) — ROM difftest BIT-IDENTICAL ✅
+
+The CPU **fetch** pillar: an address SOURCE (Program Counter) + the **Instruction ROM** it addresses. This
+build LANDS and difftest-validates the **instruction ROM** (a 2→4 one-hot address decoder + a word matrix);
+the **PC** (a 2-bit edge-triggered counting register) is designed from the already-proven build-11/12
+edge-triggered accumulator and documented as the next build. The ROM is validated with the PC's job done by
+a **manually-driven dual-rail address** — exactly item-2's spec ("set the PC to each address 0..3, read the
+ROM output") — so ROM correctness is independent of the PC's feedback routing. Full geometry in
+`build-15-pc-rom.txt`.
+
+**4 words × 3 bits, stored** `W0=101 W1=011 W2=110 W3=001` (bit2 bit1 bit0), addressed by a 2-bit dual-rail
+address `{a0,na0,a1,na1}` (four `redstone_block`-driven cells).
+
+**(1) 2→4 one-hot DECODER.** Because both address rails *and their complements* are present, each minterm
+`AND(x,y)=x−(15−y)` collapses to a **single subtract comparator** `x − (complement of y)`:
+`W0=na1−a0, W1=na1−na0, W2=a1−a0, W3=a1−na0` (4 comparators facing west at x=306, z=300/304/308/312).
+**One-hot verified live for all 4 addresses:** addr0→W0 hot, addr1→W1, addr2→W2, addr3→W3; rest LOW. **4/4.**
+
+**(2) word MATRIX** (diode-OR per output bit; one-way repeaters isolate every tap). `OUT0=W0|W1|W3`
+(re-amped east runs → a short merge column at x=319 → read 321,101,300); `OUT1=W1|W2` merged **between** the
+W1/W2 rows at z=306 (so it crosses neither W0 nor W3) → read 313,101,306.
+
+**ROM word read — all 4 addresses** (live power, ~9 s settle):
+
+| addr | word | stored bit1 bit0 | OUT1 OUT0 read |
+|------|------|------------------|----------------|
+| 0 | W0 = 101 | 0 1 | LO HI → **01** ✅ |
+| 1 | W1 = 011 | 1 1 | HI HI → **11** ✅ |
+| 2 | W2 = 110 | 1 0 | HI LO → **10** ✅ |
+| 3 | W3 = 001 | 0 1 | LO HI → **01** ✅ |
+
+`OUT0` sweep `{1,1,0,1}` = bit0 of all four words; `OUT1` sweep `{0,1,1,0}` = bit1 of all four words — both
+low bit-planes read the stored word **bit-correct** for every address.
+
+**difftest** (from the server console; verdict from the log):
+
+| case | seed | verdict |
+|------|------|---------|
+| addr0 bit0 HI | 321 101 300 | **BIT-IDENTICAL (100t, 124 cells, 64 components, single-region)** |
+| addr2 bit0 LO | 321 101 300 | **BIT-IDENTICAL (100t, 126 cells)** |
+| addr1 bit1 HI | 313 101 306 | **BIT-IDENTICAL (100t, 128 cells)** |
+| addr3 bit1 LO | 313 101 306 | **BIT-IDENTICAL (100t, 127 cells)** |
+
+**4/4 BIT-IDENTICAL, 0 divergences.** The ~126-cell footprint per seed = the WHOLE connected decoder+matrix
+(64 components) detected as one network → a genuinely integrated ROM, bit-for-bit to vanilla in both HI and
+LO output states on both validated bit-planes.
+
+**Build lessons (cost real debug):** (1) **attenuation** — bare 12-cell dust runs into a long merge column
+read correct only for the nearest word; re-amp each word with a repeater before a SHORT merge (build-06/11
+rule). (2) **settle by game ticks** — after re-amping, addr1/addr3 still first read LO; a 3 s probe caught the
+multi-repeater path half-propagated, a ~9 s settle (or the game-tick-stepped difftest) reads the true steady
+state (build-07 rule). (3) **diode isolation + the ROM "triangle"** — a shared merge let W2 back-feed into
+OUT0, and a south-routed W2 tap crossed W3's row at (313,312) leaking W3 into OUT1 at addr3; fixed with one-way
+diode repeaters on every tap and by merging OUT1 *between* the W1/W2 rows.
+
+**Honest status — OUT2 (bit2 = W0|W2) NOT landed.** bit0 and bit1 are difftest-clean on all 4 addresses; the
+3rd bit-plane hits the fundamental single-layer ROM-matrix crossing (the words form the triangle
+`{W0,W1,W3}/{W1,W2}/{W0,W2}`, and W2's row z=308 is boxed — north crosses W1, south crosses W3, east is walled
+by the OUT0 merge column, west is the decoder). A clean planar fix exists (re-route W1 to OUT0 on an offset row
+to vacate z=304, or one y=102 dust bridge with vertical-redstone parity spot-checked first) — recorded not
+forced. **The PC** (2-bit counter: `bit0.D=Slave0.Qbar` = the build-12 T-flip-flop verbatim, `bit1.D=Q1 XOR Q0`
+= the build-01 gadget; two build-11 master-slave flip-flops on a shared two-phase clock advance 00→01→10→11→00
+edge-triggered, each held state difftest-clean) is designed from difftest-clean constituents but not built here
+— a sustained 2-bit feedback counter is a multi-cell build on the scale of the whole build-11+build-12 arc.
+Wiring the PC's 2 output bits onto this ROM's `{a1,a0}` rails is the item-3 PC→ROM walk. **No feature patch was
+added — only `test-harness/redstone-computer/`.**
