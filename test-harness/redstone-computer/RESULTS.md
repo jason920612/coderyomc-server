@@ -1291,3 +1291,62 @@ build-12 non-crossing-lane discipline extended to the 2-bit board; (2) a **2-bit
 build-24 ring-PC + one-hot ROM, widened to a 2-bit operand word) driving B; (3) **opcode decode** (LOAD vs
 ADD select on the adder B / register D) → the minimal programmable CPU; then wider (4-bit ACC + ALU).
 No feature patch — only `test-harness/redstone-computer/`.
+
+## build-26 — PHYSICAL FEEDBACK for the 2-bit accumulator: SUM→D half CLOSED via an elevated vertical-bridge express bus ⚠️
+
+The build-25 accumulator did real 2-bit arithmetic (`ACC := ACC + operand`, carry) but its Q→A feedback and
+operand were **driver-fed per clock**. build-26 wires the feedback **physically**. Boot = the reused
+`coderyo-bundler-26.2` patch-0020 jar (NO rebuild), `-Dcoderyo.redstone.compile.enabled=true`, port **15568**,
+RCON 25581, flat world, spawn-monsters off; settle by GAME ticks; difftest verdicts from the
+`[redstone-difftest/live]` server log.
+
+**Base reused VERBATIM, re-confirmed difftest BIT-IDENTICAL on this jar.** Placed via build-25's own
+`adder.py place` + `ff.py place 0 190` + `ff.py place 80 190`:
+| network | difftest seed | verdict |
+|---|---|---|
+| 2-bit ripple adder | `30 101 374 60` | **BIT-IDENTICAL (60 ticks, 644 cells, 328 comp)** |
+| FF0 (bit0 register) | `44 101 312 60` | **BIT-IDENTICAL (60 ticks, 274 cells)** |
+| FF1 (bit1 register) | `124 101 312 60` | **BIT-IDENTICAL (60 ticks, 274 cells)** |
+
+**Driver-fed 2-bit real-add accumulator reproduced** on the fresh jar: program `[1,1,1,1]` →
+`ACC 0→1→2→3→0` (genuine 2-bit carry: 3+1=4 mod4=0, Cout=1). Every step `ACC := ACC+op` OK.
+
+**The physical-wiring problem (found this build).** build-25 reuses the *proven* placement — but the adder
+(`z≈369–377`) and the two registers (`z≈308–325`) sit **~45 blocks apart**, and every adder I/O cell
+(SUM/A/B) is **buried inside the dense build-07 full-adder tile**: a lateral exit crosses live y=101 logic.
+Probing confirmed the routing gap `z 331–359` is clear but the tile columns are not.
+
+**Solution — the build-24 ELEVATED VERTICAL-BRIDGE idiom.** Lift the buried output straight **up to y=103**
+(two stone-step climbs), run an express dust bus **north over the top of the whole adder** on y=102 stone
+pillars, **drop back to y=101** in the clear gap, then route at ground level to the register D-port — the
+express layer never touches a y=101 logic cell. **Repeater convention re-verified** on this fork (against the
+build-07 XOR merge): `repeater[facing=D]` outputs the side **opposite** D — push north = `facing=south`,
+push east = `facing=west` (my first attempt reversed every diode and delivered 0; flipping fixed it).
+
+**Result — SUM0 → D0 physical feedback wire BUILT and TRACED end-to-end** (`build-26-autofeedback.py`):
+| point on the wire | SUM0 = 1 | SUM0 = 0 |
+|---|---|---|
+| SUM0 adder output `30,101,374` | 14 | 0 |
+| bridge input `32,101,374` | 12 | 0 |
+| gap corner `62,101,356` | 10 | 0 |
+| pre-inject `62,101,327` | 15 | 0 |
+| **register D-cell `62,101,325`** | **15** | **0** |
+
+The adder's SUM0 output is delivered across the entire structure to the register's master D-port — **the
+`SUM→D` half of the physical feedback loop is CLOSED** (data flows adder→register with no driver). And the
+register **captures a 1 through the physical wire** (clock → `Q0 = 15`) when the master's D-ports are asserted.
+
+**Honest verdict — NOT yet autonomous.** The master latch has **two** D injection cells
+(`61,101,308` and `62,101,325`); only `62,325` is on the physical wire so far, so single-clock capture of a
+**0** and reliable latching still need the **second-port branch**. Remaining for full autonomy: (a) branch
+the SUM0 bus to the 2nd D-port; (b) the **SUM1→D1** twin bridge (bit1); (c) the **Q→A** half — register Q
+feeding the adder A input, which is a **4-way fan-out per bit** (build-07 consumes A at 4 buried cells) via
+repeater-isolated taps; (d) a **constant operand** on B (4 redstone_blocks over the B0 cells = program `+1`).
+With those, `ACC := ACC + operand` self-accumulates on a stepped 2-phase clock with **no data driver**.
+
+**What IS proven this build:** the reused datapath is difftest-clean on the jar; the real-add accumulator
+runs (driver-fed); and the hard part of the autonomy problem — **getting a buried adder output physically
+across the dense tile to the register D-port** — is **solved** by the elevated vertical-bridge bus and
+traced delivering the correct value. The `SUM→D` half of the loop is physically closed; the `Q→A` half and
+the 2-bit ROM front-end are the remaining routing on the same proven idiom. **No feature patch — only
+`test-harness/redstone-computer/`.**
