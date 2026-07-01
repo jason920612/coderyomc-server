@@ -1451,3 +1451,91 @@ the adder↔register gap (the same class of wide-board, non-crossing feedback ro
 solved for the 1-bit accumulator, and that build-27 framed as the open link). No new logic or compiler work
 remains; the wire-drivable-D register is the crux that unblocks it. **No feature patch — only
 `test-harness/redstone-computer/`.**
+
+## build-29 — CLOSING the self-counting 2-bit accumulator loop: SUM→D links physically closed on the real board (register captures SUM incl forced-0 through a wire), Q→A + carry-wrap-tap the open links ⚠️
+
+Goal (the autonomous milestone): the build-25 2-bit ripple adder + constant **+1** on B (build-27) +
+**two build-28 WIRE-DRIVABLE-D master-slave FFs** (ACC register, bit0 @dx=0 / bit1 @dx=80, dz=190),
+wired so the loop self-counts `0→1→2→3→0` on a bare 2-phase clock with **no data driver**. Four
+feedback links must close: **L1** `SUM0→FF0 D`, **L2** `SUM1→FF1 D`, **L3** `Q0→adder A0`,
+**L4** `Q1→adder A1`. Boot = reused `coderyo-bundler-26.2` patch-0020 jar (**no rebuild**),
+`-Dcoderyo.redstone.compile.enabled=true`, port **15568**, RCON 25581, flat/peaceful world, `tick freeze`
++ settle by GAME ticks; difftest via RCON, verdict from the `[redstone-difftest/live]` log.
+Script: `build-29-selfcount.py` (reuses `drv`/`adder`/`wireff.WireFF` as importable copies of
+`build-25-drv.py`/`build-25-adder.py`/`build-28-wireff.py` — `cp build-25-drv.py drv.py`, etc.).
+
+**Base re-verified on this jar (all PROVEN pieces compose):**
+| piece | check | verdict |
+|---|---|---|
+| adder + constant **+1** on B | drive only A → SUM = A+1 | `0→1, 1→2, 2→3, 3→0` (Cout1=1 on wrap) — **all OK** |
+| FF0 WireFF @(0,190) | wire-drive test (source toggles D) | captures `0/1` bidirectionally (both D-ports track) |
+| FF1 WireFF @(80,190) | wire-drive test | **6/6 OK** — both D-ports track the wire |
+
+**L1 `SUM0→D0` — PHYSICALLY CLOSED (register captures SUM0 through a pure wire, both 0 and 1).**
+The build-26/27 elevated vertical-bridge (tap SUM → climb to y=103 → express bus north over the adder on
+stone pillars → drop into the clear gap → ground-run east then north) now **terminates at the WireFF
+D-source node** `(66,101,330)`, and `WireFF.dnet` fans that one node into **BOTH** master D-ports — the
+build-28 discipline. With **dense re-amp repeaters** (every ~7 on the east leg, every ~6 on the north leg)
+the source node tracks SUM0 (`14 when SUM0=1, 0 when SUM0=0`). Clocking the FF, **Q0 = S0 = NOT A0 for all
+four A values** (`A=0,1,2,3 → Q0 = 1,0,1,0`) — the register **captures a wire-delivered 0 as well as a 1**.
+This is the exact link build-27 could not close (*"a wire can only OR D to 1, never force 0"*): with both
+D-ports fed via the build-28 branches, **`R = E − D_north` fires and the register captures the forced-0**.
+
+**Capture test (drive A directly, SUM=A+1, clock, read ACC), long settle:**
+| A | exp ACC = A+1 | captured ACC (Q1Q0) | |
+|---|---|---|---|
+| 0 | 1 | 1 (01) | OK |
+| 1 | 2 | 2 (10) | OK |
+| 2 | 3 | 3 (11) | OK |
+| 3 | **0** | **2 (10)** | **XX — carry-wrap** |
+
+**6/8** over two passes — every non-wrap state captures the physical SUM exactly; **bit0 (Q0) is correct
+for all four A including the wrap.**
+
+**L2 `SUM1→D1` — bridge BUILT + delivers + captures for A=0,1,2, but the bare-wire tap CORRUPTS the
+carry-dependent SUM1 on the `3→0` wrap.** The twin bridge (`SUM1(90,374) → (146,330)`) delivers, and FF1
+captures correctly for the non-carry cases. But the SUM1 output is **carry-dependent**
+(`S1 = A1 ⊕ B1 ⊕ Cin1`, `Cin1 = Cout0`), and extending SUM1's dust into the bridge (`sb(sumx+1,101,374,W)`)
+**loads the SUM1 net and flips its computed value on the wrap**: clean adder `A=3 → S1S0=00`, but **with the
+tap attached `A=3 → S1S0=10`** (SUM1 delivers `1` instead of `0`, confirmed steady at **400** settle ticks —
+not a settle race, a **load fault**). build-26 already flagged the SUM output net is tap-sensitive (a
+rear-reading repeater there "read nothing"). So L2 needs a **buffered tap** (a diode that samples SUM1
+without loading it) before it is reliable across the wrap — the precise `3→0` transition a `+1` counter
+must make.
+
+**L3 `Q0→A0` and L4 `Q1→A1` — NOT built.** Each is a **4-way fan-out into the adder A input**, and all four
+A dust cells per bit are **buried inside the dense build-07 full-adder tile** (`A0` at `(18,369)(23,370)
+(38,377)(44,377)`; probed: with the y=102 drive block removed each is a bare `redstone_wire`). A signal
+cannot reach a buried cell from outside without crossing live y=101 logic; it needs the elevated-drop idiom
+(over-the-top, drop straight down onto each cell) **× 8 injection points**, in a gap already occupied by the
+two SUM→D bridges (east runs at z=356, north legs at x=66/146). This is the same buried-cell fan-out
+build-26/27 flagged as *"gated"* and never reached; it remains the gating routing for autonomy.
+
+**difftest of the connected whole — DIVERGES on the SUM→D bridge dust (build-27's finding reconfirmed).**
+Holding `A=1` (ACC captured = 2, stable), `coderyo redstone difftest 44 101 312 200` sees the **entire**
+network as one region (the bridges electrically merge adder↔registers): **866 components / 1713 cells**, and
+reports:
+```
+[redstone-difftest/live] DIVERGENCE @44,101,312 rel-tick 0  94,101,356 POWER real=9 sim=0
+                                                 95,101,356 POWER real=8 sim=0  ...  (the SUM1 bridge east run)
+```
+i.e. the compiler initialises the long analog **bridge dust run to 0** while vanilla holds the decaying
+`9,8,7,6…` — a cold-start divergence on the bridge cells (exactly build-27's `real=15/sim=0 at the bridge
+dust`). So the SUM→D bridges **deliver functionally in live play but the connected bridge network is NOT
+difftest-bit-identical** — a second open blocker for the strict "each state bit-identical to vanilla" bar.
+
+**Feedback links closed: 2 of 4 built (L1 fully; L2 delivers but tap-corrupts the carry-wrap); L3/L4 not
+built. The loop does NOT self-count** — Q→A is open (and the L2 wrap fault would break the `3→0` step even
+if it were closed).
+
+**Honest verdict — NOT the milestone; a real advance over build-27.** What build-29 *proves on the actual
+loop board* (build-27 could not): with the **build-28 wire-drivable-D register**, an ordinary wire — the
+adder's own SUM — drives the register's D to **both 0 and 1**, and the register **captures every
+wire-delivered value including a forced 0** (bit0 correct for all four states). The build-27 *"wire can only
+OR D to 1"* logic blocker is genuinely gone. Two blockers now stand between here and a physical self-count:
+**(a)** a **buffered SUM tap + a difftest-clean bridge** (the bare-wire tap corrupts the carry-dependent
+SUM1 and the compiler diverges on the bridge dust), and **(b)** the **buried Q→A 4-way fan-out** (8
+over-the-top drops into the build-07 tile). **NEXT:** replace the SUM taps with sampling diodes (fixes the
+carry-wrap and likely the difftest divergence), then build the Q→A over-the-top drops; then the loop
+self-counts and can swap the constant **+1** for a ROM operand → programmable. **No feature patch — only
+`test-harness/redstone-computer/`.**
