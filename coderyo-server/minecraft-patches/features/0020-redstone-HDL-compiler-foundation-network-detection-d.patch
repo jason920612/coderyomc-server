@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..326d2f244eddd1268bde243812de50bb40346baa
+index 0000000000000000000000000000000000000000..b5fdda21450382b47a877069168bee30712e16d5
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,2387 @@
+@@ -0,0 +1,2488 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -39,6 +39,9 @@ index 0000000000000000000000000000000000000000..326d2f244eddd1268bde243812de50bb
 +import net.minecraft.world.Container;
 +import net.minecraft.world.inventory.AbstractContainerMenu;
 +import net.minecraft.world.item.ItemStack;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.chunk.LevelChunk;
++import net.minecraft.world.ticks.LevelChunkTicks;
 +import net.minecraft.world.level.block.BasePressurePlateBlock;
 +import net.minecraft.world.level.block.Blocks;
 +import net.minecraft.world.level.block.ComparatorBlock;
@@ -487,7 +490,102 @@ index 0000000000000000000000000000000000000000..326d2f244eddd1268bde243812de50bb
 +        for (final long packed : c.pistons) {
 +            c.pistonNeighborSeen.put(packed, c.snapshotPistonNeighbors(BlockPos.of(packed)));
 +        }
++        // IN-FLIGHT SCHEDULED-TICK (LevelTicks) PHASE SEEDING. A snapshot captures only block
++        // STATES; a component's NEXT delayed transition lives solely in vanilla's LevelTicks (the
++        // per-block pending ScheduledTick). So a circuit already OSCILLATING at snapshot — a torch /
++        // repeater / observer clock — looks quiescent (its torch is LIT with input matching, no
++        // standing edge) and the compiled model, being edge-driven, HOLDs forever and diverges. By
++        // reading the live pending scheduled ticks for this network's cells and enqueuing them at the
++        // SAME remaining delay + priority, the compiled clock's next transition is already queued at
++        // the correct offset and it continues in phase with vanilla. Flag-gated (default off).
++        if (RedstoneCompileConfig.seedScheduledTicks()) {
++            c.seedScheduledTicks(level, network);
++        }
 +        return c;
++    }
++
++    /**
++     * Seed the compiled discrete-event queue from the live world's in-flight block-scheduled ticks
++     * (vanilla {@link net.minecraft.world.ticks.LevelTicks}). For every pending {@code ScheduledTick}
++     * whose position is a compiled component in this network's footprint, enqueue a {@link
++     * ScheduledEntry} of the matching {@link Kind} at the SAME remaining delay and priority — so an
++     * oscillator mid-cycle continues in phase (see {@link RedstoneCompileConfig#seedScheduledTicks()}).
++     *
++     * <p><b>Tick-frame alignment.</b> The harness steps the compiled model with its {@code rel}
++     * counter anchored at 0 = the live game time at compile. A vanilla scheduled tick with absolute
++     * {@code triggerTick} T fires during the game tick whose time equals T (the first tick with
++     * {@code gameTime >= T}), i.e. at {@code rel = T - now}. The queue's {@link ScheduledEntry#trigger}
++     * is in that same rel frame, so the seeded trigger is simply {@code T - now}. It is clamped to
++     * {@code >= 1}: any tick already due at the current game time was collected + run before this
++     * compile ran (scheduled block ticks drain before command execution within a server tick), so
++     * whatever remains is due next tick at the soonest.
++     *
++     * <p>Only the pure delayed-redstone-transition kinds are seeded (torch, repeater, comparator,
++     * observer, lamp) plus the impulse un-power kinds (button, target, lightning rod). Piston /
++     * dispenser / crafter scheduled ticks interleave with the block-event + block-entity layers and
++     * are intentionally NOT seeded here (their in-flight phase remains a documented limitation).
++     */
++    private void seedScheduledTicks(final ServerLevel level, final RedstoneNetwork network) {
++        final long now = level.getGameTime();
++        final LongSet footprint = network.footprint();
++        for (final long chunkKey : network.chunkKeys()) {
++            final LevelChunk chunk = level.getChunkIfLoaded(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
++            if (chunk == null) {
++                continue; // network cell in an unloaded chunk — no pending ticks readable
++            }
++            if (!(chunk.getBlockTicks() instanceof LevelChunkTicks<?> chunkTicks)) {
++                continue; // not the standard live-chunk tick container (defensive)
++            }
++            chunkTicks.getAll().forEach(tick -> {
++                final long packed = tick.pos().asLong();
++                if (!footprint.contains(packed)) {
++                    return; // a pending tick outside this network's footprint
++                }
++                final Kind kind = this.scheduledSeedKind(packed);
++                if (kind == null) {
++                    return; // not a seedable delayed-transition component
++                }
++                if (this.willTick(packed, kind)) {
++                    return; // one pending tick per (pos, kind), exactly like UNIQUE_TICK_HASH
++                }
++                final long trigger = Math.max(1L, tick.triggerTick() - now);
++                this.queue.add(new ScheduledEntry(packed, kind, trigger, tick.priority().getValue(), this.subCounter++));
++            });
++        }
++    }
++
++    /**
++     * The compiled {@link Kind} whose pending scheduled tick may be seeded for a footprint cell, or
++     * {@code null} if the cell is not a seedable delayed-transition component. Piston / dispenser /
++     * crafter are deliberately excluded (their scheduled phase is not seeded — see
++     * {@link #seedScheduledTicks}).
++     */
++    private @org.jspecify.annotations.Nullable Kind scheduledSeedKind(final long packed) {
++        if (this.torches.contains(packed)) {
++            return Kind.TORCH;
++        }
++        if (this.repeaters.contains(packed)) {
++            return Kind.REPEATER;
++        }
++        if (this.comparators.contains(packed)) {
++            return Kind.COMPARATOR;
++        }
++        if (this.observers.contains(packed)) {
++            return Kind.OBSERVER;
++        }
++        if (this.lamps.contains(packed)) {
++            return Kind.LAMP;
++        }
++        if (this.buttons.contains(packed)) {
++            return Kind.BUTTON;
++        }
++        if (this.targets.contains(packed)) {
++            return Kind.TARGET;
++        }
++        if (this.lightningRods.contains(packed)) {
++            return Kind.LIGHTNING_ROD;
++        }
++        return null;
 +    }
 +
 +    /** Capture a piston's 6 face-neighbour block states, indexed by {@code Direction.ordinal()}. */
@@ -1416,8 +1514,11 @@ index 0000000000000000000000000000000000000000..326d2f244eddd1268bde243812de50bb
 +    // the 0-tick / TRIGGER_DROP fast-retract path (an in-flight extend head finalised early on
 +    // retract — see retract()).
 +    // DEFERRED (NOT modelled — noted, not attempted): self-propelled flying machines / piston
-+    // tape, observer-0-tick free-running engines (the harness snapshots block states but not the
-+    // in-flight scheduled-tick phase, so a circuit already oscillating at snapshot can't be seeded).
++    // tape, observer-0-tick free-running piston engines. NOTE: the pure-redstone free-running
++    // oscillator case (a torch / repeater / observer clock already mid-cycle at snapshot) IS now
++    // seedable — the compile-time LevelTicks phase seeding ({@link #seedScheduledTicks}, flag-gated)
++    // enqueues the in-flight scheduled ticks so the compiled clock continues in phase with vanilla.
++    // Only PISTON scheduled-tick phase (and thus piston-tape engines) stays unseeded here.
 +
 +    /** The live {@link MovingBlock} for a cell (grid == MOVING_PISTON), or null; for the harness. */
 +    MovingBlock movingAt(final long packed) {
@@ -2484,10 +2585,10 @@ index 0000000000000000000000000000000000000000..392364776098f3331df652388a8592c4
 +}
 diff --git a/com/coderyo/redstone/RedstoneCompileConfig.java b/com/coderyo/redstone/RedstoneCompileConfig.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..f54de038469379d1278cd8dabdbd7cac0b69c634
+index 0000000000000000000000000000000000000000..0dcee4467e527c940e9e770973e9a8b67b85f923
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneCompileConfig.java
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,143 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent
 + * implementation. MCHPRS studied as concept only (logic-graph idea), never copied.
@@ -2541,15 +2642,32 @@ index 0000000000000000000000000000000000000000..f54de038469379d1278cd8dabdbd7cac
 +     */
 +    public static final String DRIVE_BENCH_PROPERTY = "coderyo.redstone.drive.benchmark";
 +
++    /**
++     * In-flight scheduled-tick (LevelTicks) phase seeding. With this ON <em>and</em> the master
++     * {@link #ENABLED_PROPERTY} ON, {@link CompiledNetwork#compile} additionally reads the live
++     * world's pending block-scheduled ticks (vanilla {@code ServerLevel} {@link
++     * net.minecraft.world.ticks.LevelTicks}) for the network's cells and enqueues them into the
++     * compiled discrete-event queue at the SAME remaining delay + priority. This lets a circuit
++     * that is already OSCILLATING at snapshot (a free-running torch / repeater / observer clock)
++     * compile at its CURRENT phase and continue in lock-step with vanilla — previously impossible,
++     * because a snapshot captures only block states, not the next transition that lives solely in
++     * LevelTicks, so an oscillator compiled as quiescent and diverged. Default false → the compiler
++     * behaves exactly as before (states only), so the corpus + drive are byte-for-byte unchanged.
++     */
++    public static final String SEED_TICKS_PROPERTY = "coderyo.redstone.seedticks";
++    public static final String SEED_TICKS_ENV = "CODERYO_REDSTONE_SEEDTICKS";
++
 +    public static final boolean DEFAULT_ENABLED = false;
 +    public static final boolean DEFAULT_DIFFTEST = false;
 +    public static final boolean DEFAULT_DRIVE = false;
++    public static final boolean DEFAULT_SEED_TICKS = false;
 +    public static final int DEFAULT_MAXTICKS = 300;
 +
 +    private static final boolean ENABLED = resolveBoolean(ENABLED_PROPERTY, ENABLED_ENV, DEFAULT_ENABLED);
 +    private static final boolean DIFFTEST = resolveBoolean(DIFFTEST_PROPERTY, DIFFTEST_ENV, DEFAULT_DIFFTEST);
 +    private static final boolean DRIVE = resolveBoolean(DRIVE_PROPERTY, DRIVE_ENV, DEFAULT_DRIVE);
 +    private static final boolean DRIVE_BENCH = resolveBoolean(DRIVE_BENCH_PROPERTY, null, false);
++    private static final boolean SEED_TICKS = resolveBoolean(SEED_TICKS_PROPERTY, SEED_TICKS_ENV, DEFAULT_SEED_TICKS);
 +    private static final int MAXTICKS = resolveInt(MAXTICKS_PROPERTY, DEFAULT_MAXTICKS);
 +
 +    private RedstoneCompileConfig() {
@@ -2578,6 +2696,15 @@ index 0000000000000000000000000000000000000000..f54de038469379d1278cd8dabdbd7cac
 +    /** Whether the self-contained heavy-circuit MSPT benchmark should run (requires drive). */
 +    public static boolean isDriveBenchmark() {
 +        return ENABLED && DRIVE && DRIVE_BENCH;
++    }
++
++    /**
++     * Whether {@link CompiledNetwork#compile} seeds the live world's in-flight scheduled ticks
++     * (LevelTicks phase) into the compiled discrete-event queue (requires {@link #isEnabled()}).
++     * Default false → block states only, exactly as before.
++     */
++    public static boolean seedScheduledTicks() {
++        return ENABLED && SEED_TICKS;
 +    }
 +
 +    private static boolean resolveBoolean(final String property, final String env, final boolean fallback) {
