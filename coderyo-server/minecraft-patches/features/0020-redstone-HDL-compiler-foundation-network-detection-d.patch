@@ -5391,10 +5391,10 @@ index 0000000000000000000000000000000000000000..a3f01ec9c94bc2daeed55124eac1469b
 +}
 diff --git a/com/coderyo/redstone/RedstoneNetwork.java b/com/coderyo/redstone/RedstoneNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..fd499c4aaf72e84527ee085be5257ff7deb35a66
+index 0000000000000000000000000000000000000000..d706390feb127721b409f616e756fadccb6f42e4
 --- /dev/null
 +++ b/com/coderyo/redstone/RedstoneNetwork.java
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,319 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + */
@@ -5666,9 +5666,18 @@ index 0000000000000000000000000000000000000000..fd499c4aaf72e84527ee085be5257ff7
 +            frontier.add(next.immutable());
 +            return;
 +        }
-+        // Only step into a conductor if it is adjacent to a component (it bridges
-+        // strong power); never flood across an open conductor plane indefinitely.
-+        if (!fromConductor && state.isRedstoneConductor(level, next) && touchesComponent(level, next)) {
++        // Step into a conductor iff it is adjacent to a component (it bridges strong power);
++        // touchesComponent bounds the flood so an open conductor plane is never walked
++        // indefinitely (interior cells touch no component). This must NOT depend on whether we
++        // arrived from a conductor: a redstone-conductor block that a VERTICAL redstone-dust
++        // bridge sits on / climbs over is a first-class strong-power + wire-connection node, and
++        // for some geometries it is first reached DIAGONALLY from an adjacent support conductor
++        // (fromConductor=true). Gating the add on !fromConductor there marked the cell visited
++        // (line above) but never added it, so the later component-sourced visit was blocked and
++        // the support stone was MISSING from the compiled grid — it then read back as AIR
++        // (non-conductor), flipping the wire relaxation's up/down climb decision at the vertical
++        // step and over-powering a loaded bridge vs vanilla (#68 vertical-dust divergence).
++        if (state.isRedstoneConductor(level, next) && touchesComponent(level, next)) {
 +            frontier.add(next.immutable());
 +        }
 +    }
