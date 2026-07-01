@@ -1,0 +1,82 @@
+# coderyoMC redstone-computer MAP — 4-STAGE ONE-HOT RING COUNTER (program counter, XOR-free)  (build-22)
+#
+# DESIGN PIVOT (operator spec): the binary-counter PC kept dying on physical routing (builds 16-21):
+#   the dual-rail XOR gate that computes bit1.D packs four mutually-adjacent input dusts that cannot each
+#   be wire-fed without an adjacency short, and bit0's Q0/Qbar0 are enclosed by the T-feedback interconnects.
+#   A RING COUNTER sidesteps ALL of it: NO XOR (so no packed 4-input gate), NO per-stage T-feedback (so no
+#   enclosing feedback ring), and it is one-hot so it will drive a ROM with NO decoder. It is 4 edge-triggered
+#   master-slave D flip-flops (build-11 body VERBATIM) wired as a shift register FF_i.D = FF_{i-1}.Q, with the
+#   loop FF_0.D = FF_3.Q closing it. Each Q feeds EXACTLY ONE next-stage D (+ROM tap) — no fan-out collision.
+#
+# JAR: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (patch-0020 compiler = origin/main; REUSED, not rebuilt).
+#   Boot -Dcoderyo.redstone.compile.enabled=true ; port 15568, RCON 25579, flat world, difficulty peaceful.
+#   Placement + live power reads over RCON (rc.py / probe.py: `execute if block <p> redstone_wire[power=N]`).
+#   Two-phase clock driven by clock.py: place redstone_block over the enable dusts, settle by GAME TICKS via
+#   `tick sprint N` polled on `time query gametime` (deterministic), remove, settle. Non-overlapping phi1/phi2.
+#   difftest from the server CONSOLE (op-gated `coderyo` literal): `coderyo redstone difftest <x> <y> <z> <t>`,
+#   verdict from the log "[redstone-difftest/live] PASS ... BIT-IDENTICAL".
+# Convention (CALIBRATED live on this jar, matches build-01..21): comparator/repeater[facing=D] => REAR/INPUT
+#   on side D, OUTPUT exits the OPPOSITE side.  Verified: comparator[facing=west] + redstone_block on the WEST
+#   (rear) outputs 15 to the EAST.  A redstone_block ABOVE a dust drives that dust to 15.
+#
+# ============================== LAYOUT (spaced ROW, y=101 plane) ==============================
+# 4 FF bodies at DX = 0, -30, -60, -90 (stage0 EASTMOST, data flows east->west; the loop returns west->east).
+# Each FF = build-20-bit0.commands.txt lines 4-66 VERBATIM (MASTER base x=62, SLAVE base x=46, + the internal
+#   MASTER.Q->SLAVE.D forward) translated by DX, WITHOUT the T-feedback (lines 67-84) — the ring's D comes
+#   from the PREVIOUS stage, not from itself. Per stage i (dx=-30*i):
+#     Q_i      = (44+dx, 101, 122)      Qbar_i  = (48+dx, 101, 130)
+#     Master.D external input ports: D_north = (61+dx, 118)   D_south = (62+dx, 135)
+#     phi1 (master enable): redstone_block over (62+dx,102,117) & (60+dx,102,133)
+#     phi2 (slave  enable): redstone_block over (46+dx,102,117) & (44+dx,102,133)  [shared across all 4 stages]
+#
+# INTER-STAGE LINK  Q_i -> D_{i+1}  (adjacent links corridor z=145; loop link Q3->D0 corridor z=158):
+#   The Slave.Q rail (44+dx) is ENCLOSED (boxed south by the slave S-comparator gadget at 44,133/44,134) and
+#   cannot be tapped — CONFIRMS build-21's finding.  Slave.Qbar (48+dx) escapes cleanly, so each link taps
+#   Qbar and recovers Q = 15 - Qbar with one subtract comparator:
+#     1. ISOLATING STUB tap: dust at (48+dx,131) extends the Qbar rail one cell; a repeater at (48+dx,132)
+#        reads the STUB.  (A repeater REAR placed directly on the Qbar rail (48+dx,130) unbalances the sensitive
+#        cross-coupled latch and destroys its state-holding — measured; the 1-dust stub is gentle enough.)
+#     2. drop south to the corridor, RE-AMP every <=5 (incl. a clean repeater right above the comparator side,
+#        else the Qbar arrives attenuated e.g. 13 and 15-13=2 garbage).
+#     3. INVERT: comparator[facing=east,subtract] rear = redstone_block(15) on the EAST, side(N) = Qbar drop,
+#        out(W) = 15 - Qbar = Q.  The 15-source block is placed AFTER the comparator so it re-evaluates its rear.
+#     4. haul the Q along the corridor to the destination's east riser (x=66+dx_dst) + D_south riser
+#        (x=62+dx_dst); the east riser climbs to a z=115 lane N of the master body and feeds D_north from the
+#        WEST (repeater at (60+dx_dst,118) -> (61+dx_dst,118)); the D_south riser feeds (62+dx_dst,135).
+#   Generator: gen_ring.py (committed).  Full command streams: cmd_ffs / cmd_links / cmd_loop (from gen_ring.py).
+#
+# ================================ RESULT — PHYSICAL SHIFT (no driver) ✅  THE MILESTONE ================================
+# INIT to one-hot 1000: cut the loop D0-feed repeaters, clock 6x with D0=0 (flush -> 0000), then drive D0=1 for
+#   ONE cycle (redstone_block over stage0's D ports) -> 1000, release, restore the loop feed.
+# WALK (clock.py, two-phase, D0 RELEASED — the '1' propagates ONLY through the Qbar-tap/invert links):
+#     init  : Q0=1 Q1=0 Q2=0 Q3=0   (1000)
+#     clk 1 : Q0=0 Q1=1 Q2=0 Q3=0   (0100)
+#     clk 2 : Q0=0 Q1=0 Q2=1 Q3=0   (0010)
+#     clk 3 : Q0=0 Q1=0 Q2=0 Q3=1   (0001)
+#   => the one-hot '1' PHYSICALLY SHIFTS 1000 -> 0100 -> 0010 -> 0001 across the four edge-triggered stages with
+#      NO driver, purely through the register->register links. Clean and REPEATABLE. This is the autonomous PC
+#      walk — the CPU instruction-fetch heart — and it sidesteps the XOR-fanout death-loop entirely (there is
+#      NO XOR and NO 4-input packed gate anywhere; each Q drives exactly one next-D).
+# EDGE-TRIGGER discipline reproduced: single-stage load needs generous non-overlapping phases (12-tick master &
+#   slave enables + a D pre-settle); 6-tick phases fail to capture. Each FF loads 1 and 0 cleanly and holds.
+#
+# ================================ RESULT — difftest (compiler == vanilla) ✅ ================================
+# The WHOLE ring (all 4 master-slave FFs + 3 shift links + the loop link, ~1986 cells / 999 components / 26
+# chunks, single-region) compiles BIT-FOR-BIT to vanilla:
+#   held 1000, difftest 44 101 122 200 -> PASS BIT-IDENTICAL (200 ticks, 1986 cells, 999 components)
+#   held 1000, difftest 14 101 122 150 -> PASS BIT-IDENTICAL (150 ticks, 1982 cells)
+# => the entire XOR-free ring datapath is difftest-clean on the patch-0020 compiler.
+#
+# ================================ HONEST STATUS — loop recirculation + ROM ================================
+# LOOP recirculation (0001 -> 1000) NOT landed in budget. The loop link Q3->D0 is a ~110-cell east haul; its
+#   invert comparator + long haul suffer a repeater/comparator STALENESS (build-21's "a freshly-set diode does
+#   not re-evaluate until a neighbor update"): when Qbar3 flips the loop invert does not refresh, so D0 stays
+#   stale and the '1' falls off the west end (0001 -> 0000) instead of recirculating. The IDENTICAL invert+haul
+#   pattern on the three SHORT adjacent links refreshes correctly every clock (the clean shift above proves it),
+#   and the difftest is BIT-IDENTICAL — so this is a long-haul PHYSICAL-settle issue, not a logic/compiler fault.
+#   The fix is the same class as builds 16-21: a dedicated, shorter, re-amp-dense return lane (or an explicit
+#   poke of the loop invert each cycle). The SHIFT is the milestone and it is clean; the loop is the capstone.
+# ONE-HOT ROM fetch walk NOT reached in budget (depends on the closed ring). The one-hot rails are ready to
+#   drive a decoder-less ROM (each Q_i AND word_i, OR down each bit column) exactly as designed.
+#
+# No feature patch was added — only test-harness/redstone-computer/.
