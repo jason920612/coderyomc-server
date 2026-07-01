@@ -1,0 +1,106 @@
+# coderyoMC redstone-computer MAP — MINIMAL RUNNING CPU: FETCH -> EXECUTE (build-24)   ✅ THE CAPSTONE
+#
+# build-23 (PR#76) delivered the autonomous instruction-FETCH heart: a self-recirculating one-hot
+#   ring-PC (1000->0100->0010->0001->1000 forever, no driver) driving a decoder-less one-hot ROM
+#   whose output WALKS W0->W1->W2->W3 per clock (all difftest BIT-IDENTICAL). build-24 wires
+#   FETCH -> EXECUTE: the ROM word each clock drives an ACCUMULATOR, so the machine RUNS A PROGRAM.
+#   ACC := ACC XOR (fetched ROM bit) every clock -> a genuine (if tiny) stored-program machine:
+#   it walks the ROM and accumulates, autonomously, on a single shared clock.  NO feature patch.
+#
+# JAR: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (patch-0020 compiler, REUSED not rebuilt).
+#   Boot -Dcoderyo.redstone.compile.enabled=true ; port 15568, RCON 25579(pw ring2), flat world,
+#   spawn-monsters=false, floor forceloaded/extended to z=275.  Build + power-probe over RCON
+#   (build-24-ctl.py); two-phase clock = redstone_block over enable dusts, settled by GAME TICKS
+#   (`tick sprint N` polled on gametime).  difftest = op-gated `coderyo redstone difftest x y z t`
+#   from the server CONSOLE stdin (RCON's restricted dispatcher can't reach the `coderyo` literal),
+#   verdict from the log "[redstone-difftest/live] PASS ... BIT-IDENTICAL".
+# Convention (fork, calibrated): repeater/comparator[facing=D] => REAR/INPUT on side D, OUTPUT exits
+#   the OPPOSITE side; SUBTRACT comp out = max(0, rear - max(sideL,sideR)); redstone_block over/beside
+#   a dust drives it to 15.
+#
+# ================================ THE DESIGN (a minimal programmable accumulator CPU) ================================
+# FETCH  = build-23 ring-PC + one-hot ROM, rebuilt VERBATIM (build-22 ffs/links + build-23 loop-close/rom).
+#          ROM words (bits b2 b1 b0):  Q0=100  Q1=110  Q2=011  Q3=001 ; read cells b2(32,190) b1(2,193)
+#          b0(-27,196).  As the ring walks the ROM output walks 100->110->011->001->100.
+# EXECUTE = one accumulator flip-flop (the SAME proven master-slave D-FF body used by every ring stage,
+#          build-22 FF_TEMPLATE verbatim), placed in clear space at DX=-80, DZ=+100 (base south of the
+#          ROM), clocked by the SAME two-phase clock as the ring.  Its D input is D = XOR(ACC, op),
+#          where op = ROM bit b0 (chosen: geometrically nearest read cell, HI=12).  On each clock the
+#          master captures XOR(ACC_old, op) while the slave still holds ACC_old (edge-triggered, no race);
+#          the falling edge writes ACC_new = ACC_old XOR op.  => ACC := ACC XOR (fetched b0).
+#
+#   Accumulator FF ports (DX=-80,DZ=+100):  ACC=Slave.Q (-36,101,222)  Qbar (-32,101,230)
+#     Master D-ports  D_north(-19,101,218) D_south(-18,101,235)   delivery source M=(-33,101,245)
+#     enables (redstone_block y=102): master (-18,217)/(-20,233)  slave (-34,217)/(-36,233)
+#
+# DATAPATH (build-24-xor.commands.txt):
+#   * op:  b0 read (-27,196) re-amped, then a FULLY PLANAR haul east of the FF (x=-12) and looped in
+#          from the south (z=250) to reach M's neighbourhood -> ZERO crossings on the operand (no bridge).
+#   * D=XOR(ACC,op) at the delivery source M=(-33,245):
+#       Qbar tapped (isolating stub + repeater), dropped, INVERTED (comp[facing=east], rear=15-block,
+#         side=Qbar) => Q=15-Qbar=ACC at (-33,241).
+#       compA @(-33,243)[facing=north]: rear=Q, side(W)=op  -> out south = ACC-op   -> M
+#       compB @(-33,247)[facing=south]: rear=op, side(W)=ACC -> out north = op-ACC   -> M
+#       M = max(ACC-op, op-ACC) = |ACC-op| = XOR(ACC,op).
+#     The XOR is cross-coupled (each input feeds one rear + the OTHER comparator's side), so the Q-side
+#     rail (x=-35) crosses the op-side rail (x=-37 col -> z=243 row): resolved by ONE Y-bridge
+#     (dust climbs y101->y102->y103 over the op dust at (-35,243) and back) — the build-23 bridge idiom,
+#     difftest-clean.  A post-bridge RE-AMP repeater (-35,246) restores Q to a clean 15 into compB's side.
+#   * delivery M -> both master D-ports reuses the ring LINK riser fan-out (build-22 link steps 5-7,
+#     translated): haul east at z=245, east riser x=-14 -> z=215 lane -> D_north(-19,218); D_south riser
+#     x=-18 -> D_south(-18,235).
+#
+# BUILD LESSONS (new this build):
+#   1. INVERT side-feed must be DUST, not a repeater: a re-amp repeater landing ON the comparator's
+#      side cell (-32,240) fed the comparator wrong (out stuck at 15). Fix = plain dust into the side,
+#      re-amp one cell further back (-32,238) — same rule build-22 used for the link invert (clean
+#      repeater at corr-2, dust at corr-1).
+#   2. Y-BRIDGE decays HARD: a 3-cell y-bridge + ~5 cells of rail dropped Q 15 -> 7 (below the HI
+#      threshold, corrupting the subtract). A re-amp repeater immediately AFTER the bridge is mandatory.
+#   3. XOR IS INTRINSICALLY CROSS-COUPLED: |A-B| needs A on {compA.rear, compB.side} and B on
+#      {compB.rear, compA.side} — the two side-feeds always swap sides, so exactly ONE crossing (one
+#      Y-bridge) is unavoidable.  Space the two comparators >=4 apart on z and keep every side-feed
+#      rail 2 cells off neighbouring rails/ports or dust merges silently.
+#   4. Keep the OPERAND haul planar: routing op EAST of the FF footprint and looping it in from the far
+#      SOUTH reaches the delivery source with ZERO crossings — no bridge needed on op, only on the XOR.
+#
+# ================================ RESULT — THE MACHINE RUNS A PROGRAM (autonomous, no driver) ================================
+# Program = ROM b0 stream as the ring walks: [b0(W0),b0(W1),b0(W2),b0(W3)] = [0,0,1,1] (repeating).
+# Clocked through 8 steps (init ACC=1), probing ring Q, ROM word, and ACC each clock:
+#     init : Q=1000 ROM=100 ACC=1
+#     clk1 : Q=0100 ROM=110 ACC=1     (XOR 0)
+#     clk2 : Q=0010 ROM=011 ACC=1     (XOR 0)
+#     clk3 : Q=0001 ROM=001 ACC=0     (XOR 1)  <- toggled
+#     clk4 : Q=1000 ROM=100 ACC=1     (XOR 1)  <- toggled
+#     clk5 : Q=0100 ROM=110 ACC=1
+#     clk6 : Q=0010 ROM=011 ACC=1
+#     clk7 : Q=0001 ROM=001 ACC=0     <- toggled
+#     clk8 : Q=1000 ROM=100 ACC=1     <- toggled
+#   Every step satisfies ACC_next = XOR(ACC_prev, fetched_b0).  The signature 1,1,1,0 (repeating) is the
+#   XOR running-sum trajectory for op-stream [0,0,1,1] — and it DIFFERS from the pure LOAD trajectory
+#   (ACC=op delayed = 0,0,1,1), proving the FEEDBACK is live: ACC computes on its OWN prior value, i.e.
+#   the accumulator genuinely EXECUTES (accumulates) the fetched word each clock, not merely latches it.
+#   The ring walks (FETCH), the ROM emits the word (FETCH), the accumulator computes ACC:=ACC XOR word.b0
+#   (EXECUTE) — autonomously, on one shared clock, no driver.  THIS IS A MINIMAL RUNNING CPU.
+#
+# A LOAD variant (D=op, no feedback/XOR — build-24-load.commands.txt) was validated first as a lower-risk
+# stepping stone: ACC = fetched b0 delayed one clock (0,0,1,1), difftest BIT-IDENTICAL (3150 cells). The
+# XOR accumulate above is the real capstone.
+#
+# ================================ RESULT — difftest (WHOLE CPU: ring + ROM + accumulator, single-region) ================================
+#   held ACC=0 (ring 1000):  coderyo redstone difftest -36 101 222 200 -> PASS BIT-IDENTICAL (200 ticks, 3226 cells, 1603 components, 48 chunks, single-region=true)
+#   held ACC=1 (ring 0100):  coderyo redstone difftest -36 101 222 150 -> PASS BIT-IDENTICAL (150 ticks, 3226 cells)
+#  => the ENTIRE fetch->execute machine — self-recirculating ring-PC + decoder-less one-hot ROM + the
+#     XOR-accumulator (invert + cross-coupled |A-B| + Y-bridge + master-slave register + riser fan-out),
+#     3226 cells / 1603 components across 48 chunks — compiles BIT-FOR-BIT to vanilla in BOTH held ACC
+#     states.  The regionized MULTITHREADED compiler is transparent to a genuine running stored-program
+#     machine.
+#
+# FILES (all under test-harness/redstone-computer/, NO feature patch):
+#   build-24-gen_acc.py       FF (translated) / deliver / load / xor generator
+#   build-24-ff.commands.txt  accumulator FF body (DX=-80,DZ=+100)
+#   build-24-deliver.commands.txt  M -> both D-ports riser fan-out
+#   build-24-load.commands.txt     LOAD operand route (D=op) — stepping stone
+#   build-24-xor.commands.txt      ACCUMULATE datapath (D=XOR(ACC,op)) — the capstone insert
+#   build-24-ctl.py           controller: rebuild + two-phase clock (ring+ACC) + probes + run/difftest
+# Rebuild order: (build-22 floor/ffs/links) + (build-23 loop-close/rom) + build-24 ff + deliver + xor.

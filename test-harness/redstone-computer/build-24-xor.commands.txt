@@ -1,0 +1,44 @@
+# build-24 XOR-accumulate: M(-33,245) = XOR(Q_acc, op).
+# Q from Qbar_acc(-32,230) tap+invert -> (-33,241). op arrives from south loop at (-33,250).
+# compA@(-33,243)[north]: rear(-33,242)=Q -> out south (-33,244)->M ; side W(-34,243)=op  => Q-op
+# compB@(-33,247)[south]: rear(-33,248)=op -> out north (-33,246)->M ; side W(-34,247)=Q  => op-Q
+# M = |Q-op| = XOR.  One Y-bridge: Q-side (x=-35 vert) hops op-side horizontal at (-35,243).
+#
+# --- Qbar tap + invert -> Q at (-33,241) ---
+setblock -32 101 231 minecraft:redstone_wire
+setblock -32 101 232 minecraft:repeater[facing=north]
+fill -32 101 233 -32 101 240 minecraft:redstone_wire
+setblock -32 101 236 minecraft:repeater[facing=north]
+setblock -32 101 238 minecraft:repeater[facing=north]
+setblock -32 101 241 minecraft:comparator[facing=east,mode=subtract]
+setblock -31 101 241 minecraft:redstone_block
+fill -33 101 241 -33 101 242 minecraft:redstone_wire
+# --- XOR core comparators + merge ---
+setblock -33 101 243 minecraft:comparator[facing=north,mode=subtract]
+setblock -33 101 244 minecraft:redstone_wire
+setblock -33 101 245 minecraft:redstone_wire
+setblock -33 101 246 minecraft:redstone_wire
+setblock -33 101 247 minecraft:comparator[facing=south,mode=subtract]
+# --- op main arrival: south loop (-33,250) -> compB rear (-33,248) ---
+fill -33 101 248 -33 101 250 minecraft:redstone_wire
+# --- op-side branch: op(-33,249) -> compA west side (-34,243) via x=-37 column ---
+setblock -34 101 249 minecraft:redstone_wire
+setblock -35 101 249 minecraft:redstone_wire
+setblock -36 101 249 minecraft:redstone_wire
+fill -37 101 243 -37 101 249 minecraft:redstone_wire
+setblock -37 101 246 minecraft:repeater[facing=south]
+setblock -36 101 243 minecraft:redstone_wire
+setblock -35 101 243 minecraft:redstone_wire
+setblock -34 101 243 minecraft:redstone_wire
+# --- Q-side branch: Q(-33,241) -> compB west side (-34,247) via x=-35 with Y-bridge over (-35,243) ---
+setblock -34 101 241 minecraft:redstone_wire
+setblock -35 101 241 minecraft:redstone_wire
+setblock -35 101 242 minecraft:stone
+setblock -35 102 242 minecraft:redstone_wire
+setblock -35 102 243 minecraft:stone
+setblock -35 103 243 minecraft:redstone_wire
+setblock -35 101 244 minecraft:stone
+setblock -35 102 244 minecraft:redstone_wire
+fill -35 101 245 -35 101 247 minecraft:redstone_wire
+setblock -35 101 246 minecraft:repeater[facing=north]
+setblock -34 101 247 minecraft:redstone_wire
