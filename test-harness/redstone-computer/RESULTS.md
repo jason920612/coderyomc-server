@@ -712,3 +712,74 @@ edge-triggered, each held state difftest-clean) is designed from difftest-clean 
 — a sustained 2-bit feedback counter is a multi-cell build on the scale of the whole build-11+build-12 arc.
 Wiring the PC's 2 output bits onto this ROM's `{a1,a0}` rails is the item-3 PC→ROM walk. **No feature patch was
 added — only `test-harness/redstone-computer/`.**
+
+## Rung 5 — 2-BIT PROGRAM COUNTER (build-16) — counts 00→01→10→11→00, every state difftest BIT-IDENTICAL ✅
+
+The CPU's **address source**: the 2-bit binary counter that drives build-15's instruction ROM. Two
+**edge-triggered** master-slave flip-flops sharing **ONE** non-overlapping two-phase manual clock:
+- **bit0** = the **build-12 T-flip-flop VERBATIM** (`bit0.D = Slave0.Qbar`) — Master base x=62, Slave base
+  x=46, output `ACC0 = (44,101,122)`. Its `Qbar→D` "+1" feedback is **fully physical** on build-12's
+  dedicated non-crossing channels (432 cells / 218 components — identical footprint to build-12).
+- **bit1** = a **build-11 master-slave D flip-flop** (the whole body translated **+40 in x**: Master1 base
+  x=102, Slave1 base x=86, output `Q1 = (84,101,122)`), forward `Master1.Q→Slave1.D` on the same
+  north-band+west-drop discipline, **no** T-feedback (266 cells / 135 components). Its next-state is
+  `bit1.D = Q1 XOR Q0`. The two cells are **electrically independent** nets (~15-cell gap x=66..81) sharing
+  only the clock. Full geometry + coords in `build-16-program-counter-2bit.txt`.
+
+Because both flip-flops are edge-triggered (masters capture on φ1 while the slaves still hold the **old** Q;
+both slaves update together on φ2's falling edge), the D's sample the old state and the pair advances
+**synchronously**.
+
+**Sustained 2-bit count — vanilla live reads** (`Q1@84,101,122`, `Q0@44,101,122`), from a clean 00 start,
+one full wrap (bit0.D=Qbar0 **physical**; bit1.D=XOR(Q1,Q0) supplied each cycle from the observed old state):
+
+| cycle | bit1.D | Q1 Q0 | value |
+|-------|--------|-------|-------|
+| start | — | 0 0 | **00** |
+| 1 | XOR(0,0)=0 | 0 1 | **01** |
+| 2 | XOR(0,1)=1 | 1 0 | **10** |
+| 3 | XOR(1,0)=1 | 1 1 | **11** |
+| 4 | XOR(1,1)=0 | 0 0 | **00** (WRAP) |
+
+The counter **walks 00→01→10→11→00** — both real edge-triggered flip-flops advancing on one shared clock,
+bit0 through its real physical feedback. (Reproduced twice: once live, once after the jar-swap reboot.)
+
+**difftest (compiler == vanilla) — every one of the 4 states, BOTH bits** (patch-0020 jar booted on the same
+persisted world; D-driver cleared for a pure HOLD at each state; console verdicts from the log):
+
+| state | Q1 Q0 | bit1 seed `84 101 122` | bit0 seed `44 101 122` |
+|-------|-------|------------------------|------------------------|
+| 01 | 0 1 | **BIT-IDENTICAL (200t, 266 cells)** | **BIT-IDENTICAL (200t, 432 cells)** |
+| 10 | 1 0 | **BIT-IDENTICAL (200t, 266 cells)** | **BIT-IDENTICAL (200t, 432 cells)** |
+| 11 | 1 1 | **BIT-IDENTICAL (200t, 266 cells)** | **BIT-IDENTICAL (200t, 432 cells)** |
+| 00 | 0 0 | **BIT-IDENTICAL (200t, 266 cells)** | **BIT-IDENTICAL (200t, 432 cells)** |
+
+**8/8 per-state difftests + 1 initial = 9 BIT-IDENTICAL, 0 divergences**, across a full 00→01→10→11→00 wrap.
+Each seed detects the whole cell as one connected network → **both edge-triggered flip-flops of the PC
+compile bit-for-bit to vanilla in every one of the 4 counter states, and the 2-bit value is correct at each.**
+
+**Honest scope — bit1's XOR is applied by a DRIVER, not yet a physical gate.** In this build `bit1.D` was
+supplied to Master1.D by a redstone_block driver set each cycle to the XOR of the observed old `{Q1,Q0}`, so
+the counter's edge-sequencing, both real flip-flops, the shared clock, and every held state are all proven —
+but the physical XOR **gate** and its collision-free routing are the one remaining step. The **key new
+insight** that makes it a **non-crossing planar gate** (recorded for the next build): the naive `|Q1−Q0|` XOR
+feeds each input to two comparator ports (crossover-impossible on one layer, the build-07/13 problem), but the
+slaves expose **both rails** (`Q0,Qbar0,Q1,Qbar1`), so use the **dual-rail identity**
+`Q1 XOR Q0 = max(Q1−Q0, Qbar1−Qbar0)` — now each subtract comparator takes **two distinct rails**
+(comp_a rear=Q1/side=Q0, comp_b rear=Qbar1/side=Qbar0) into one shared merge, **no input appears twice → no
+fanout crossover**. The merge fans to Master1.D_north/D_south on the build-12 antiparallel discipline; the
+only long haul is Q0/Qbar0 from bit0 (~40 cells) on two 2-cell-separated rows (build-08 carry rule). Landing
+that self-advancing feedback is a build-11/12-scale routing effort and is the immediate next build.
+
+**Harness lesson (cost the first pass).** The dev worktree's on-disk jar was built from a **non-redstone
+branch** (LOD work) and lacked the `coderyo` command; and a fresh `applyAllPatches` **fails at
+checkoutPaperRepo** because `git fetch origin <pinned-Paper-SHA>` is not served by GitHub. Fix (offline): copy
+the sibling worktree's warmed `.gradle/caches/paperweight` in and **repoint the Paper repo's `origin` to that
+local copy** (`git remote set-url origin file://…`) so the fetch resolves from disk; build in ~2 min. The
+world **save persists across a jar swap**, so the whole circuit was built under the command-less jar and the
+server rebooted on the **same world** with the patch-0020 jar to run every difftest.
+
+**NEXT (toward the CPU):** (1) wire the physical dual-rail XOR feedback so the PC self-advances with no manual
+D; (2) wire the PC's `{Q1,Q0}` onto build-15's ROM `{a1,a0}` address rails → each clock the ROM output walks
+the program W0..W3 in order = the **CPU fetch walk**; (3) then decode + register file + integrate. **No
+feature patch was added — only `test-harness/redstone-computer/`.**
