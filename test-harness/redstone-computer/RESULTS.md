@@ -1027,3 +1027,48 @@ build-17's dual-rail XOR (`max(Q1−Q0, Qbar1−Qbar0)`) → Master1.D for the f
 self-advance, and the PC→ROM fetch walk — now a routing exercise on **proven** parts (this repeater fan-out +
 build-17's difftest-clean XOR + build-15 ROM) with the port discipline established. **No feature patch — only
 `test-harness/redstone-computer/`.**
+
+---
+
+## build-21 — 2-BIT PC INTEGRATION: dual-rail XOR difftest-clean + LIVE-RAIL drive proven
+
+Fresh RCON-driven run on the patch-0020 jar (port 15568), full geometry + runnable command files in
+`build-21-2bit-pc-integration.txt`. Repeater/comparator convention re-calibrated empirically on this jar
+(`[facing=D]` ⇒ rear/input on side D, output opposite; a setblock'd repeater needs a neighbour update to
+re-read its input — drive the input last). Two-phase clock + probes automated (`clock.py`, `probe.py`).
+
+**(1) bit0 = build-12 T-flip-flop VERBATIM — clean physical self-advance reproduced ✅.** Physical toggle
+probe of `Q0@(44,101,122)` after each settled full clock cycle: **`15 → 0 → 15 → 0 → 15 → 0`** — six
+consecutive clean toggles, zero sticking; bit0 self-advances with **no manual D**.
+`difftest 44 101 122 200` → **PASS BIT-IDENTICAL (200 ticks, 440 cells, 218 components)** (matches build-20).
+
+**(2) Dual-rail XOR gate `bit1.D = Q1⊕Q0 = max(Q1−Q0, Qbar1−Qbar0)` — 4/4 truth + difftest-clean ✅.** Two
+subtract comparators → shared merge → clean repeater → `XV@(104,101,165)`. Truth (dual-rail drivers):
+
+| (Q1,Q0) | XV | XOR |
+|---------|----|-----|
+| 0 0 | 0 (LO) | 0 ✅ |
+| 0 1 | 15 (HI) | 1 ✅ |
+| 1 0 | 15 (HI) | 1 ✅ |
+| 1 1 | 0 (LO) | 0 ✅ |
+
+`difftest 104 101 165 100` → **PASS BIT-IDENTICAL (32 cells)** in **both** the HI (1,0) and LO (1,1) states.
+
+**(3) LIVE-RAIL DRIVE — the repeater tap DRIVES a downstream comparator from the self-advancing rail ✅ (NEW).**
+Beyond prior builds (which only showed the tap PORT reads a static 15): the Qbar0 repeater tap off the
+feedback trunk (52,145) → ~50-block haul → a spread-out subtract comparator `out = 15 − Qbar0`. Toggling
+bit0: `Qbar0=15 → out=0`, `Qbar0=0 → out=15` over 4 cycles — the comparator tracks the **live** rail.
+`difftest 100 101 171 200` → **PASS BIT-IDENTICAL (200 ticks, 593 cells, 295 components)** — the whole
+connected network (self-advancing bit0 + tap + haul + comparator). Port discipline proven in-context: without
+a re-amp repeater AT the comparator port the side arrived at 5 → wrong `out=10`; the re-amp lifted it to a
+clean 15 → correct `out=0/15`.
+
+**Honest status — full 4-state self-advance + ROM walk NOT landed.** The full physical `00→01→10→11→00`
+(all four rails → one XOR → Master1.D) and the PC→ROM fetch walk were not reached in budget. Concrete
+blocker, now pinned to coordinates: (a) the compact XOR's four input dusts (99–100 / 162–167) are mutually
+adjacent, so a hauled real rail cannot be wire-fed to one without shorting a neighbour (drivers avoid this;
+a **single** spread comparator fed by a real rail is proven in (3)); (b) bit0's Q0/Qbar0 are enclosed by
+build-12's own interconnects (only Qbar0 escapes), and `XV` must fan to Master1's two D-feed points. The fix
+is the from-scratch **wide-platform** PC with a shared spread fan-out bus — the same finding builds 16–19
+named, now confirmed hands-on. Every constituent is difftest BIT-IDENTICAL on this jar. **No feature patch —
+only `test-harness/redstone-computer/`.**
