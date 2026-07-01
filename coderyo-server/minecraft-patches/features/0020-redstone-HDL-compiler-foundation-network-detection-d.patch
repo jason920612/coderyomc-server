@@ -11,10 +11,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/com/coderyo/redstone/CompiledNetwork.java b/com/coderyo/redstone/CompiledNetwork.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..b5fdda21450382b47a877069168bee30712e16d5
+index 0000000000000000000000000000000000000000..8363b7d9f0681385498fc07bdf9a7234805316f2
 --- /dev/null
 +++ b/com/coderyo/redstone/CompiledNetwork.java
-@@ -0,0 +1,2488 @@
+@@ -0,0 +1,2505 @@
 +/*
 + * coderyoMC — redstone HDL-compiler (Stream B). Clean-room independent implementation.
 + * MCHPRS studied as concept only (compile redstone to a logic graph); never copied.
@@ -511,14 +511,18 @@ index 0000000000000000000000000000000000000000..b5fdda21450382b47a877069168bee30
 +     * ScheduledEntry} of the matching {@link Kind} at the SAME remaining delay and priority — so an
 +     * oscillator mid-cycle continues in phase (see {@link RedstoneCompileConfig#seedScheduledTicks()}).
 +     *
-+     * <p><b>Tick-frame alignment.</b> The harness steps the compiled model with its {@code rel}
-+     * counter anchored at 0 = the live game time at compile. A vanilla scheduled tick with absolute
-+     * {@code triggerTick} T fires during the game tick whose time equals T (the first tick with
-+     * {@code gameTime >= T}), i.e. at {@code rel = T - now}. The queue's {@link ScheduledEntry#trigger}
-+     * is in that same rel frame, so the seeded trigger is simply {@code T - now}. It is clamped to
-+     * {@code >= 1}: any tick already due at the current game time was collected + run before this
-+     * compile ran (scheduled block ticks drain before command execution within a server tick), so
-+     * whatever remains is due next tick at the soonest.
++     * <p><b>Tick-frame alignment (#63).</b> The harness steps the compiled model with its {@code rel}
++     * counter anchored at 0 = the FIRST live-world tick the sim is compared against. That first
++     * comparison happens one game tick AFTER the compile snapshot: compile runs during command
++     * processing at game time {@code now}, but the job's first {@code tickOnce} runs at the end of the
++     * NEXT server tick, when the live game time has already advanced to {@code now + 1}. So the sim
++     * step whose live counterpart has game time T is {@code rel = T - now - 1}, and a vanilla
++     * scheduled tick firing at absolute {@code triggerTick} T is seeded at that offset. The earlier
++     * naive {@code T - now} ran every seeded oscillator a constant one tick behind vanilla — its
++     * PERIOD exact but its PHASE off — so a free-running clock diverged the instant its first seeded
++     * transition landed. Clamped {@code >= 0}: a tick due at {@code now + 1} fires at {@code rel 0};
++     * nothing pending is due earlier (ticks due at the snapshot game time drained before the compile
++     * command ran — scheduled block ticks drain before command execution within a server tick).
 +     *
 +     * <p>Only the pure delayed-redstone-transition kinds are seeded (torch, repeater, comparator,
 +     * observer, lamp) plus the impulse un-power kinds (button, target, lightning rod). Piston /
@@ -548,7 +552,20 @@ index 0000000000000000000000000000000000000000..b5fdda21450382b47a877069168bee30
 +                if (this.willTick(packed, kind)) {
 +                    return; // one pending tick per (pos, kind), exactly like UNIQUE_TICK_HASH
 +                }
-+                final long trigger = Math.max(1L, tick.triggerTick() - now);
++                // Frame-align the seeded trigger to the differential harness's comparison frame
++                // (#63). The compiled model is stepped with rel=0 == the FIRST tick the live world
++                // is compared against, and that first comparison happens one game tick AFTER the
++                // compile snapshot (compile runs during command processing; the job's first
++                // {@code tickOnce} runs at the end of the NEXT server tick, by which point the live
++                // world's game time has advanced to {@code now + 1}). So the sim step whose live
++                // counterpart has game time T is {@code rel = T - now - 1}, NOT {@code T - now}: a
++                // vanilla scheduled tick firing at absolute {@code triggerTick} must fire in the
++                // compiled queue one step earlier than the naive offset, or the whole oscillator
++                // runs a constant one tick behind vanilla and diverges the moment its first
++                // transition lands (a free-running clock's period is exact, only its PHASE was off).
++                // Clamped >= 0 (a tick due at now+1 fires at rel 0; nothing pending is due earlier —
++                // ticks due at the snapshot game time already drained before the compile command ran).
++                final long trigger = Math.max(0L, tick.triggerTick() - now - 1L);
 +                this.queue.add(new ScheduledEntry(packed, kind, trigger, tick.priority().getValue(), this.subCounter++));
 +            });
 +        }
