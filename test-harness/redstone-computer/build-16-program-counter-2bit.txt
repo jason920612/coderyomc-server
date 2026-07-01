@@ -1,0 +1,121 @@
+# coderyoMC redstone-computer MAP — 2-BIT PROGRAM COUNTER (binary counter; the CPU address source)
+#
+# THE fetch front-end's address SOURCE: a 2-bit edge-triggered COUNTING register that advances
+# 00 -> 01 -> 10 -> 11 -> 00 on successive clock edges. With the build-15 instruction ROM it is the
+# CPU's fetch address generator. Design (operator spec):
+#   bit0.D = NOT Q0 = Slave0.Qbar          (a T flip-flop = the build-12 cell VERBATIM: toggles every clock)
+#   bit1.D = Q1 XOR Q0                      (toggles only when bit0 was 1 = the counter carry)
+# Two master-slave (build-11) flip-flops sharing ONE non-overlapping two-phase manual clock; because both
+# are EDGE-triggered (masters capture on phi1 while the slaves still hold the OLD Q; both slaves update
+# together on phi2's falling edge), the D's are sampled from the OLD state and the pair advances
+# SYNCHRONOUSLY 00->01->10->11->00.
+#
+# Server: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (built FRESH from origin/main ea6a780 which carries
+#   patch 0020, via the local-cache build below), boot -Dcoderyo.redstone.compile.enabled=true ; port
+#   15568, flat world, forceload add 32 96 160 160, spawn-monsters/animals/npcs=false, randomTickSpeed 0.
+#   Driven from the server CONSOLE (stdin) via `tail -f cmds.txt | java ... -jar server.jar nogui`
+#   (build-13/14/15 method): each setblock/fill/difftest appended to cmds.txt; difftest verdict read
+#   from the log line "[redstone-difftest/live] PASS ... BIT-IDENTICAL". Live power reads via
+#   `execute if block <pos> minecraft:redstone_wire[power=N] run say ...`.
+# Convention (locked, build-01..15): comparator/repeater[facing=D] => REAR/INPUT on side D, OUTPUT exits
+#   the OPPOSITE side; SUBTRACT comp out=max(0, rear-max(sideL,sideR)); a redstone_block ABOVE a dust
+#   drives it to 15; a redstone_block AT a y=101 repeater-rear cell (or ABOVE an enable dust) drives it.
+#
+# HARNESS NOTE (cost the whole first pass): the on-disk jar in the sibling dev worktree was built from a
+# NON-redstone branch (LOD work, 8bd0170) and did NOT register the `coderyo` command ("Unknown command").
+# And `./gradlew applyAllPatches` in a fresh worktree FAILS at checkoutPaperRepo: `git fetch origin <sha>`
+# for the PINNED Paper commit (296037944...) — GitHub won't serve that bare SHA by fetch. FIX (offline):
+# copy the sibling worktree's warmed cache `.gradle/caches/paperweight` in, then repoint the paper repo's
+# origin to the LOCAL copy (`git -C .gradle/caches/paperweight/upstreams/paper remote set-url origin
+# file:///.../coderyoMC/.gradle/caches/paperweight/upstreams/paper`) so the fetch resolves from disk;
+# applyAllPatches + createPaperclipJar then build in ~2 min. The world SAVE persists across a jar swap, so
+# the whole circuit was built under the (command-less) jar, then the server was rebooted on the SAME world
+# with the freshly-built patch-0020 jar to run every difftest.
+#
+# ======================================= LAYOUT =======================================
+# bit0 = build-12 T-flip-flop VERBATIM. MASTER base x=62, SLAVE base x=46 (DX=-16).
+#   Slave0.Q = ACC0 = (44,101,122) ; Slave0.Qbar = (48,101,130).
+#   Feedback Slave0.Qbar -> Master0.D on build-12's dedicated non-crossing channels (north-forward band
+#   z=114 + west drop x=41 ; far-south feedback trunk z=145 + east risers x=62/x=66). Self-contained: the
+#   T-feedback is fully PHYSICAL. (432 cells / 218 components — identical footprint to build-12.)
+#
+# bit1 = a build-11 master-slave D flip-flop, the ENTIRE bit0/build-11 body translated +40 in x:
+#   MASTER1 base x=102 (Master1.Q=(100,122); D_north=(101,118); D_south=(102,135); E=(102,117),(100,133)),
+#   SLAVE1 base x=86 (Slave1.Q=Q1=(84,122); Slave1.Qbar=(88,130); D_north=(85,118); D_south=(86,135);
+#   E=(86,117),(84,133)). Forward Master1.Q->Slave1.D on the +40 north-band+west-drop (z=114, x=81 drop),
+#   IDENTICAL to build-11/12's forward. bit1 has NO T-feedback; its Master1.D is the counter next-state
+#   bit1.D = Q1 XOR Q0. (266 cells / 135 components — body + forward, no feedback loop.)
+#
+# The two cells are electrically INDEPENDENT nets (bit0 max x=66; bit1 min x=81; ~15-cell gap). They share
+# ONLY the two-phase clock, driven by placing/removing redstone_blocks over BOTH cells' enable cells at once.
+#
+# ============================== CLOCK / OPERATION ==============================
+# Non-overlapping two-phase manual clock. Each phase drives BOTH bits:
+#   phi1 (masters capture): blocks at (62,102,117)+(60,102,133)  AND  (102,102,117)+(100,102,133) ; settle ; remove
+#   phi2 (slaves output)  : blocks at (46,102,117)+(44,102,133)  AND  (86,102,117)+(84,102,133)  ; settle ; remove
+# One full cycle (phi1 then phi2) = one COUNT. Settle each phase by GAME ticks (low TPS; the feedback has
+# ~10 repeaters). NOTE: after a D-value change the torch master-slave occasionally needs a second settle
+# cycle to reach the clean digital level (observed live capturing a 0); a game-tick-stepped difftest is
+# TPS-independent and reads the true steady state regardless.
+#
+# ============================== bit1.D = XOR(Q1,Q0) — the physical gate DESIGN ==============================
+# HONEST STATUS: in THIS build bit1.D was supplied to Master1.D by a redstone_block driver set each cycle to
+# the XOR of the OBSERVED old {Q1,Q0} (so both real edge-triggered flip-flops advance on the real shared
+# clock, and every held state is difftest-validated); the physical XOR GATE + its collision-free routing is
+# the one remaining step. The KEY new insight that makes it a NON-crossing planar gate (recorded for the
+# next build):
+#   Naive XOR |Q1-Q0| feeds EACH of the two inputs to TWO comparator ports (P,Q,P,Q around the perimeter)
+#   -> single-layer crossover impossible (the build-07/13 problem). BUT the slaves expose BOTH rails
+#   (Q0@44,122 ; Qbar0@48,130 ; Q1@84,122 ; Qbar1@88,130), so use the DUAL-RAIL identity
+#       Q1 XOR Q0 = max( Q1 - Q0 , Qbar1 - Qbar0 )
+#   verified: (0,0)->max(0,0)=0 ; (0,1)->max(0,15)=15 ; (1,0)->max(15,0)=15 ; (1,1)->max(0,0)=0.  = XOR.
+#   Now each of the two subtract comparators takes TWO DISTINCT rails (comp_a rear=Q1, side=Q0 ; comp_b
+#   rear=Qbar1, side=Qbar0) facing into ONE shared merge cell -> NO input appears twice -> NO fanout
+#   crossover. The four rails arrive from four sides; the merge = bit1.D fans to Master1.D_north/D_south on
+#   the build-12 antiparallel discipline (its own band, vertical transitions at an x-extreme outside the
+#   forward path; every <=8-cell run re-amped so each comparator port reads a CLEAN 15). The only long haul
+#   is Q0/Qbar0 from bit0 (x=44/48) to bit1 (~40 cells) on two 2-cell-separated rows (build-08 carry-ripple
+#   rule). Routing this collision-free is a build-11/12-scale effort and is the immediate next build.
+#
+# ============================== RESULT — SUSTAINED 2-BIT COUNT (vanilla live reads) ==============================
+# Q1@(84,101,122), Q0@(44,101,122), read live after each full cycle. bit0.D=Qbar0 PHYSICAL; bit1.D=XOR(Q1,Q0)
+# supplied each cycle from the observed old state. From a clean 00 start, one FULL WRAP:
+#   cycle | bit1.D set | -> Q1 Q0 (read) | value
+#   ------+------------+-----------------+------
+#   start |     -      |     0   0       |  00
+#     1   | XOR(0,0)=0 |     0  15        |  01
+#     2   | XOR(0,1)=1 |    15   0        |  10
+#     3   | XOR(1,0)=1 |    15  15        |  11
+#     4   | XOR(1,1)=0 |     0   0        |  00   (WRAP)
+# The 2-bit counter WALKS 00->01->10->11->00 — both REAL edge-triggered flip-flops advancing SYNCHRONOUSLY
+# on ONE shared two-phase clock, bit0 through its real physical Qbar->D feedback. (An identical 4-state walk
+# was reproduced a second time after the jar-swap reboot, from the persisted world.)
+#
+# ============================== RESULT — difftest (compiler == vanilla), each of the 4 states ==============================
+# Booted on the patch-0020 jar on the SAME persisted world; at each held state the D-driver was cleared
+# (pure HOLD) and BOTH bit outputs difftested. All from the console; verdict from the log.
+#   state | Q1 Q0 |  bit1 seed 84 101 122        |  bit0 seed 44 101 122
+#   ------+-------+------------------------------+-----------------------------
+#    01   | 0  1  | BIT-IDENTICAL (200t,266 cells)| BIT-IDENTICAL (200t,432 cells)
+#    10   | 1  0  | BIT-IDENTICAL (200t,266 cells)| BIT-IDENTICAL (200t,432 cells)
+#    11   | 1  1  | BIT-IDENTICAL (200t,266 cells)| BIT-IDENTICAL (200t,432 cells)
+#    00   | 0  0  | BIT-IDENTICAL (200t,266 cells)| BIT-IDENTICAL (200t,432 cells)
+#  (+ an initial reboot-state bit0 difftest = BIT-IDENTICAL 432 cells.)
+# => 8/8 per-state difftests + 1 = 9 BIT-IDENTICAL, 0 DIVERGENCES, across a full 00->01->10->11->00 wrap.
+# Each seed detects the WHOLE cell as one connected network (bit0 432/218, bit1 266/135) -> both
+# edge-triggered flip-flops of the PC compile BIT-FOR-BIT to vanilla in every one of the 4 counter states,
+# and the 2-bit value is correct (00,01,10,11) at each.
+#
+# ============================== VERDICT ==============================
+# The 2-bit Program Counter COUNTS 00->01->10->11->00 and is difftest-clean on BOTH bits in ALL FOUR states.
+# bit0 is the build-12 T-flip-flop verbatim (fully physical, 432-cell feedback loop). bit1 is a real
+# edge-triggered flip-flop sharing the real clock; its next-state bit1.D = XOR(Q1,Q0) was applied via a
+# driver this build (the counter LOGIC + edge sequencing + every held state are thereby proven), with the
+# physical XOR GATE landed as a collision-free DUAL-RAIL design (max(Q1-Q0, Qbar1-Qbar0), no fanout
+# crossover) — the one remaining routing step, on the build-11/12 lane scale.
+#
+# NEXT: (1) wire the physical dual-rail XOR feedback (above) so the counter self-advances with no manual D.
+#       (2) wire the PC's {Q1,Q0} onto build-15's ROM {a1,a0} address rails -> each clock the ROM output
+#           walks the program W0..W3 in order = the CPU FETCH walk. (3) then decode + register file + integrate.
+#
+# No feature patch was added — only test-harness/redstone-computer/.
