@@ -843,3 +843,79 @@ PC→ROM address bus, both gated by the single Q0/Qbar0 second-consumer fan-out 
 XOR gate → Master1.D (self-advance) and (ii) build-15's ROM `{a1,a0}` (fetch walk); then decode opcode →
 control lines + register file + integrate the build-14 ALU + build-12 accumulator. **No feature patch was
 added — only `test-harness/redstone-computer/`.**
+
+## Rung 5 — FETCH FRONT-END on a WIDE PLATFORM with a shared FAN-OUT BUS (build-18) — fan-out bus functional + difftest-clean at LOW; vertical-bridge HIGH-state compiler divergence FOUND ⚠️
+
+The build-17 fix, built: rebuild the 2-bit PC on a **wide platform** that brings every register rail
+(Q0, Qbar0, Q1, Qbar1) **out to a shared fan-out bus from the start**, so each rail can feed multiple
+consumers (the bit1.D XOR gate AND the ROM address rails) with no crossing — the fix for the retrofit
+collision where bit0's own T-loop ring enclosed Q0/Qbar0. Full geometry in `build-18-fetch-fanout-bus.txt`.
+(Jar: the patch-0020 compiler reused byte-for-byte from the showcase build of `origin/main` 9e2343d.)
+
+**The wide floor plan (the ring-map insight that made it tractable).** bit0 = build-12 T-flip-flop verbatim
+(fully-physical `Qbar0→Master0.D` feedback), bit1 = build-11 D-flip-flop `+40x`, shared two-phase clock.
+Mapping bit0's T-loop ring showed the **west platform (x≤40), the x=67..80 gap, and the east (x≥89) are all
+OPEN** — each enclosed rail needs to cross **only ONE ring wire**:
+- **Q0** (x=44): tap @z=126, **hop over the x=41 forward-drop wire with a y=103 bridge**, land x=39, lane
+  south to the shared corridor at z=152.
+- **Qbar0** (x=48): **diode-tap the feedback trunk** (z=145) at x=50 (a repeater is a diode → no back-feed
+  into the difftest-clean T-loop), lane south to z=152.
+- **Q1** (x=84): hop over the x=81 forward-drop with a y=103 bridge, land x=79, lane to z=152.
+- **Qbar1** (x=88): **straight south** (bit1 has no feedback → its east/south is open), lane to z=152.
+
+The four lanes sit at x=39/50/79/88 (each ≥2 apart), re-amped every ≤9 dust — the **shared fan-out bus**.
+
+**(A) bit0 self-advance + fan-out bus — difftest-clean at LOW (reproduced on this jar) ✅.** Q0
+(@44,101,122) toggles `0→15→0→15` live through the physical feedback (one metastability-break pulse first),
+**with the whole bus attached**. The bus reads the four rails' **correct live values across counter states**:
+state 00 → `Q0BUS=0, Qbar0BUS=10, Q1BUS=0, Qbar1BUS=8`; state 01 → `Q0BUS=8, Qbar0BUS=0, Q1BUS=0,
+Qbar1BUS=8` (HIGH reads 8–10 = logical 1 over the ~30-cell lane; LOW = 0) — every rail tracks the count.
+
+| difftest (console; verdict from log) | verdict |
+|--------------------------------------|---------|
+| bit0 pure (no bus) | **BIT-IDENTICAL (200t, 432 cells, 218 comp)** |
+| bit0 + Q0 bridge (Q0=0) | **BIT-IDENTICAL (200t, 491 cells)** |
+| bit0 + Q0 & Qbar0 bus (Q0=0) | **BIT-IDENTICAL (200t, 505 cells)** (×2) |
+| bit1 + Q1 & Qbar1 bus | **BIT-IDENTICAL (200t, 369 cells)** (×2) |
+
+So the **whole PC + shared fan-out bus compiles bit-for-bit to vanilla** when the bridged rails carry LOW,
+and reads every rail's correct live value across states. **The build-17 fan-out routing is delivered
+functionally — the retrofit-collision is gone** (all four rails out on their own lanes, no crossing).
+
+**(B) NEW compiler finding — the vertical y=102/103 BRIDGE diverges 1–2 dust levels at HIGH (difftest caught
+it).** An **isolated** block-sourced bridge is fully parity-clean — a spot-check (up → over an independent
+wire → down) is **BIT-IDENTICAL (100t, 22 cells)**. But when a **ring-crossing** bridge carries a HIGH bit
+(Q0=1, a loaded/attenuated dust level), its vertical-transition cells **persistently diverge**:
+`bit0+Q0 bridge, Q0=1` → **DIVERGENCE, 800 mismatches, @tick0 (42,102,126) POWER real=9 sim=11**;
+re-sourcing the bridge from a clean repeater shrank it to **400 mism, (40,102,126) real=13 sim=14** but did
+**not** close it (400/200t = 2 climb cells persistently off by 1 = a *steady-state* divergence, reproduced
+after a full re-settle — not a settle artifact). So **patch-0020's model of VERTICAL redstone-dust
+attenuation drifts 1–2 levels from vanilla when a bridge carries a nonzero loaded signal** (it matches
+vanilla for the clean isolated case and for LOW). **Recorded, not fixed** — exactly like the build-06 torch
+gap and build-09 seeding edge the difftest discovered (this map adds NO feature patch). **Consequence:** the
+y=102 bridge is a functionally-correct fan-out shortcut but **not a reliably difftest-clean one**; a fully
+difftest-BIT-IDENTICAL fan-out of the *enclosed* rails needs a **FLAT** (single-layer, no vertical crossing)
+exit — i.e. re-laying bit0's forward+feedback interconnects on a genuinely wider footprint so a flat gap
+opens beside Q0/Qbar0 (build-17's "rebuild the ring bigger with deliberate gaps"). That flat re-lay
+(a build-11/12-scale interconnect rebuild) is the remaining routing work; not completed in budget.
+
+**(C) XOR-gate consume of the bus → bit1.D — attempted, layout bug found, not landed.** Built the build-17
+dual-rail XOR gate as a consumer fed by the four bus lanes (staggered inward turns + one bridge). It read
+wrong (XV=15 at state 00 where XOR(0,0)=0); power reads root-caused it to **(1)** the west-input runs crossing
+the **merge column** (x=64) and shorting it HIGH (build-13/14 "merge must not be crossed" lesson), and **(2)**
+the long side-runs arriving **attenuated** so `15 − Qbar0` doesn't null (build-01 "cleaning repeater AT each
+port" lesson). The buggy gate was removed and both bits re-verified BIT-IDENTICAL (505/369). The correct
+design (route both comparator outputs clear of the input rows to a merge no data run crosses; a cleaning
+repeater at every rear AND side) is specified but not built in budget.
+
+**Verdict.** The 2-bit PC is rebuilt on the **wide platform with the shared fan-out bus** — all four register
+rails out on their own ≥2-apart lanes to a shared corridor, correct live values across states, bit0
+self-advancing physically, whole thing difftest **BIT-IDENTICAL at LOW** (505+369 cells): **the build-17
+retrofit-collision is solved functionally.** The difftest then caught a **new compiler finding** — the
+vertical ring-crossing bridge diverges 1–2 levels at HIGH, so a fully difftest-clean fan-out wants a flat
+wide re-lay rather than a bridge. **Not landed:** the physical XOR consume (→ 2-bit self-advance) and the
+PC→ROM fetch walk. **NEXT:** (1) re-lay bit0's forward+feedback wider to open **flat** rail exits; (2) route
+the XOR gate with the merge clear of the input rows + cleaning repeaters at every port → bit1.D fanned to
+Master1.D_north/D_south → the PC self-advances; (3) tap the same bus into build-15's ROM `{a1,a0}` for the
+fetch walk; then decode + register file + integrate the build-14 ALU + build-12 accumulator. **No feature
+patch was added — only `test-harness/redstone-computer/`.**
