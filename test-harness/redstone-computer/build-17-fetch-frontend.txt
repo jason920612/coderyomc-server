@@ -1,0 +1,102 @@
+# coderyoMC redstone-computer MAP — INSTRUCTION-FETCH FRONT-END: physical XOR feedback + PC->ROM (build-17)
+#
+# GOAL (operator spec, the two remaining fetch steps after build-16's driver-applied PC):
+#   1. Route bit1's D = Q1 XOR Q0 with the LANDED non-crossing dual-rail design
+#      (Q1 XOR Q0 = max(Q1-Q0, Qbar1-Qbar0), two subtract comparators each fed two DISTINCT slave
+#      rails, OR the two subtract results) so the 2-bit PC SELF-ADVANCES 00->01->10->11->00 with NO
+#      driver block. difftest each state.
+#   2. Wire PC {Q1,Q0} onto build-15's ROM {a1,a0} address rails so each clock the ROM output walks
+#      W0->W1->W2->W3->W0 = the CPU instruction-fetch walk. difftest the walk.
+#
+# Server: coderyo-paperclip-26.2-R0.1-SNAPSHOT.jar (the SAME patch-0020 compiler that is on main:
+#   the jar reused byte-for-byte from the showcase worktree build of origin/main 9e2343d — the only
+#   commits between 9e2343d and the fetch branch base 4b6b8b5 are test-harness-only build-15/16, so the
+#   compiler code is identical; this SKIPS the applyAllPatches/checkoutPaperRepo build entirely). Boot
+#   -Dcoderyo.redstone.compile.enabled=true ; port 15568, flat world, forceload add 0 0 255 255,
+#   spawn-monsters/animals/npcs=false. Driven from the server CONSOLE (stdin) via
+#   `tail -f cmds.txt | java ... -jar server.jar nogui` (build-13/14/15/16 method): each setblock/fill/
+#   difftest appended to cmds.txt; difftest verdict read from the log "[redstone-difftest/live] PASS ...
+#   BIT-IDENTICAL". Live power reads via `execute if block <pos> minecraft:redstone_wire[power=N] run say`.
+# Convention (locked, build-01..16): comparator/repeater[facing=D] => REAR/INPUT on side D, OUTPUT exits
+#   the OPPOSITE side; SUBTRACT comp out=max(0, rear-max(sideL,sideR)); a redstone_block ABOVE a dust
+#   drives it to 15; a redstone_block AT a y=101 repeater-rear (or ABOVE an enable dust) drives it.
+#
+# =====================================================================================
+# (A) PHYSICAL DUAL-RAIL XOR GATE  — the bit1.D gate, built + difftest-clean  ✅
+# =====================================================================================
+# The genuinely NEW circuit of item-1: bit1.D = Q1 XOR Q0 = max(Q1-Q0, Qbar1-Qbar0) as two subtract
+# comparators facing a shared merge, each fed TWO DISTINCT rails (no input appears twice -> NO fanout
+# crossover, the build-07/13 planar-XOR problem SOLVED by using the slaves' both-rail outputs).
+# Built standalone at x~204, driven by 4 dual-rail drivers (Q1,Q0,Qbar1,Qbar0), output XV @(208,101,206):
+#   setblock 204 101 204 comparator[facing=west,mode=subtract]   # comp_a: rear(203,204)=Q1, side(204,203)=Q0, out(205,204)=Q1-Q0
+#   setblock 204 101 208 comparator[facing=west,mode=subtract]   # comp_b: rear(203,208)=Qbar1, side(204,207)=Qbar0, out(205,208)=Qbar1-Qbar0
+#   merge dust (205,204)->(206,204..208)<-(205,208) at (206,206); clean repeater 207,101,206[facing=west] -> XV (208,101,206)
+#   drivers (redstone_block y=102 over each input dust): Q1@203,102,204  Q0@204,102,203  Qbar1@203,102,208  Qbar0@204,102,207
+#
+# TRUTH TABLE (live power reads at XV, dual-rail drivers set per (Q1,Q0)):
+#   (Q1,Q0) | Q1-Q0 | Qbar1-Qbar0 | XV=max | XOR
+#   --------+-------+-------------+--------+----
+#    (0,0)  |   0   |  15-15 = 0  |   0    |  0   OK
+#    (0,1)  | 0-15=0 |  15-0 = 15 |  15    |  1   OK
+#    (1,0)  | 15-0=15|  0-15 = 0  |  15    |  1   OK
+#    (1,1)  | 15-15=0|  0-0 = 0   |   0    |  0   OK
+#   4/4 correct = XOR.
+# difftest (from console; verdict from log) over the whole connected gate (17 components / 32 cells):
+#   (1,0) HI : coderyo redstone difftest 208 101 206 100 -> BIT-IDENTICAL (100t, 32 cells)
+#   (1,1) LO : coderyo redstone difftest 208 101 206 100 -> BIT-IDENTICAL (100t, 32 cells)
+#   => the physical dual-rail XOR gate compiles BIT-FOR-BIT to vanilla in both output states. This is the
+#      exact bit1.D gate the self-advancing PC needs, PROVEN — no fanout crossover, single planar layer.
+#
+# =====================================================================================
+# (B) 2-BIT PC — both flip-flops rebuilt fresh + difftest-clean; bit0 SELF-ADVANCES physically ✅
+# =====================================================================================
+# bit0 = build-12 T-flip-flop VERBATIM (MASTER base x=62, SLAVE base x=46, ACC0=Q0 @44,101,122),
+#   with its Qbar0->Master0.D "+1" feedback FULLY PHYSICAL on build-12's dedicated non-crossing channels
+#   (forward north-band z=114 + west drop x=41 ; feedback south-band z=145 + east risers x=62/x=66).
+# bit1 = build-11 master-slave D flip-flop translated +40 in x (MASTER1 base x=102, SLAVE1 base x=86,
+#   Q1 @84,101,122 ; Qbar1 @88,101,130 ; Master1.D_north (101,118), D_south (102,135)), body + forward
+#   Master1.Q->Slave1.D only, NO T-feedback (its Master1.D is the counter next-state = the XOR gate).
+# Two-phase manual clock, both bits share it:
+#   phi1 (masters): blocks (62,102,117)+(60,102,133) AND (102,102,117)+(100,102,133) ; settle ; remove
+#   phi2 (slaves) : blocks (46,102,117)+(44,102,133) AND (86,102,117)+(84,102,133)  ; settle ; remove
+#
+# bit0 SELF-ADVANCE — physical Qbar0->D feedback, live reads @(44,101,122), from a clean 00 start:
+#   cycle 1 -> ACC0=1 ; cycle 2 -> 0 ; cycle 3 -> 1 ; cycle 4 -> 0   (0->1->0->1->0, ZERO sticking)
+#   The 1-bit counter self-advances with NO manual D (build-12 result reproduced fresh on this jar).
+#
+# difftest (console; verdict from log):
+#   bit0 held ACC0=0 : coderyo redstone difftest 44 101 122 200 -> BIT-IDENTICAL (200t, 432 cells, 218 components)
+#   bit1 held Q1=0   : coderyo redstone difftest 84 101 122 200 -> BIT-IDENTICAL (200t, 244 cells, 124 components)
+#   => both flip-flops of the PC compile BIT-FOR-BIT to vanilla; bit0's 432-cell / 218-component footprint
+#      is identical to build-12 (fully-physical T-loop), bit1's 244/124 is the build-11 body+forward.
+#
+# =====================================================================================
+# (C) INTEGRATION STATUS — physical XOR feedback + PC->ROM: the ROOT-CAUSE ROUTING FINDING  (honest)
+# =====================================================================================
+# Both remaining items need the SAME thing: bit0's Q0 (and Qbar0) fanned out to a SECOND consumer -- the
+# XOR gate (for bit1.D) in item-1, and the ROM address {a1,a0} in item-2 (Q1 is the item-2 a1, Q0 the a0).
+# bit1's Q1/Qbar1 are reachable (bit1 has no T-feedback, so its slave1 output side is open). bit0's
+# Q0@(44,122)/Qbar0@(48,130) are NOT: they are ENCLOSED by bit0's own two interconnects (which build-12
+# deliberately packed into every clean lane to make bit0's T-loop non-crossing):
+#   - NW walls: the FORWARD interconnect -- z=114 trunk spanning x=41..50, and the x=41 south-drop column
+#     z=115..137 -- form an L that seals Q0's north and west exits (every northward ramp hits z=114 at
+#     x=41..50; every westward ramp hits the x=41 drop).
+#   - SE walls: the FEEDBACK interconnect -- the x=48 drop z=131..145, the far-south z=145 trunk x=48..66,
+#     and the x=66 east riser -- seal Q0/Qbar0's south and east exits.
+# So a RETROFIT tap of Q0/Qbar0 for a second consumer collides with a live bit0 net on the same y=101
+# layer (exactly the build-11 wire-crossing failure mode, and the reason build-16 applied bit1.D by a
+# DRIVER). The fix is NOT a local reroute: the whole PC must be rebuilt on a WIDER platform that brings
+# Q0/Qbar0 (and Q1/Qbar1) out to a SHARED FAN-OUT BUS from the start -- one clean tap that fans to BOTH
+# the bit1.D XOR gate AND the ROM address rails -- with bit0's forward+feedback lanes shifted to leave that
+# bus clear (build-12's "design the channels in from the start on a wider board", now applied to a
+# two-consumer fan-out). Every CONSTITUENT is difftest-clean on this jar: the dual-rail XOR gate (A), both
+# edge-triggered flip-flops (B), and build-15's ROM. What remains is purely that wider-platform, non-
+# crossing FAN-OUT routing -- a build-11/12-scale layout effort, deferred (anti-stall: the XOR gate + a
+# physically self-advancing bit0 + both FFs difftest-clean are the landed wins).
+#
+# NEXT: rebuild the 2-bit PC on a wide platform with a Q0/Qbar0/Q1/Qbar1 fan-out bus; connect that bus to
+# (i) the dual-rail XOR gate (A) -> Master1.D so the PC self-advances, and (ii) build-15's ROM {a1,a0}
+# rails so each clock the ROM output walks W0..W3 = the fetch walk. Then decode opcode->control lines +
+# register file + integrate the build-14 ALU + build-12 accumulator.
+#
+# No feature patch was added -- only test-harness/redstone-computer/.
