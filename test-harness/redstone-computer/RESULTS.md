@@ -1350,3 +1350,45 @@ across the dense tile to the register D-port** — is **solved** by the elevated
 traced delivering the correct value. The `SUM→D` half of the loop is physically closed; the `Q→A` half and
 the 2-bit ROM front-end are the remaining routing on the same proven idiom. **No feature patch — only
 `test-harness/redstone-computer/`.**
+
+## build-27 — toward the SELF-COUNTING 2-bit accumulator: constant +1 operand CLOSED, twin SUM→D bridge built, D-injection blocker diagnosed ⚠️
+
+Goal: make the build-25/26 accumulator **autonomous** — a 2-bit register that counts `0→1→2→3→0` on a
+bare clock with **no data driver**, by physically closing `SUM→D`, `Q→A`, and a **constant +1** on operand
+B. build-26 traced only `SUM0→D0`. build-27 extends the idiom to both bits, adds the constant operand, and
+pins down the exact reason the loop cannot close with a wire. Boot = the reused `coderyo-bundler-26.2`
+patch-0020 jar (NO rebuild), `-Dcoderyo.redstone.compile.enabled=true`, port **15568**, RCON 25581, flat
+world, spawn off; settle by GAME ticks; difftest verdicts from the `[redstone-difftest/live]` log.
+
+**CLOSED this build — the constant +1 operand (difftest-clean):** redstone_blocks over the four B0 cells
+(B0=1), B1=0, Cin0=0 — a permanent `+1` on B with no driver.
+| test | verdict |
+|---|---|
+| `difftest 30 101 374 60` (adder **incl. B0 blocks**) | **BIT-IDENTICAL (60 ticks, 696 cells)** |
+| drive only A, read SUM=A+1 | `A=0→1, 1→2, 2→3, 3→0` (Cout1=1 on the 3→0 wrap) — **all OK, STABLE** |
+
+So the **+1 increment arithmetic — the heart of the counter — is physically correct on a real constant
+operand** (no B driver). Base preserved BIT-IDENTICAL: FF0 `44 101 312` (396 cells), FF1 `124 101 312` (436).
+
+**Built this build — the twin `SUM1→D1` bridge** (mirror of the proven `SUM0→D0`, +60 x), plus a laid
+**stone floor** under both ground runs (the gap `z331–359` is **void at y=100** — a bare wire there has no
+support; build-26's run must have had floor from an earlier session). The climb + y=103 express bus carries
+SUM (bus top = **14 when SUM=1, 0 when SUM=0** — the signal travels up and over the adder).
+
+**BLOCKER — why the loop does NOT self-count yet (the real finding).** The FF master **D-port cells**
+(`61,308`/`62,325`, `141,308`/`142,325`) are **not clean combinational inputs** — they are the **output dust
+of the FF's internal D-injection subtract comparators**, and in the latched state they read **power 15 by
+default** (probed 15 with the bridge fully cut). A redstone **dust** bridge can only **OR** into that node:
+it can **raise** D but can **never force D low**, so **the register cannot capture a 0 through a wire**.
+build-25's driver works only because a **redstone_block strongly overrides** the cell (a wire cannot). This
+also explains why a clock through the bridge latched `Q=1` regardless of SUM. Additionally the combined
+adder+2FF+2bridge net is hard to settle in **live** reads (deep comparator cascade), and difftest of the
+connected whole diverges on the bridge cells (real=15/sim=0 at the bridge dust).
+
+**Honest verdict — NOT autonomous / does NOT self-count.** Physically proven this build: the **constant +1
+operand** (difftest-clean, A+1 = 0→1→2→3→0 correct) and the **twin SUM-delivery bus**. Open links: (1)
+**register-capture-through-a-wire** — needs a strong-power injection or an **FF redesign exposing a clean
+wire-drivable D node** (the wire-can-only-OR limit is the crux; build-26's "D-cell=0" trace was a
+latch-state coincidence, not a controllable input); (2) **Q→A 4-way fan-out**, gated behind (1). **NEXT:**
+give the D-FF a clean combinational D input (or strong-power the D cell), then wire Q→A; then the ROM/variable
+operand. **No feature patch — only `test-harness/redstone-computer/`.**

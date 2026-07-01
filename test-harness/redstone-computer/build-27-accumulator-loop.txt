@@ -1,0 +1,55 @@
+# coderyoMC redstone-computer MAP — build-27: toward the SELF-COUNTING 2-bit accumulator.
+#
+# GOAL (the autonomous milestone): a 2-bit register that counts 0->1->2->3->0 on a bare clock
+#   with NO data driver, by physically closing:
+#       SUM[1:0] (adder) -> D[1:0] (register)      [feedback of the new value]
+#       Q[1:0]   (register) -> A[1:0] (adder)       [feedback operand A = ACC]
+#       constant +1 on operand B                    [so each clock: ACC := ACC + 1]
+#   build-26 closed only the SUM0->D0 trace. build-27 extends it and finds the hard blocker.
+#
+# SERVER: reuse the coderyo-bundler-26.2 patch-0020 jar (NO rebuild),
+#   -Dcoderyo.redstone.compile.enabled=true, port 15568, RCON 25581 (pw cpu2), flat world,
+#   spawn-monsters off, settle by GAME ticks (`tick sprint N`). difftest via RCON, verdict read
+#   from the `[redstone-difftest/live]` server log. Scripts: build-25-drv/-adder/-ff + build-27-loop.py.
+#
+# LAYOUT (world coords; adder DZ=360, registers dz=190):
+#   ADDER (build-08 2-bit ripple = build-07 tile x2):  SUM0=(30,101,374) SUM1=(90,101,374)
+#     A0 in-cells (18,369)(23,370)(38,377)(44,377)  B0 (22,369)(19,370)(36,377)(50,377)
+#     A1 in-cells (78,369)(83,370)(98,377)(104,377) B1 (82,369)(79,370)(96,377)(110,377)
+#   REGISTER (2x master-slave D-FF): FF0 Q0=(44,101,312) D0 (61,308)&(62,325)
+#                                    FF1 Q1=(124,101,312) D1 (141,308)&(142,325)
+#   GAP z331..359 is clear but the y=100 floor is VOID there -> bridges lay their own floor.
+#
+# TWIN SUM->D ELEVATED VERTICAL BRIDGE (build-27-loop.py sum_to_d, one per bit):
+#   tap SUM east 2 cells -> climb y101->y103 (two stone steps) -> express dust bus NORTH at
+#   y=103 over the whole adder on y=102 stone pillars (repeaters facing=south push north,
+#   re-amp) -> drop y103->y101 in the clear gap -> ground run EAST on a laid stone floor
+#   (repeaters facing=west) -> ground run NORTH to the register D-port (repeaters facing=south).
+#   Repeater convention (re-verified): repeater[facing=D] outputs the side OPPOSITE D.
+#
+# CONSTANT +1 ON B: redstone_blocks at y=102 over the four B0 cells (B0=1), B1 cells air (B1=0),
+#   Cin0=0. Permanent, no driver.
+#
+# ============================ RESULTS (all e2e on the cpu2 jar) ============================
+# CONSTANT +1 operand — CLOSED and difftest-clean:
+#   difftest @30,101,374 (adder incl. B0 blocks) -> BIT-IDENTICAL (60 ticks, 696 cells)
+#   drive only A, read SUM = A+1:  A=0->1, 1->2, 2->3, 3->0 (Cout1=1 on the 3->0 wrap) — all OK, STABLE.
+#   => the +1 INCREMENT arithmetic is physically correct with a real constant operand (no B driver).
+# BASE preserved BIT-IDENTICAL: FF0 @44,101,312 (396 cells), FF1 @124,101,312 (436 cells).
+# TWIN SUM->D bridges BUILT: the climb+express-bus carries SUM (bus top = 14 when SUM=1, 0 when SUM=0).
+#
+# BLOCKER (loop does NOT self-count yet):
+#   The FF master D-port cells are the OUTPUT dust of the FF's internal D-injection SUBTRACT
+#   comparators; in the latched state they read power 15 by DEFAULT (probed 15 with the bridge
+#   cut). A redstone-dust bridge can only OR into that node -> it can RAISE D but never FORCE D=0,
+#   so the register cannot capture a 0 through a wire. build-25's driver works only because a
+#   redstone_block STRONGLY overrides the cell; a wire cannot. Closing the loop needs a
+#   strong-power injection OR an FF redesign exposing a clean wire-drivable D. The Q->A 4-way
+#   fan-out is gated behind this and was not reached. The combined adder+2FF+2bridge net is also
+#   hard to settle in LIVE reads (deep cascade), and difftest of the connected whole diverges on
+#   the bridge cells.
+#
+# HONEST VERDICT: the +1 operand and the SUM-delivery bus are proven; register-capture-through-a-wire
+#   and Q->A feedback are the open links. Loop is NOT autonomous/self-counting.
+#   NEXT: give the FF a clean wire-drivable D input (or strong-power the D cell), THEN Q->A fan-out.
+# No feature patch — only test-harness/redstone-computer/.
