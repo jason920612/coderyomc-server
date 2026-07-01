@@ -1,0 +1,13 @@
+fill -33 101 245 -14 101 245 minecraft:redstone_wire
+setblock -25 101 245 minecraft:repeater[facing=west]
+setblock -17 101 245 minecraft:repeater[facing=west]
+fill -14 101 215 -14 101 244 minecraft:redstone_wire
+setblock -14 101 238 minecraft:repeater[facing=south]
+setblock -14 101 230 minecraft:repeater[facing=south]
+setblock -14 101 222 minecraft:repeater[facing=south]
+fill -18 101 237 -18 101 244 minecraft:redstone_wire
+setblock -18 101 236 minecraft:repeater[facing=south]
+fill -21 101 215 -14 101 215 minecraft:redstone_wire
+setblock -18 101 215 minecraft:repeater[facing=east]
+fill -21 101 216 -21 101 218 minecraft:redstone_wire
+setblock -20 101 218 minecraft:repeater[facing=west]

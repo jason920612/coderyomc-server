@@ -1,0 +1,63 @@
+setblock -18 101 222 minecraft:stone
+setblock -19 101 222 minecraft:redstone_wall_torch[facing=west]
+setblock -18 101 221 minecraft:repeater[facing=north]
+setblock -17 101 222 minecraft:repeater[facing=east]
+setblock -18 101 230 minecraft:stone
+setblock -17 101 230 minecraft:redstone_wall_torch[facing=east]
+setblock -18 101 231 minecraft:repeater[facing=south]
+setblock -19 101 230 minecraft:repeater[facing=west]
+setblock -20 101 222 minecraft:redstone_wire
+fill -20 101 223 -20 101 230 minecraft:redstone_wire
+setblock -16 101 230 minecraft:redstone_wire
+fill -16 101 222 -16 101 229 minecraft:redstone_wire
+setblock -18 101 218 minecraft:comparator[facing=north,mode=subtract]
+setblock -18 101 217 minecraft:redstone_wire
+setblock -19 101 218 minecraft:redstone_wire
+setblock -18 101 219 minecraft:redstone_wire
+setblock -18 101 220 minecraft:redstone_wire
+setblock -21 101 234 minecraft:redstone_block
+setblock -20 101 234 minecraft:comparator[facing=west,mode=subtract]
+setblock -20 101 233 minecraft:redstone_wire
+setblock -19 101 234 minecraft:redstone_wire
+setblock -18 101 234 minecraft:comparator[facing=south,mode=subtract]
+setblock -18 101 235 minecraft:redstone_wire
+setblock -18 101 233 minecraft:redstone_wire
+setblock -18 101 232 minecraft:redstone_wire
+setblock -34 101 222 minecraft:stone
+setblock -35 101 222 minecraft:redstone_wall_torch[facing=west]
+setblock -34 101 221 minecraft:repeater[facing=north]
+setblock -33 101 222 minecraft:repeater[facing=east]
+setblock -34 101 230 minecraft:stone
+setblock -33 101 230 minecraft:redstone_wall_torch[facing=east]
+setblock -34 101 231 minecraft:repeater[facing=south]
+setblock -35 101 230 minecraft:repeater[facing=west]
+setblock -36 101 222 minecraft:redstone_wire
+fill -36 101 223 -36 101 230 minecraft:redstone_wire
+setblock -32 101 230 minecraft:redstone_wire
+fill -32 101 222 -32 101 229 minecraft:redstone_wire
+setblock -34 101 218 minecraft:comparator[facing=north,mode=subtract]
+setblock -34 101 217 minecraft:redstone_wire
+setblock -35 101 218 minecraft:redstone_wire
+setblock -34 101 219 minecraft:redstone_wire
+setblock -34 101 220 minecraft:redstone_wire
+setblock -37 101 234 minecraft:redstone_block
+setblock -36 101 234 minecraft:comparator[facing=west,mode=subtract]
+setblock -36 101 233 minecraft:redstone_wire
+setblock -35 101 234 minecraft:redstone_wire
+setblock -34 101 234 minecraft:comparator[facing=south,mode=subtract]
+setblock -34 101 235 minecraft:redstone_wire
+setblock -34 101 233 minecraft:redstone_wire
+setblock -34 101 232 minecraft:redstone_wire
+fill -30 101 222 -21 101 222 minecraft:redstone_wire
+setblock -30 101 221 minecraft:repeater[facing=south]
+fill -30 101 216 -30 101 220 minecraft:redstone_wire
+setblock -30 101 215 minecraft:repeater[facing=south]
+fill -39 101 214 -30 101 214 minecraft:redstone_wire
+setblock -35 101 214 minecraft:repeater[facing=east]
+fill -37 101 215 -37 101 218 minecraft:redstone_wire
+setblock -36 101 218 minecraft:repeater[facing=west]
+fill -39 101 215 -39 101 237 minecraft:redstone_wire
+setblock -39 101 222 minecraft:repeater[facing=north]
+setblock -39 101 230 minecraft:repeater[facing=north]
+fill -38 101 237 -34 101 237 minecraft:redstone_wire
+setblock -34 101 236 minecraft:repeater[facing=south]

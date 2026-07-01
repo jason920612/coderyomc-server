@@ -1182,3 +1182,57 @@ cells)**.
 program counter that walks a decoder-less ROM. Next CPU step: decode is trivial with one-hot (the ROM words
 ARE the micro-ops); add a register file + integrate the ALU/accumulator. No feature patch — only
 `test-harness/redstone-computer/`.
+
+---
+
+## build-24 — MINIMAL RUNNING CPU: FETCH → EXECUTE (the accumulator runs a ROM program) ✅ CAPSTONE
+
+build-23 gave the autonomous instruction-**fetch** heart (self-recirculating ring-PC + decoder-less one-hot
+ROM). build-24 wires **fetch → execute**: the ROM word each clock drives an **accumulator**, so the machine
+**runs a program** — `ACC := ACC XOR (fetched ROM bit)` every clock, autonomously, on one shared two-phase
+clock. No driver, no feature patch (JAR reused, patch-0020 compiler).
+
+**Execute stage.** One accumulator flip-flop = the SAME proven master-slave D-FF body used by every ring
+stage (build-22 `FF_TEMPLATE` verbatim), placed in clear space at `DX=-80, DZ=+100` south of the ROM and
+clocked by the same clock as the ring. Its D input is `D = XOR(ACC, op)` where `op` = ROM bit **b0**. On
+each clock the master captures `XOR(ACC_old, op)` while the slave still holds `ACC_old` (edge-triggered, no
+race), and the falling edge writes `ACC_new = ACC_old XOR op`.
+
+**XOR datapath** (`build-24-xor.commands.txt`): Qbar tapped + inverted → `Q=ACC`; two subtract comparators
+`compA=ACC-op`, `compB=op-ACC` merge into `M=|ACC-op|=XOR`; `M` fans to both master D-ports via the ring
+link's riser delivery. The operand is routed **fully planar** (east of the FF, looped in from the far south
+— zero crossings). The XOR is intrinsically cross-coupled, so exactly **one Y-bridge** (build-23 idiom)
+carries the Q-side rail over the op-side rail, with a **post-bridge re-amp** repeater (bridge decays 15→7,
+below the HI threshold). New lesson: an invert comparator's side-feed must be **plain dust**, not a re-amp
+repeater (a repeater on the side cell stuck the output at 15).
+
+**The machine runs.** Program = ROM b0 stream as the ring walks `[b0(W0..W3)] = [0,0,1,1]` (repeating).
+Clocked 8 steps (init ACC=1), probing ring / ROM / ACC each clock:
+
+| clk | ring | ROM | ACC | note |
+|-----|------|-----|-----|------|
+| init| 1000 | 100 | 1 | |
+| 1 | 0100 | 110 | 1 | XOR 0 |
+| 2 | 0010 | 011 | 1 | XOR 0 |
+| 3 | 0001 | 001 | **0** | XOR 1 → toggle |
+| 4 | 1000 | 100 | **1** | XOR 1 → toggle |
+| 5 | 0100 | 110 | 1 | |
+| 6 | 0010 | 011 | 1 | |
+| 7 | 0001 | 001 | **0** | toggle |
+| 8 | 1000 | 100 | **1** | toggle |
+
+Every step satisfies `ACC_next = XOR(ACC_prev, fetched_b0)`. The signature `1,1,1,0` (repeating) is the XOR
+running-sum trajectory for op-stream `[0,0,1,1]` — and it **differs** from the pure LOAD trajectory
+(`ACC=op` delayed = `0,0,1,1`), proving the **feedback is live**: ACC computes on its own prior value, i.e.
+the accumulator genuinely **executes** (accumulates) the fetched word, not merely latches it. The ring walks
+(fetch), the ROM emits the word (fetch), the accumulator computes `ACC:=ACC XOR word.b0` (execute) — one
+shared clock, no driver. **This is a minimal running CPU.**
+
+**difftest (whole CPU: ring-PC + one-hot ROM + XOR-accumulator, single connected region):**
+- held `ACC=0` (ring 1000): `difftest -36 101 222 200` → **PASS BIT-IDENTICAL (200 ticks, 3226 cells, 1603 components, 48 chunks, single-region=true)**
+- held `ACC=1` (ring 0100): `difftest -36 101 222 150` → **PASS BIT-IDENTICAL (150 ticks, 3226 cells)**
+
+A LOAD variant (`D=op`, no feedback — `build-24-load.commands.txt`) was validated first as a lower-risk
+stepping stone (ACC = fetched b0 delayed one clock, difftest BIT-IDENTICAL, 3150 cells). The XOR accumulate
+is the real capstone. The regionized multithreaded compiler is bit-for-bit transparent to a genuine running
+stored-program machine. No feature patch — only `test-harness/redstone-computer/`.
