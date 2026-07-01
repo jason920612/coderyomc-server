@@ -60,3 +60,11 @@ Concurrency correctness is validated by composing all features under heavy real 
 - **#28** — entity-tracker (`ChunkMap.newTrackerTick`) iterating a non-thread-safe list while region workers add/remove entities → NPE under spawn-storm. Fixed (defensive guard, gated on regionization).
 
 Each fix is flag-gated such that `region.enabled=false` remains byte-for-byte vanilla, and each is proven by a sustained heavy-load e2e run (0 crashes / 0 single-writer violations).
+
+## Redstone HDL-compiler + drive-the-world (experimental, opt-in)
+
+coderyoMC includes an experimental **redstone HDL-compiler** that treats a connected redstone network like a compiled logic circuit (inspired by MCHPRS). It reuses vanilla'''s own redstone code on an in-memory `VirtualRedstoneWorld` oracle and is **differential-tested bit-identical to vanilla every tick** across 50 component circuits — wire/torch/repeater/comparator (analog 0-15)/observer/lamp/button/plates/target + piston (normal/sticky/QC/topology)/slime-honey multi-block drag/0-tick + hopper/dispenser/dropper/crafter + copper-bulb/daylight-sensor/sculk/lightning-rod + the quirks (quasi-connectivity, 0-tick pulses, zero-update BUD). A runtime `/coderyo redstone difftest <pos>` command validates **any** live in-world circuit against the compiled oracle.
+
+**Drive-the-world: a measured 41.4x MSPT speedup** — on a heavy pure-logic workload (200 networks / ~3600 redstone components) vanilla ran **19.99 ms/tick** vs the compiler-driven **0.48 ms/tick**, **checksum-proven behaviour-identical** to vanilla. When `-Dcoderyo.redstone.drive.enabled=true`, the compiler becomes authoritative for networks the differential validator has proven bit-identical (suppressing vanilla'''s per-block redstone churn); unsupported/movement networks fall back to vanilla. Default OFF.
+
+A validated redstone **datapath** (logic gates → half/full/ripple adders → torch RS/D latches → edge-triggered master-slave register → a sustaining edge-triggered accumulator, every stage difftest-clean) is being built as an in-world test map toward a compiler-driven redstone computer.
