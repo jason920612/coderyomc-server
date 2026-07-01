@@ -1,0 +1,61 @@
+# coderyoMC redstone-computer MAP — build-28: WIRE-DRIVABLE-D master-slave flip-flop.
+#   THE UNBLOCK for autonomous feedback (registers / accumulators / the whole CPU).
+#
+# THE BLOCKER (build-27 / PR#80): closing the 2-bit self-counting accumulator failed because a
+#   redstone-dust SUM bridge could RAISE the register's D to 1 but never FORCE it to 0 — build-27
+#   diagnosed the master D-port as "floating to 15 by default." A wire could only OR into D, so the
+#   register could not capture a SUM of 0.
+#
+# ROOT CAUSE (found here, and it is NOT an FF-logic fault): the FF (build-10/-11 gated D-latch)
+#   already HAS a clean, combinational, wire-drivable D — TWO input cells:
+#       D_north (61,118) = the R comparator's WEST SIDE   (R = E - D_north)
+#       D_south (62,135) = the S comparator's REAR        (S = D_south - nE)
+#   Build-27 fed the bridge into ONLY D_south and left D_north unfed; without D_north driven low,
+#   R = E - D_north can never fire, so the latch cannot RESET -> D "sticks at 1." The "floats to 15"
+#   symptom was a WIRE-CONGESTION SHORT: a D-feed riser laid one cell from the S-gadget's nE
+#   15-source block at (59,134) leaks 15 into the whole D net (build-11 lesson #2, reproduced &
+#   fixed live: riser at x=58 -> D net stuck 15; riser moved to a clear lane -> D net follows 0/1).
+#
+# THE FIX (this build): drive the D INPUT WIRE (a single toggleable source block emulating the
+#   incoming adder SUM) into BOTH master D-ports through repeater-CLEANED branches, so a wire
+#   forces D — and Q — to BOTH 0 and 1. Two lessons made it work:
+#     * the master body + Q-rail + forward-interconnect bus WALL OFF z=122 across x=50..64, so the
+#       ONLY clear N-S lane to reach the master's north D-port is x=66 (EAST of the Qbar rail x=64);
+#       D_north is then approached from the NORTH (z=115 row) to dodge the R-gadget and the E_north
+#       enable dust (which would short Enable into D).
+#     * both branches re-amp through repeaters to arrive at a CLEAN 15 (else R=E-D subtract mis-fires).
+#
+# SERVER: reuse the coderyo-bundler-26.2 patch-0020 jar (NO rebuild), boot
+#   -Dcoderyo.redstone.compile.enabled=true ; port 15568, RCON 25581 (pw cpu2), flat/peaceful world.
+#   Settle by GAME ticks (`tick sprint N`). difftest via RCON; verdict from the
+#   `[redstone-difftest/live]` server log. Script: build-28-wireff.py (WireFF extends ff.FF).
+#
+# LAYOUT (isolation rig at DX=200, DZ=500; base master x=62 / slave x=46):
+#   D source (the "incoming SUM wire") : block over (66,102,140) -> source dust (66,101,140)
+#   Branch A  source -> D_south (62,135): west z=140 -> north x=62 -> 2 clean reps -> D_south
+#   Branch B  source -> D_north (61,118): x=66 riser (clear lane) -> z=115 row west -> drop to
+#                                         (59,118) -> rep[facing=west] injects east -> D_north
+#   Master E (phi1): blocks (62,102,117)&(60,102,133)   Slave E (phi2): (46,102,117)&(44,102,133)
+#   Q (register out) = slave Q (44,101,122)   Qbar (48,101,130)
+#   D is driven ONLY by the source block (the y=102 block D-ports are left AIR).
+#
+# ============================== RESULT — a WIRE forces Q to BOTH 0 and 1 (vanilla live reads) ==============================
+# Toggling ONLY the source block (D via wire), clocking the two-phase clock, reading Q @(244,101,622):
+#     D_wire=0 -> Q=0    (D_src=0  D_north=0  D_south=0)   RESET through the wire  OK
+#     D_wire=1 -> Q=1    (D_src=15 D_north=15 D_south=15)  SET   through the wire  OK
+#     D_wire=0 -> Q=0 ;  D_wire=1 -> Q=1 ;  D_wire=1 -> Q=1(hold) ;  D_wire=0 -> Q=0   ALL OK
+#   => a plain WIRE drives the register's captured bit to BOTH 0 AND 1, bidirectionally, on the
+#      clock edge. The build-27 blocker (wire can only OR D to 1) is ELIMINATED: with BOTH D-ports
+#      fed, R = E - D_north fires and the register captures a 0 from a wire.
+#
+# ============================== RESULT — difftest (compiler == vanilla) ==============================
+#   HOLD Q=1 : coderyo redstone difftest 244 101 622 200 -> PASS BIT-IDENTICAL (200 ticks, 369 cells, 183 components, single-region)
+#   HOLD Q=0 : coderyo redstone difftest 244 101 622 200 -> PASS BIT-IDENTICAL (200 ticks, 368 cells, 182 components)
+#   => the whole wire-drivable-D master-slave register (torch latches + comparator enable-gates +
+#      forward interconnect + the two repeater-cleaned D-feed branches) compiles BIT-FOR-BIT to
+#      vanilla in BOTH captured states. This is the difftest-clean, WIRE-DRIVABLE edge-triggered
+#      register that unblocks ALL autonomous feedback: an ordinary wire (the adder SUM) can now
+#      drive the register's D to both 0 and 1, so the ACC := ACC + 1 loop can capture every state
+#      (0,1,2,3) — the build-27 D-injection blocker is the last logic gap, and it is closed.
+#
+# No feature patch — only test-harness/redstone-computer/.
