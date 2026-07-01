@@ -1,0 +1,3 @@
+forceload add -60 108 72 165
+fill -60 100 108 72 100 165 minecraft:stone
+fill -60 101 108 72 103 165 minecraft:air

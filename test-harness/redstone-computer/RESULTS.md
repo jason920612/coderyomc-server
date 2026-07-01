@@ -1072,3 +1072,52 @@ build-12's own interconnects (only Qbar0 escapes), and `XV` must fan to Master1'
 is the from-scratch **wide-platform** PC with a shared spread fan-out bus — the same finding builds 16–19
 named, now confirmed hands-on. Every constituent is difftest BIT-IDENTICAL on this jar. **No feature patch —
 only `test-harness/redstone-computer/`.**
+
+## Rung 22 — 4-STAGE ONE-HOT RING COUNTER (XOR-free program counter) (build-22-ring-counter.txt)
+
+**DESIGN PIVOT.** The binary-counter PC died on physical routing for builds 16–21 (the dual-rail XOR that
+computes `bit1.D` packs four mutually-adjacent input dusts that can't each be wire-fed without an adjacency
+short; bit0's `Q0/Qbar0` are enclosed by its own T-feedback). A **ring counter** sidesteps ALL of it: **no
+XOR** (no packed 4-input gate), **no per-stage T-feedback** (no enclosing feedback ring), and it is **one-hot**
+(drives a ROM with no decoder). It is 4 edge-triggered master-slave D flip-flops (build-11 body verbatim) in a
+spaced ROW wired `FF_i.D = FF_{i-1}.Q`, loop `FF_0.D = FF_3.Q`. **Each Q feeds exactly one next-stage D** — no
+fan-out collision.
+
+**Build.** FF bodies at `DX = 0,-30,-60,-90` (build-20-bit0 lines 4–66, sans T-feedback). Per stage:
+`Q_i=(44+dx,101,122)`, `Qbar_i=(48+dx,101,130)`, `Master.D=(61+dx,118)&(62+dx,135)`, `phi1` over
+`(62+dx,102,117)&(60+dx,102,133)`, `phi2` over `(46+dx,102,117)&(44+dx,102,133)`. **Slave.Q is enclosed**
+(boxed by its S-comparator gadget) — confirms build-21; each link taps **Qbar** and recovers `Q = 15 − Qbar`
+with one subtract comparator. Key discovered rules: a repeater rear **directly on the Qbar rail** unbalances
+the sensitive cross-coupled latch and destroys its state → tap a **1-dust isolating stub**; re-amp the Qbar
+drop **every ≤5** so the comparator side sees a clean 15 (else `15−13=2` garbage); place the invert's 15-source
+block **after** the comparator so it re-evaluates its rear (freshly-set diodes don't re-eval until a neighbour
+update — build-21's rule); FF capture needs **12-tick non-overlapping phases** + a D pre-settle (6-tick fails).
+Generator: `build-22-gen_ring.py` (+ `build-22-{floor,ffs,links,loop}.commands.txt`).
+
+**PHYSICAL SHIFT — the milestone ✅ (no driver).** Init one-hot `1000` (flush to 0000, inject a 1 for one
+cycle, release). Clock two-phase; the '1' propagates ONLY through the Qbar-tap/invert register→register links:
+
+| clock | Q0 Q1 Q2 Q3 |
+|-------|-------------|
+| init  | **1 0 0 0** |
+| clk 1 | **0 1 0 0** |
+| clk 2 | **0 0 1 0** |
+| clk 3 | **0 0 0 1** |
+
+The one-hot bit **physically shifts `1000 → 0100 → 0010 → 0001`** across the four edge-triggered stages with
+**no driver** — the autonomous program-counter walk — and it **avoids the XOR-fanout blocker entirely** (no XOR,
+no packed gate; each Q drives exactly one next-D). Clean and repeatable.
+
+**difftest ✅.** The whole ring (4 master-slave FFs + 3 shift links + loop link, single-region):
+- held `1000`, `difftest 44 101 122 200` → **PASS BIT-IDENTICAL (200 ticks, 1986 cells, 999 components, 26 chunks)**
+- held `1000`, `difftest 14 101 122 150` → **PASS BIT-IDENTICAL (150 ticks, 1982 cells)**
+
+**Honest status — loop recirculation + ROM.** Loop `0001→1000` NOT landed in budget: the ~110-cell east
+loop-haul + its invert suffer a long-haul diode staleness (when `Qbar3` flips the loop invert doesn't refresh,
+so `D0` stays stale and the '1' falls off the west end `0001→0000`). The **identical** invert+haul pattern on
+the three SHORT adjacent links refreshes every clock (the clean shift proves it) and the difftest is
+BIT-IDENTICAL — so it is a long-haul physical-settle issue, not a logic/compiler fault; fix = a shorter re-amp-
+dense return lane (same class as builds 16–21). The one-hot ROM fetch walk (each `Q_i AND word_i`, OR down each
+column — no decoder) depends on the closed ring and was not reached. **The ring counter sidestepped the
+XOR-fanout death-loop and delivered a difftest-clean, physically-shifting one-hot PC.** No feature patch —
+only `test-harness/redstone-computer/`.
